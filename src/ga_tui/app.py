@@ -13269,18 +13269,23 @@ def append_process_turn(
 ) -> None:
     has_process_noise = process_has_tool_noise(body)
     has_call_noise = process_has_tool_call_noise(body)
-    if collapse_whole and has_process_noise:
-        rendered.append(collapsed_process_line(marker, body, current=current))
-        return
     final_text = visible_reply_text(body, hide_detail_fences=has_process_noise)
     if final_text:
         if has_call_noise and fold_details:
             final_text = close_unbalanced_markdown_fence(final_text)
+        if collapse_whole and has_process_noise:
+            rendered.append(final_text)
+            if fold_details:
+                rendered.append(collapsed_process_line(marker, body, current=current))
+            return
         if has_call_noise:
             rendered.append(process_speech_header(marker, body))
         rendered.append(final_text)
         if has_call_noise and fold_details:
             rendered.append(process_detail_line(marker, body, current=current))
+        return
+    if collapse_whole and has_process_noise:
+        rendered.append(collapsed_process_line(marker, body, current=current))
         return
     summary = process_summary_text(body) or process_preview(body)
     if summary and summary != "执行中":

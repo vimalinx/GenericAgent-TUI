@@ -841,6 +841,26 @@ def assert_process_detail_line_not_swallowed_by_code_fence() -> None:
     assert "▸ 细节 Turn 1" in flattened, flattened
 
 
+def assert_single_search_turn_keeps_final_reply_visible() -> None:
+    restored = (
+        "**LLM Running (Turn 1) ...**\n"
+        "🛠️ Tool: `web_search` 📥 args:\n"
+        "````text\n"
+        "{\"query\":\"GenericAgent TUI 能力\"}\n"
+        "````\n"
+        "`````\n"
+        "search results noise\n"
+        "`````\n"
+        "[Info] Final response to user.\n"
+        "在这个 TUI 里，我可以帮你管理会话、拆任务、调度子 Agent。\n"
+    )
+    rendered = a.render_assistant_text(restored, done=True, fold_process=True, message_index=11)
+    assert "在这个 TUI 里，我可以帮你管理会话、拆任务、调度子 Agent。" in rendered, rendered
+    assert rendered.index("在这个 TUI 里") < rendered.index("▸ 过程 Turn 1"), rendered
+    assert "search results noise" not in rendered, rendered
+    assert "{\"query\"" not in rendered, rendered
+
+
 def assert_ask_user_tool_use_input_payload_visible() -> None:
     restored = (
         "**LLM Running (Turn 76) ...**\n"
@@ -1681,6 +1701,7 @@ def run_checks() -> None:
     assert_secret_native_restore_hydrates_backend_context_blocks()
     assert_restored_process_group_main_speech_visible()
     assert_process_detail_line_not_swallowed_by_code_fence()
+    assert_single_search_turn_keeps_final_reply_visible()
     assert_ask_user_tool_use_input_payload_visible()
     assert_ask_user_multiline_tool_args_payload_visible()
     assert_aux_mouse_buttons_do_not_start_selection()
