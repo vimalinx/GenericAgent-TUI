@@ -112,6 +112,87 @@ class ContextFakeAgent:
     log_path = ""
 
 
+def ga_control(*actions: dict) -> str:
+    return "<ga-control>" + json.dumps({"schema_version": "ga-control.v2", "actions": list(actions)}, ensure_ascii=False) + "</ga-control>"
+
+
+def plan_action(title: str, steps: list[str]) -> dict:
+    return {"action": "task.plan.create", "title": title, "steps": steps}
+
+
+def create_agent_action(
+    name: str,
+    *,
+    profile: str = "",
+    role: str = "specialist",
+    persistent: bool | None = None,
+    temporary: bool | None = None,
+    force_new: bool = False,
+    parent_task_id: str = "",
+    plan_step_id: str = "",
+) -> dict:
+    action = {"action": "agent.create", "name": name, "role": role, "profile": profile}
+    if persistent is not None:
+        action["lifecycle"] = "persistent" if persistent else "ephemeral"
+        action["persistent"] = persistent
+    if temporary is not None:
+        action["lifecycle"] = "ephemeral" if temporary else "persistent"
+        action["temporary"] = temporary
+    if force_new:
+        action["reuse_policy"] = "force_new"
+        action["force_new"] = True
+    if parent_task_id:
+        action["parent_task_id"] = parent_task_id
+    if plan_step_id:
+        action["plan_step_id"] = plan_step_id
+    return action
+
+
+def delegate_action(target: str, objective: str, *, parent_task_id: str = "", role: str = "researcher", task_title: str = "") -> dict:
+    return {
+        "schema_version": "agenttask.v2",
+        "action": "delegate.create",
+        "parent_task_id": parent_task_id,
+        "task_title": task_title,
+        "routing": {
+            "mode": "agent_as_tool",
+            "selected_agent": target,
+            "target_selector": {
+                "role": role,
+                "capabilities_required": ["read"],
+                "reuse_policy": "prefer_existing",
+                "security_context": "standard",
+            },
+        },
+        "work_order": {
+            "objective": objective,
+            "background": "policy gate regression test",
+            "non_goals": ["do not exceed delegated scope"],
+            "success_criteria": ["return a bounded structured result"],
+            "stop_condition": "return summary, evidence refs, risks, artifact refs, and confidence",
+        },
+        "capability_contract": {
+            "tools_allowed": ["read"],
+            "tools_forbidden": ["repo.write", "deploy", "email.send"],
+            "write_policy": "none",
+            "network_policy": "none",
+            "memory_write": "candidate_only",
+            "max_subagents": 0,
+        },
+        "context_contract": {
+            "history_mode": "summary",
+            "artifact_reference_only": True,
+            "include_raw_logs": False,
+        },
+        "output_contract": {
+            "format": "structured_markdown",
+            "required_sections": ["summary", "findings", "evidence_refs", "risks", "artifact_refs", "confidence"],
+            "schema_validation": "strict",
+            "on_invalid_output": "request_repair_once",
+        },
+    }
+
+
 class FakeBackend:
     def __init__(self, name: str, model: str, apibase: str = "https://example.invalid/v1") -> None:
         self.name = name
@@ -1315,7 +1396,7 @@ def assert_subagent_create_respects_force_new_and_topic_terms() -> None:
     state.messages.append(a.Message("user", "你给我创建一个用来管理falsesocial的持久代理"))
     a.apply_tui_controls_from_text(
         state,
-        '<ga-tui>{"action":"subagent_create","name":"FalseSocial 管理代理","persistent":true,"profile":"专门管理 falsesocial 的账号、内容和运维事项。"}</ga-tui>',
+        ga_control(create_agent_action("FalseSocial 管理代理", persistent=True, profile="专门管理 falsesocial 的账号、内容和运维事项。")),
         source="agent",
     )
     falsesocial_agents = [sub for sub in state.subagents.values() if "falsesocial" in sub.agent_id]
@@ -1327,7 +1408,7 @@ def assert_subagent_create_respects_force_new_and_topic_terms() -> None:
     state.messages.append(a.Message("user", "不不，单独弄一个管理falsesocial的持久代理，不要复用"))
     a.apply_tui_controls_from_text(
         state,
-        '明白，单独新建，不引用已有代理。\n<ga-tui>{"action":"subagent_create","name":"FalseSocial 管理代理","persistent":true,"profile":"专门管理 falsesocial 的账号、内容和运维事项。"}</ga-tui>',
+        "明白，单独新建，不引用已有代理。\n" + ga_control(create_agent_action("FalseSocial 管理代理", persistent=True, profile="专门管理 falsesocial 的账号、内容和运维事项。")),
         source="agent",
     )
     falsesocial_agents = [sub for sub in state.subagents.values() if "falsesocial" in sub.agent_id]
@@ -1336,11 +1417,17 @@ def assert_subagent_create_respects_force_new_and_topic_terms() -> None:
 
     a.apply_tui_controls_from_text(
         state,
-        '<ga-tui>{"action":"subagent_create","name":"FalseSocial 管理代理","persistent":true,"force_new":true,"profile":"专门管理 falsesocial 的账号、内容和运维事项。"}</ga-tui>',
+        ga_control(create_agent_action("FalseSocial 管理代理", persistent=True, force_new=True, profile="专门管理 falsesocial 的账号、内容和运维事项。")),
         source="agent",
     )
     falsesocial_agents = [sub for sub in state.subagents.values() if "falsesocial" in sub.agent_id]
     assert len(falsesocial_agents) == 3, [(sub.agent_id, sub.name) for sub in state.subagents.values()]
+    a.apply_tui_controls_from_text(
+        state,
+        '<ga-tui>{"action":"subagent_create","name":"Legacy Should Not Run","persistent":true}</ga-tui>',
+        source="agent",
+    )
+    assert a.resolve_subagent(state, "Legacy Should Not Run") is None
 
     security_agent = a.SubAgentRuntime(
         agent_id="agent-network-security",
@@ -1365,13 +1452,16 @@ def assert_subagent_create_respects_force_new_and_topic_terms() -> None:
         "specialist",
     )
     assert exact_reuse_score >= 40, exact_reuse_score
-    assert "Secret Vault 已解锁时仍使用同样的 subagent_create 控制" in a.TUI_AGENT_CONTROL_HINT
+    assert "schema_version:\"ga-control.v2\"" in a.TUI_AGENT_CONTROL_HINT
+    assert "delegate.create" in a.TUI_AGENT_CONTROL_HINT
+    assert '<ga-tui>{"action":"subagent_ask"' not in a.TUI_AGENT_CONTROL_HINT
     assert "secret_subagents" in a.TUI_AGENT_CONTROL_HINT
     assert "memory/subagents/" in a.TUI_AGENT_CONTROL_HINT
     fenced_control = (
         "现在重新发送：\n"
         "```json\n"
-        "{\"action\":\"subagent_create\",\"name\":\"网络搜索员\",\"persistent\":true,\"role\":\"researcher\"}\n"
+        + json.dumps({"schema_version": "agenttask.v2", **create_agent_action("网络搜索员", persistent=True, role="researcher")}, ensure_ascii=False)
+        + "\n"
         "```"
     )
     assert a.extract_tui_controls(fenced_control) == []
@@ -1526,13 +1616,13 @@ def assert_self_intro_does_not_consume_mutual_chat_step() -> None:
     main_agent = SequencedFakeAgent(["我没有发出新的控制块。"])
     state = a.State(agent=main_agent)
     state.running = True
-    orchestration_text = """
-<ga-tui>{"action":"task_plan","title":"缺少自我介绍步骤的双代理对话","steps":["创建正式子代理","创建临时子代理","两个代理互相聊天对话","汇总所有内容到我这里"]}</ga-tui>
-<ga-tui>{"action":"subagent_create","name":"正式丙","persistent":true,"profile":"你是正式永久子代理，名叫正式丙。稍后和临时子代理临时丁交流。"}</ga-tui>
-<ga-tui>{"action":"subagent_create","name":"临时丁","temporary":true,"profile":"你是临时子代理，名叫临时丁。稍后和正式子代理正式丙交流。"}</ga-tui>
-<ga-tui>{"action":"subagent_ask","target":"正式丙","prompt":"请先向主控说一句话自我介绍，说完了告诉我。"}</ga-tui>
-<ga-tui>{"action":"subagent_ask","target":"临时丁","prompt":"请先向主控说一句话自我介绍，说完了告诉我。"}</ga-tui>
-"""
+    orchestration_text = ga_control(
+        plan_action("缺少自我介绍步骤的双代理对话", ["创建正式子代理", "创建临时子代理", "两个代理互相聊天对话", "汇总所有内容到我这里"]),
+        create_agent_action("正式丙", persistent=True, profile="你是正式永久子代理，名叫正式丙。稍后和临时子代理临时丁交流。"),
+        create_agent_action("临时丁", temporary=True, profile="你是临时子代理，名叫临时丁。稍后和正式子代理正式丙交流。"),
+        delegate_action("正式丙", "请先向主控说一句话自我介绍，说完了告诉我。"),
+        delegate_action("临时丁", "请先向主控说一句话自我介绍，说完了告诉我。"),
+    )
     a.apply_tui_controls_from_text(state, orchestration_text, source="agent")
     plan_id = state.active_plan_task_id
     steps = sorted(
@@ -2083,7 +2173,7 @@ def run_checks() -> None:
             assert any("secret direct reply marker" in msg.content for msg in reloaded_secret_subagent.messages), reloaded_secret_subagent.messages
             ledger_before_controls = list(a.read_jsonl(a.AGENT_TASK_LEDGER_PATH))
             mail_before_controls = list(a.read_jsonl(a.AGENT_MAIL_PATH))
-            hidden_create = '<ga-tui>{"action":"subagent_create","name":"zzq xxy","profile":"abc def marker","plan_step_id":"normal-ledger-leak","persistent":true}</ga-tui>'
+            hidden_create = ga_control(create_agent_action("zzq xxy", profile="abc def marker", persistent=True, plan_step_id="normal-ledger-leak"))
             assert a.apply_secret_subagent_controls_from_text(state, hidden_create) == 1
             hidden_secret_subagent = a.resolve_subagent(state, "zzq xxy")
             assert hidden_secret_subagent is not None
@@ -2092,7 +2182,7 @@ def run_checks() -> None:
             assert a.read_jsonl(a.AGENT_TASK_LEDGER_PATH) == ledger_before_controls
             assert a.read_jsonl(a.AGENT_MAIL_PATH) == mail_before_controls
             secret_agent.responses.append("hidden child result marker")
-            hidden_ask = f'<ga-tui>{{"action":"subagent_ask","target":"{secret_subagent.agent_id}","prompt":"hidden child task marker","plan_step_id":"normal-ledger-leak"}}</ga-tui>'
+            hidden_ask = ga_control(delegate_action(secret_subagent.agent_id, "hidden child task marker", parent_task_id="normal-ledger-leak"))
             assert a.apply_secret_subagent_controls_from_text(state, hidden_ask) == 1
             drain_ui(state)
             assert any("hidden child result marker" in msg.content for msg in state.messages), state.messages
@@ -2194,7 +2284,7 @@ def run_checks() -> None:
     control_state.secret_vault.unlocked = False
     control_state.secret_vault.previous_log_path = os.path.join(root, "normal-after-lock.jsonl")
     a.set_agent_log_path(control_state.agent, os.devnull)
-    control_state.ui_queue.put(("stream", a.StreamTarget(), 42, '<ga-tui>{"action":"subagent_create","name":"secret-leak","profile":"plaintext"}</ga-tui>', True))
+    control_state.ui_queue.put(("stream", a.StreamTarget(), 42, ga_control(create_agent_action("secret-leak", profile="plaintext")), True))
     a.process_ui_queue(control_state)
     assert "secret-leak" not in control_state.subagents
     assert "TUI 控制已忽略" in control_state.last_error, control_state.last_error
@@ -2499,13 +2589,11 @@ def run_checks() -> None:
 
     partial_agent = SequencedFakeAgent(
         [
-            """
-<ga-tui>{"action":"task_plan","title":"自动续跑计划","steps":["创建正式子代理","创建临时子代理"]}</ga-tui>
-<ga-tui>{"action":"subagent_create","name":"续跑正式","persistent":true,"profile":"正式测试子代理"}</ga-tui>
-""",
-            """
-<ga-tui>{"action":"subagent_create","name":"续跑临时","temporary":true,"profile":"临时测试子代理"}</ga-tui>
-""",
+            ga_control(
+                plan_action("自动续跑计划", ["创建正式子代理", "创建临时子代理"]),
+                create_agent_action("续跑正式", persistent=True, profile="正式测试子代理"),
+            ),
+            ga_control(create_agent_action("续跑临时", temporary=True, profile="临时测试子代理")),
         ]
     )
     partial_state = a.State(agent=partial_agent)
@@ -2527,9 +2615,10 @@ def run_checks() -> None:
     assert "control-emission continuation" in continuation_prompt, continuation_prompt
     assert "Do not call browser/search/file/code tools" in continuation_prompt, continuation_prompt
     assert "web_scan" in continuation_prompt, continuation_prompt
-    assert '<ga-tui>{"action":"subagent_create"' in continuation_prompt, continuation_prompt
-    assert '<ga-tui>{"action":"subagent_ask"' in continuation_prompt, continuation_prompt
-    assert '<ga-tui>{"action":"task_update"' in continuation_prompt, continuation_prompt
+    assert '<ga-control>{"schema_version":"ga-control.v2"' in continuation_prompt, continuation_prompt
+    assert '"action":"agent.create"' in continuation_prompt, continuation_prompt
+    assert '"action":"delegate.create"' in continuation_prompt, continuation_prompt
+    assert '"action":"task.update"' in continuation_prompt, continuation_prompt
     assert '"parent_task_id":"' in continuation_prompt, continuation_prompt
     assert any("自动续跑主控" in msg.content for msg in partial_state.messages if msg.role == "system"), partial_state.messages
     partial_agents = {sub.name: sub for sub in partial_state.subagents.values()}
@@ -2539,10 +2628,10 @@ def run_checks() -> None:
 
     blocked_agent = SequencedFakeAgent(
         [
-            """
-<ga-tui>{"action":"task_plan","title":"自动续跑阻塞计划","steps":["创建正式子代理","创建临时子代理"]}</ga-tui>
-<ga-tui>{"action":"subagent_create","name":"阻塞正式","persistent":true,"profile":"正式测试子代理"}</ga-tui>
-""",
+            ga_control(
+                plan_action("自动续跑阻塞计划", ["创建正式子代理", "创建临时子代理"]),
+                create_agent_action("阻塞正式", persistent=True, profile="正式测试子代理"),
+            ),
             "我没有发出新的控制块。",
         ]
     )
@@ -2643,6 +2732,42 @@ def run_checks() -> None:
     approval_mail = [row for row in a.read_jsonl(a.AGENT_MAIL_PATH) if row.get("intent") == "approval_request"][-1]
     assert_mail_schema(approval_mail, intent="approval_request")
     assert approval_mail["approval"]["approval_id"] == queued_task["approval_id"]
+
+    approvals_before_contract_delegate = len(a.read_jsonl(a.AGENT_APPROVALS_PATH))
+    contract_objective = "整理项目结构，输出证据引用。"
+    a.apply_tui_controls_from_text(
+        state,
+        ga_control(
+            create_agent_action("Contract Researcher", role="researcher", profile="只读整理证据，不执行写操作。"),
+            delegate_action("Contract Researcher", contract_objective, task_title="contract-safe-delegate"),
+        ),
+        source="agent",
+    )
+    assert len(a.read_jsonl(a.AGENT_APPROVALS_PATH)) == approvals_before_contract_delegate
+    contract_sub = a.resolve_subagent(state, "Contract Researcher")
+    assert contract_sub is not None
+    assert any(
+        msg.role == "user"
+        and "[GA TUI AgentTask Envelope v2]" in msg.content
+        and '"tools_forbidden": [' in msg.content
+        and '"deploy"' in msg.content
+        for msg in contract_sub.messages
+    ), contract_sub.messages
+    contract_task_rows = [
+        row
+        for row in a.read_jsonl(a.AGENT_TASK_LEDGER_PATH)
+        if row.get("assigned_agent") == contract_sub.agent_id and row.get("status") == "working"
+    ]
+    assert contract_task_rows, a.read_jsonl(a.AGENT_TASK_LEDGER_PATH)
+    assert contract_task_rows[-1]["objective"] == contract_objective
+    assert "deploy" not in contract_task_rows[-1]["objective"]
+    contract_mail_rows = [
+        row
+        for row in a.read_jsonl(a.AGENT_MAIL_PATH)
+        if (row.get("to") or {}).get("target") == contract_sub.agent_id and row.get("intent") == "delegate"
+    ]
+    assert contract_mail_rows
+    assert (contract_mail_rows[-1]["payload"] or {}).get("objective") == contract_objective
 
     memory_blocked = a.append_subagent_memory(ops, "Stable operational preference", source="manual")
     assert memory_blocked.startswith("APPROVAL_REQUIRED"), memory_blocked
@@ -2768,13 +2893,13 @@ def run_checks() -> None:
     assert cache_child_row["summary"], cache_child_row
     assert any("/subagent-results/" in str(ref) for ref in cache_child_row["artifact_refs"]), cache_child_row
 
-    orchestration_text = """
-<ga-tui>{"action":"task_plan","title":"双代理对话演示","steps":["创建正式子代理(永久)","创建临时子代理","两个代理各自先向我说话","两个代理互相聊天交流","汇总所有对话内容"]}</ga-tui>
-<ga-tui>{"action":"subagent_create","name":"正式甲","persistent":true,"profile":"你是正式永久子代理，名叫正式甲。稍后和临时子代理临时乙交流。"}</ga-tui>
-<ga-tui>{"action":"subagent_create","name":"临时乙","profile":"你是临时子代理，名叫临时乙。稍后和正式子代理正式甲交流。"}</ga-tui>
-<ga-tui>{"action":"subagent_ask","target":"正式甲","prompt":"请先向主控说一句话自我介绍，说完了告诉我。"}</ga-tui>
-<ga-tui>{"action":"subagent_ask","target":"临时乙","prompt":"请先向主控说一句话自我介绍，说完了告诉我。"}</ga-tui>
-"""
+    orchestration_text = ga_control(
+        plan_action("双代理对话演示", ["创建正式子代理(永久)", "创建临时子代理", "两个代理各自先向我说话", "两个代理互相聊天交流", "汇总所有对话内容"]),
+        create_agent_action("正式甲", persistent=True, profile="你是正式永久子代理，名叫正式甲。稍后和临时子代理临时乙交流。"),
+        create_agent_action("临时乙", profile="你是临时子代理，名叫临时乙。稍后和正式子代理正式甲交流。"),
+        delegate_action("正式甲", "请先向主控说一句话自我介绍，说完了告诉我。"),
+        delegate_action("临时乙", "请先向主控说一句话自我介绍，说完了告诉我。"),
+    )
     a.apply_tui_controls_from_text(state, orchestration_text, source="agent")
     formal = next(sub for sub in state.subagents.values() if sub.name == "正式甲")
     temporary = next(sub for sub in state.subagents.values() if sub.name == "临时乙")

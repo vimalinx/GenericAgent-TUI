@@ -210,9 +210,11 @@ DETAIL_FENCE_RE = re.compile(r"`{3,}[^\n]*\n[\s\S]*?\n`{3,}", re.MULTILINE)
 FENCE_BOUNDARY_RE = re.compile(r"^[ \t]*(`{3,})(.*)$")
 PROMPT_BLOCK_WITH_TIME_RE = re.compile(r"^=== Prompt ===\s*([^\n]*)\n(.*?)(?=^=== (?:Prompt|Response) ===|\Z)", re.DOTALL | re.MULTILINE)
 RESPONSE_BLOCK_WITH_TIME_RE = re.compile(r"^=== Response ===\s*([^\n]*)\n(.*?)(?=^=== (?:Prompt|Response) ===|\Z)", re.DOTALL | re.MULTILINE)
-TUI_CONTROL_RE = re.compile(r"<ga[-_]tui>\s*([\s\S]*?)\s*</ga[-_]tui>", re.IGNORECASE)
-TUI_CONTROL_FENCE_RE = re.compile(r"```ga[-_]tui\s*([\s\S]*?)```", re.IGNORECASE)
+TUI_CONTROL_RE = re.compile(r"<ga[-_]control>\s*([\s\S]*?)\s*</ga[-_]control>", re.IGNORECASE)
+TUI_CONTROL_FENCE_RE = re.compile(r"```ga[-_]control\s*([\s\S]*?)```", re.IGNORECASE)
 TUI_CONTROL_JSON_FENCE_RE = re.compile(r"```(?:json|js|javascript|code)?[ \t]*\n([\s\S]*?)(?:^```|\Z)", re.IGNORECASE | re.MULTILINE)
+LEGACY_TUI_CONTROL_RE = re.compile(r"<ga[-_]tui>\s*([\s\S]*?)\s*</ga[-_]tui>", re.IGNORECASE)
+LEGACY_TUI_CONTROL_FENCE_RE = re.compile(r"```ga[-_]tui\s*([\s\S]*?)```", re.IGNORECASE)
 SUBAGENT_MEMORY_RE = re.compile(r"<ga[-_]subagent[-_]memory>\s*([\s\S]*?)\s*</ga[-_]subagent[-_]memory>", re.IGNORECASE)
 SUBAGENT_PROMPT_RE = re.compile(r"\n?\[GA TUI SubAgent Profile\][\s\S]*?\[/GA TUI SubAgent Profile\]\n?", re.IGNORECASE)
 LEGACY_SUBAGENT_BACKFILL_WINDOW_SECONDS = 2 * 60 * 60
@@ -284,34 +286,37 @@ COMMANDS: list[tuple[str, str, str, bool]] = [
 ]
 TUI_AGENT_CONTROL_HINT = """
 
-[GenericAgent-TUI session control]
-当用户要求你管理 TUI 会话时，你可以在最终回复末尾输出一个隐藏控制块，TUI 会执行后移除该块：
-<ga-tui>{"action":"pin|unpin|category|filter|clear_filter|collapse_category|expand_category|archive|unarchive|delete|rename|show_archived|hide_archived","target":"current|id:430986|model_responses_430986.txt|分类名","value":"分类或名称"}</ga-tui>
-子 agent 控制也用同一个隐藏块：
-多步骤或多子 agent 任务必须先创建计划，不要把每次给子 agent 的 prompt 当顶层 task：
-<ga-tui>{"action":"task_plan","title":"三代理闲聊","steps":["准备/复用子 agent","进行第一轮对话","进行第二轮对话","进行第三轮对话","对话汇总"]}</ga-tui>
-之后 subagent_ask 可用 "step":1/2/3 或 "parent_task_id":"step_id" 挂到对应计划步骤下面。
-创建前必须先解析已有子 agent：用户说“现有/已有/那几个/叫叫/唤醒”时，优先对已有 id/name 输出 subagent_ask；不要按相同人设新建副本。
-只有确实没有匹配的现有子 agent 时才 subagent_create；默认创建临时会话子 agent，不写长期记忆。
-用户明确要求“单独新建/不要复用/不引用现有/全新/专属”时，subagent_create 必须设置 "force_new":true 或 "reuse":false，并使用用户要求的具体领域名称。
-用户明确要求“长期/持久/永久/正式/persistent/保存身份”时设置 persistent=true；明确要求“临时/暂时/temp/ephemeral”时保持临时，并不要用持久 agent 冒充临时 agent。
-同一批控制里如果 subagent_create 被复用到实际 id/name，后续 subagent_ask 必须用返回的实际 id/name，或使用同一个 create 名称让 TUI 批内别名自动解析。
-subagent_ask 是异步委派：发出后等待子 agent 结果进入 bus/系统消息，再做汇总或把汇总/计划步骤标 completed；不要在派发后立即 task_update completed。
-<ga-tui>{"action":"subagent_create","name":"研究员","profile":"职责和边界"}</ga-tui> 默认创建临时会话子 agent，只显示在右栏，不写长期记忆。
-<ga-tui>{"action":"subagent_create","name":"长期研究员","persistent":true,"profile":"职责和边界"}</ga-tui> 仅在用户明确需要长期独立子 agent 时使用。
-<ga-tui>{"action":"subagent_create","name":"FalseSocial 管理代理","persistent":true,"force_new":true,"profile":"专门管理 falsesocial 的职责和边界"}</ga-tui> 用户明确不要复用时使用。
-<ga-tui>{"action":"subagent_create","name":"审查员","role":"reviewer","profile":"职责和边界"}</ga-tui>
-Secret Vault 已解锁时仍使用同样的 subagent_create 控制；persistent=true 会写入加密 Secret vault（secret_subagents），不要检查或推断普通 memory/subagents/ 目录。
-<ga-tui>{"action":"subagent_ask","target":"研究员或id","prompt":"交给子 agent 的任务"}</ga-tui>
-如果同一个子 agent 正在运行，新的 subagent_ask 会进入该 agent 队列，不要因为一轮未完成而重复报错。
-<ga-tui>{"action":"subagent_remember","target":"研究员或id","memory":"经验证、长期有效的信息"}</ga-tui> 会进入人工审批队列，不会直接写长期记忆。
-<ga-tui>{"action":"subagent_profile","target":"研究员或id","profile":"新的 profile"}</ga-tui>
-<ga-tui>{"action":"subagent_role","target":"研究员或id","role":"researcher|code_reader|coder|reviewer|verifier|memory_curator|ops"}</ga-tui>
-<ga-tui>{"action":"subagent_model","target":"研究员或id","model":"已配置模型名|inherit"}</ga-tui> 仅设置持久子 agent 的默认模型。
-原则：你是主控 Orchestrator；读任务可并行，写任务保持单写者；子 agent 返回 artifact/证据/摘要，不要无结构自由聊天。
-批量操作历史会话时优先用 /sessions 输出的稳定 id:xxxxxx 或完整文件名作为 target；不要用 S01/1 这种当前视图相对编号，除非同时提供 expected_title 做校验。
-也可以输出 {"actions":[...]} 批量执行。普通回答不要输出该块。
-[/GenericAgent-TUI session control]
+[GenericAgent-TUI ga-control v2]
+当用户要求你管理 TUI、拆任务或调度子 agent 时，只能输出隐藏 `<ga-control>` 控制块；旧 `<ga-tui>` / subagent_ask / subagent_create / task_update 格式已经废弃，不要再使用。
+
+控制块必须是 `schema_version:"ga-control.v2"`，批量动作放在 `actions` 里；每个动作使用强类型 dotted action 名称。
+
+会话控制示例：
+<ga-control>{"schema_version":"ga-control.v2","actions":[{"action":"session.rename","target":"current","value":"FastAPI 后端重构"}]}</ga-control>
+
+多 agent 协作必须先建计划，再创建或复用 agent，最后用完整 `agenttask.v2` 工作订单委派，不要把自然语言 prompt 当作唯一任务信息：
+<ga-control>{"schema_version":"ga-control.v2","actions":[
+  {"action":"task.plan.create","title":"三代理协作","steps":["准备/复用子 agent","第一轮并行处理","汇总结果"]},
+  {"action":"agent.create","name":"研究员","role":"researcher","lifecycle":"ephemeral","profile":"只读调研、证据收集、输出 artifact refs"},
+  {"schema_version":"agenttask.v2","action":"delegate.create","parent_task_id":"<step_id>","routing":{"mode":"agent_as_tool","selected_agent":"研究员","target_selector":{"role":"researcher","capabilities_required":["web.search","source.verify"],"reuse_policy":"prefer_existing","security_context":"standard"}},"work_order":{"objective":"调研指定问题","background":"用户当前上下文","non_goals":["不要写代码"],"success_criteria":["给出证据","给出风险"],"stop_condition":"产出结构化结论后停止"},"capability_contract":{"tools_allowed":["web.search","read"],"tools_forbidden":["repo.write","deploy","email.send"],"write_policy":"none","network_policy":"allowlist","memory_write":"candidate_only","max_subagents":0},"context_contract":{"history_mode":"summary","artifact_reference_only":true,"include_raw_logs":false},"output_contract":{"format":"structured_markdown","required_sections":["summary","findings","evidence_refs","risks","artifact_refs","confidence"],"schema_validation":"strict","on_invalid_output":"request_repair_once"}}
+]}</ga-control>
+
+动作清单：
+- `session.pin|session.unpin|session.category|session.filter|session.clear_filter|session.collapse_category|session.expand_category|session.archive|session.unarchive|session.delete|session.rename|session.show_archived|session.hide_archived`
+- `task.plan.create`, `task.update`, `task.done`, `task.start`, `task.fail`, `task.cancel`
+- `agent.create`, `agent.profile.update`, `agent.role.update`, `agent.model.update`, `agent.stop`
+- `delegate.create`
+- `memory.candidate`
+
+规则：
+- `delegate.create` 是异步委派：发出后等待子 agent 结果进入 bus/系统消息，再汇总或完成计划步骤。
+- `delegate.create` 必须带 `routing`、`work_order`、`capability_contract`、`context_contract`、`output_contract`，让能力匹配、工作安排和输出契约完整可审计。
+- 默认创建临时会话 agent；只有用户明确要求长期/持久/永久/正式时，`agent.create` 才使用 `lifecycle:"persistent"` 或 `persistent:true`。
+- 用户明确要求全新/不要复用时，使用 `reuse_policy:"force_new"` 或 `force_new:true`。
+- Secret Vault 已解锁时仍使用同样的 `ga-control.v2` / `agent.create` / `delegate.create` 控制；持久 Secret agent 写入加密 `secret_subagents`，不要检查或推断普通 `memory/subagents/` 目录。
+- 你是主控 Orchestrator；读任务可并行，写任务保持单写者；子 agent 返回 artifact/证据/摘要，不要无结构自由聊天。
+- 批量操作历史会话时优先用 `/sessions` 输出的稳定 `id:xxxxxx` 或完整文件名作为 target；不要用 `S01`/`1` 这种当前视图相对编号，除非同时提供 `expected_title`。
+[/GenericAgent-TUI ga-control v2]
 """
 
 
@@ -1111,7 +1116,7 @@ def session_subagent_control_blocks(path: str) -> list[tuple[float, str]]:
     except OSError:
         return []
     blocks: list[tuple[float, str]] = []
-    action_markers = ("subagent_ask", "subagent_run", "subagent_input", "agent_ask", "agent_run")
+    action_markers = ("delegate.create", "agenttask.v2", "subagent_ask", "subagent_run", "subagent_input", "agent_ask", "agent_run")
     for timestamp, response_body in RESPONSE_BLOCK_WITH_TIME_RE.findall(content):
         if not any(marker in response_body for marker in action_markers):
             continue
@@ -3870,8 +3875,26 @@ def subagent_task_schema_kwargs(
     }
 
 
+def policy_relevant_subagent_prompt_text(prompt: str) -> str:
+    marker_start = "[GA TUI AgentTask Envelope v2]"
+    marker_end = "[/GA TUI AgentTask Envelope v2]"
+    text = prompt or ""
+    if marker_start not in text or marker_end not in text:
+        return text
+    raw = text.split(marker_start, 1)[1].split(marker_end, 1)[0].strip()
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        return text
+    if not isinstance(payload, dict):
+        return text
+    work_order = payload.get("work_order") if isinstance(payload.get("work_order"), dict) else {}
+    objective = str(work_order.get("objective") or payload.get("objective") or "").strip()
+    return objective or text
+
+
 def infer_policy_action_for_subagent_task(sub: SubAgentRuntime, prompt: str) -> str:
-    text = unicodedata.normalize("NFKC", prompt or "").lower()
+    text = unicodedata.normalize("NFKC", policy_relevant_subagent_prompt_text(prompt)).lower()
     checks = [
         ("access_secret", ("api key", "apikey", "secret", "token", "credential", "password", "密码", "密钥", "凭据", "令牌")),
         ("spend_money", ("buy", "purchase", "pay", "charge", "充值", "购买", "付款", "付费", "花钱")),
@@ -3902,6 +3925,7 @@ def policy_gate_for_subagent_task(
     task_title: str = "",
     queue_if_required: bool = True,
 ) -> PolicyDecision:
+    task_objective = policy_relevant_subagent_prompt_text(prompt)
     action = infer_policy_action_for_subagent_task(sub, prompt)
     decision = evaluate_policy_action(
         action,
@@ -3916,13 +3940,13 @@ def policy_gate_for_subagent_task(
             "task_id": bus_task_id,
             "parent_task_id": parent_task_id,
             "task_title": task_title,
-            "prompt_preview": truncate_cells(prompt, 240),
+            "prompt_preview": truncate_cells(task_objective, 240),
         },
     )
     if queue_if_required and decision.approval_required:
         queue_policy_approval(
             decision,
-            summary=f"{sub.name}: {truncate_cells(prompt, 100)}",
+            summary=f"{sub.name}: {truncate_cells(task_objective, 100)}",
             extra_payload={
                 "deferred_operation": "start_subagent_task",
                 "subagent_id": sub.agent_id,
@@ -7194,17 +7218,16 @@ def format_plan_continuation_prompt(
         f"Next unblocked step: {next_task_id} - {next_title}",
         "",
         "This is a control-emission continuation, not a research, browsing, or user-chat turn.",
-        "Execute exactly the next ledger step by emitting hidden <ga-tui> JSON control blocks before any prose.",
+        "Execute exactly the next ledger step by emitting hidden <ga-control> JSON control blocks before any prose.",
         "Do not call browser/search/file/code tools such as web_scan, webexecute_js, file_read, or code_run just to decide what to do; the task ledger above is authoritative.",
         f"When a control belongs to the next step, attach it with parent_task_id={next_task_id!r} or an equivalent step reference.",
         "Do not repeat completed steps. Reuse existing subagents before creating new ones.",
         "Temporary subagents are the default unless the user/control explicitly asks for persistent/long-term agents.",
-        "If you need child agent output before summarizing, delegate with subagent_ask and wait for results instead of inventing a summary.",
-        "If the plan is blocked, emit a task_update/task_fail for the blocked step with a concrete reason.",
+        "If you need child agent output before summarizing, delegate with agenttask.v2 delegate.create and wait for results instead of inventing a summary.",
+        "If the plan is blocked, emit task.update/task.fail for the blocked step with a concrete reason.",
         "Examples to adapt, not copy literally:",
-        f'<ga-tui>{{"action":"subagent_create","name":"<name>","profile":"<role and boundaries>","parent_task_id":"{next_task_id}"}}</ga-tui>',
-        f'<ga-tui>{{"action":"subagent_ask","target":"<agent name or id>","prompt":"<bounded task>","parent_task_id":"{next_task_id}"}}</ga-tui>',
-        f'<ga-tui>{{"action":"task_update","target":"{next_task_id}","status":"working|completed|failed","summary":"<what changed>"}}</ga-tui>',
+        f'<ga-control>{{"schema_version":"ga-control.v2","actions":[{{"action":"agent.create","name":"<name>","role":"researcher","lifecycle":"ephemeral","profile":"<role and boundaries>","parent_task_id":"{next_task_id}"}},{{"schema_version":"agenttask.v2","action":"delegate.create","parent_task_id":"{next_task_id}","routing":{{"mode":"agent_as_tool","selected_agent":"<agent name or id>","target_selector":{{"role":"researcher","capabilities_required":["read"],"reuse_policy":"prefer_existing","security_context":"standard"}}}},"work_order":{{"objective":"<bounded task>","success_criteria":["<done condition>"],"stop_condition":"return structured result then stop"}},"capability_contract":{{"tools_allowed":["read"],"tools_forbidden":["repo.write","deploy","email.send"],"write_policy":"none","max_subagents":0}},"context_contract":{{"history_mode":"summary","artifact_reference_only":true,"include_raw_logs":false}},"output_contract":{{"format":"structured_markdown","required_sections":["summary","findings","evidence_refs","risks","artifact_refs","confidence"],"schema_validation":"strict"}}}}]}}</ga-control>',
+        f'<ga-control>{{"schema_version":"ga-control.v2","actions":[{{"action":"task.update","target":"{next_task_id}","status":"working|completed|failed","summary":"<what changed>"}}]}}</ga-control>',
         "[/GA TUI Orchestrator Auto-Continue]",
     ]
     return "\n".join(lines)
@@ -10696,94 +10719,281 @@ def rename_session_path(state: State, path: str, raw_name: str) -> str:
         return f"命名失败: {type(exc).__name__}: {exc}"
 
 
+GA_CONTROL_SCHEMA = "ga-control.v2"
+AGENT_TASK_SCHEMA = "agenttask.v2"
+
 KNOWN_TUI_CONTROL_ACTIONS = {
-    "pin",
-    "pinned",
-    "unpin",
-    "unpinned",
-    "category",
-    "categorize",
-    "set_category",
-    "filter",
-    "set_filter",
-    "filter_category",
-    "clear_filter",
-    "filter_off",
-    "collapse",
-    "collapse_category",
-    "expand",
-    "expand_category",
-    "toggle_category",
-    "toggle_collapse",
-    "archive",
-    "unarchive",
-    "restore_archive",
-    "delete",
-    "remove",
-    "rename",
-    "set_name",
-    "name",
-    "show_archived",
-    "archived_on",
-    "hide_archived",
-    "archived_off",
-    "toggle_archived",
-    "archived",
-    "task_plan",
-    "plan",
-    "plan_create",
+    "session_pin",
+    "session_unpin",
+    "session_category",
+    "session_filter",
+    "session_clear_filter",
+    "session_collapse_category",
+    "session_expand_category",
+    "session_archive",
+    "session_unarchive",
+    "session_delete",
+    "session_rename",
+    "session_show_archived",
+    "session_hide_archived",
+    "task_plan_create",
     "task_update",
     "task_done",
     "task_start",
     "task_fail",
     "task_cancel",
-    "subagent_create",
     "agent_create",
-    "create_subagent",
-    "new_subagent",
-    "subagent_ask",
-    "subagent_run",
-    "subagent_input",
-    "agent_ask",
-    "agent_run",
-    "subagent_remember",
-    "subagent_memory",
-    "agent_remember",
-    "agent_memory",
-    "subagent_profile",
-    "subagent_set_profile",
-    "agent_profile",
-    "subagent_role",
-    "agent_role",
-    "subagent_model",
-    "agent_model",
-    "subagent_stop",
+    "agent_profile_update",
+    "agent_role_update",
+    "agent_model_update",
     "agent_stop",
+    "delegate_create",
+    "memory_candidate",
+}
+
+SESSION_V2_TO_EXECUTION_ACTION = {
+    "session_pin": "pin",
+    "session_unpin": "unpin",
+    "session_category": "category",
+    "session_filter": "filter",
+    "session_clear_filter": "clear_filter",
+    "session_collapse_category": "collapse_category",
+    "session_expand_category": "expand_category",
+    "session_archive": "archive",
+    "session_unarchive": "unarchive",
+    "session_delete": "delete",
+    "session_rename": "rename",
+    "session_show_archived": "show_archived",
+    "session_hide_archived": "hide_archived",
 }
 
 
 def normalized_control_action(control: dict[str, Any]) -> str:
-    return str(control.get("action") or control.get("op") or "").strip().lower().replace("-", "_")
+    return str(control.get("action") or control.get("op") or "").strip().lower().replace("-", "_").replace(".", "_")
 
 
 def known_tui_control(control: dict[str, Any]) -> bool:
     return normalized_control_action(control) in KNOWN_TUI_CONTROL_ACTIONS
 
 
+def action_schema_valid(control: dict[str, Any]) -> bool:
+    schema = str(control.get("schema_version") or "").strip().lower()
+    return schema in {"", AGENT_TASK_SCHEMA}
+
+
+def coerce_ga_control_action(action: dict[str, Any]) -> Optional[dict[str, Any]]:
+    if not isinstance(action, dict):
+        return None
+    item = dict(action)
+    if not item.get("schema_version"):
+        item["schema_version"] = AGENT_TASK_SCHEMA
+    if not action_schema_valid(item) or not known_tui_control(item):
+        return None
+    return item
+
+
+def agenttask_work_order(control: dict[str, Any]) -> dict[str, Any]:
+    value = control.get("work_order")
+    if isinstance(value, dict):
+        return value
+    value = control.get("task")
+    return value if isinstance(value, dict) else {}
+
+
+def agenttask_routing(control: dict[str, Any]) -> dict[str, Any]:
+    value = control.get("routing")
+    return value if isinstance(value, dict) else {}
+
+
+def agenttask_target_selector(control: dict[str, Any]) -> dict[str, Any]:
+    routing = agenttask_routing(control)
+    value = routing.get("target_selector")
+    return value if isinstance(value, dict) else {}
+
+
+def agenttask_contract(control: dict[str, Any], key: str) -> dict[str, Any]:
+    value = control.get(key)
+    return value if isinstance(value, dict) else {}
+
+
+def lifecycle_is_persistent(control: dict[str, Any]) -> Optional[bool]:
+    for key in ("persistent", "durable", "long_term"):
+        if key in control:
+            return control_truthy(control.get(key))
+    lifecycle = str(control.get("lifecycle") or control.get("scope") or "").strip().lower()
+    if lifecycle in {"persistent", "durable", "long_term", "long-term", "permanent", "正式", "持久", "长期", "永久"}:
+        return True
+    if lifecycle in {"ephemeral", "temporary", "temp", "session", "session_only", "临时", "暂时"}:
+        return False
+    return None
+
+
+def force_new_from_v2(control: dict[str, Any]) -> bool:
+    if control_truthy(control.get("force_new")) or control_truthy(control.get("create_new")):
+        return True
+    reuse_policy = str(control.get("reuse_policy") or "").strip().lower().replace("-", "_")
+    selector = agenttask_target_selector(control)
+    selector_policy = str(selector.get("reuse_policy") or "").strip().lower().replace("-", "_")
+    return reuse_policy in {"force_new", "never", "none", "no_reuse"} or selector_policy in {"force_new", "never", "none", "no_reuse"}
+
+
+def agenttask_objective(control: dict[str, Any]) -> str:
+    work_order = agenttask_work_order(control)
+    return str(
+        work_order.get("objective")
+        or control.get("objective")
+        or control.get("prompt")
+        or control.get("message")
+        or ""
+    ).strip()
+
+
+def format_agenttask_worker_prompt(control: dict[str, Any]) -> str:
+    objective = agenttask_objective(control)
+    work_order = agenttask_work_order(control)
+    output_contract = agenttask_contract(control, "output_contract")
+    payload = json.dumps(control, ensure_ascii=False, indent=2, sort_keys=True, default=str)
+    sections = [
+        "[GA TUI AgentTask Envelope v2]",
+        payload,
+        "[/GA TUI AgentTask Envelope v2]",
+        "",
+        "[Work Order]",
+        f"objective: {objective}",
+    ]
+    background = str(work_order.get("background") or "").strip()
+    if background:
+        sections.append(f"background: {background}")
+    non_goals = work_order.get("non_goals")
+    if isinstance(non_goals, list) and non_goals:
+        sections.append("non_goals:")
+        sections.extend(f"- {item}" for item in non_goals)
+    success = work_order.get("success_criteria")
+    if isinstance(success, list) and success:
+        sections.append("success_criteria:")
+        sections.extend(f"- {item}" for item in success)
+    stop_condition = str(work_order.get("stop_condition") or "").strip()
+    if stop_condition:
+        sections.append(f"stop_condition: {stop_condition}")
+    required = output_contract.get("required_sections")
+    if isinstance(required, list) and required:
+        sections.append("required_output_sections:")
+        sections.extend(f"- {item}" for item in required)
+    sections.append("[/Work Order]")
+    return "\n".join(str(item) for item in sections).strip()
+
+
+def execution_control_from_v2(control: dict[str, Any]) -> Optional[dict[str, Any]]:
+    action = normalized_control_action(control)
+    common = {
+        "_ga_control_schema_version": str(control.get("schema_version") or AGENT_TASK_SCHEMA),
+        "_ga_control_external_action": str(control.get("action") or ""),
+        "_ga_control_envelope": dict(control),
+    }
+    if action in SESSION_V2_TO_EXECUTION_ACTION:
+        mapped = dict(control)
+        mapped.update(common)
+        mapped["action"] = SESSION_V2_TO_EXECUTION_ACTION[action]
+        return mapped
+    if action == "task_plan_create":
+        mapped = dict(common)
+        work_order = agenttask_work_order(control)
+        mapped.update({
+            "action": "task_plan",
+            "title": control.get("title") or work_order.get("title") or control.get("name") or "任务计划",
+            "steps": control.get("steps") or work_order.get("steps") or control.get("tasks") or control.get("items") or [],
+        })
+        return mapped
+    if action in {"task_update", "task_done", "task_start", "task_fail", "task_cancel"}:
+        mapped = dict(control)
+        mapped.update(common)
+        mapped["action"] = action
+        mapped["target"] = control.get("target") or control.get("task_id") or control.get("parent_task_id") or ""
+        return mapped
+    if action == "agent_create":
+        selector = agenttask_target_selector(control)
+        persistent = lifecycle_is_persistent(control)
+        if persistent is None:
+            persistent = lifecycle_is_persistent(selector)
+        mapped = dict(common)
+        mapped.update({
+            "action": "subagent_create",
+            "name": control.get("name") or selector.get("name") or control.get("title") or selector.get("role") or "subagent",
+            "profile": control.get("profile") or control.get("description") or selector.get("profile") or selector.get("description") or "",
+            "role": control.get("role") or selector.get("role") or "specialist",
+            "plan_step_id": control.get("plan_step_id") or control.get("parent_task_id") or control.get("step") or "",
+            "force_new": force_new_from_v2(control),
+        })
+        if persistent is not None:
+            mapped["persistent"] = bool(persistent)
+            mapped["temporary"] = not bool(persistent)
+        return mapped
+    if action == "delegate_create":
+        routing = agenttask_routing(control)
+        selector = agenttask_target_selector(control)
+        selected = (
+            routing.get("selected_agent")
+            or selector.get("agent_id")
+            or selector.get("target")
+            or selector.get("name")
+            or control.get("target")
+            or control.get("agent")
+            or ""
+        )
+        mapped = dict(common)
+        mapped.update({
+            "action": "subagent_ask",
+            "target": selected,
+            "prompt": format_agenttask_worker_prompt(control),
+            "parent_task_id": control.get("parent_task_id") or control.get("plan_step_id") or control.get("step") or "",
+            "task_title": control.get("task_title") or control.get("title") or agenttask_objective(control),
+        })
+        return mapped
+    if action == "memory_candidate":
+        mapped = dict(common)
+        mapped.update({
+            "action": "subagent_remember",
+            "target": control.get("target") or control.get("agent_id") or control.get("agent") or "",
+            "memory": control.get("memory") or control.get("statement") or control.get("note") or "",
+        })
+        return mapped
+    if action in {"agent_profile_update", "agent_role_update", "agent_model_update", "agent_stop"}:
+        mapped = dict(control)
+        mapped.update(common)
+        mapped["target"] = control.get("target") or control.get("agent_id") or control.get("agent") or ""
+        mapped["action"] = {
+            "agent_profile_update": "subagent_profile",
+            "agent_role_update": "subagent_role",
+            "agent_model_update": "subagent_model",
+            "agent_stop": "subagent_stop",
+        }[action]
+        return mapped
+    return None
+
+
 def controls_from_json_payload(payload: Any, *, require_known: bool = False) -> list[dict[str, Any]]:
-    raw_items: list[Any]
-    if isinstance(payload, dict) and isinstance(payload.get("actions"), list):
-        raw_items = list(payload["actions"])
-    elif isinstance(payload, list):
-        raw_items = list(payload)
-    elif isinstance(payload, dict):
+    raw_items: list[Any] = []
+    if isinstance(payload, dict) and str(payload.get("schema_version") or "").strip().lower() == GA_CONTROL_SCHEMA:
+        actions = payload.get("actions")
+        if isinstance(actions, list):
+            raw_items = list(actions)
+        elif payload.get("action"):
+            item = dict(payload)
+            item["schema_version"] = AGENT_TASK_SCHEMA
+            raw_items = [item]
+    elif isinstance(payload, dict) and str(payload.get("schema_version") or "").strip().lower() == AGENT_TASK_SCHEMA:
         raw_items = [payload]
-    else:
-        raw_items = []
-    controls = [item for item in raw_items if isinstance(item, dict)]
+    elif isinstance(payload, list):
+        raw_items = [item for item in payload if isinstance(item, dict) and str(item.get("schema_version") or "").strip().lower() == AGENT_TASK_SCHEMA]
+    controls = [coerced for item in raw_items if isinstance(item, dict) for coerced in [coerce_ga_control_action(item)] if coerced is not None]
     if require_known:
         controls = [item for item in controls if known_tui_control(item)]
-    return controls
+    execution_controls = []
+    for control in controls:
+        mapped = execution_control_from_v2(control)
+        if mapped is not None:
+            execution_controls.append(mapped)
+    return execution_controls
 
 
 def controls_from_json_text(raw: str, *, require_known: bool = False) -> list[dict[str, Any]]:
@@ -10825,8 +11035,10 @@ def strip_tui_controls(text: str, *, allow_json_fences: bool = False) -> str:
         text = TUI_CONTROL_JSON_FENCE_RE.sub(strip_json_control_fence, text)
     text = TUI_CONTROL_RE.sub("", text)
     text = TUI_CONTROL_FENCE_RE.sub("", text)
-    text = re.sub(r"<ga[-_]tui>[\s\S]*$", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"```ga[-_]tui[\s\S]*$", "", text, flags=re.IGNORECASE)
+    text = LEGACY_TUI_CONTROL_RE.sub("", text)
+    text = LEGACY_TUI_CONTROL_FENCE_RE.sub("", text)
+    text = re.sub(r"<ga[-_](?:control|tui)>[\s\S]*$", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"```ga[-_](?:control|tui)[\s\S]*$", "", text, flags=re.IGNORECASE)
     return text.strip()
 
 
@@ -17898,6 +18110,7 @@ def start_secret_subagent_task(
 ) -> str:
     if not state.secret_vault.unlocked or not state.secret_vault.key:
         return "Secret Vault 已锁定，不能启动 Secret 子 agent。"
+    task_objective = policy_relevant_subagent_prompt_text(prompt)
     network_decision = secret_network_gate(state, operation="secret_subagent_task")
     if not network_decision.allowed:
         return policy_gate_text(network_decision)
@@ -17912,13 +18125,13 @@ def start_secret_subagent_task(
         )
     action = infer_policy_action_for_subagent_task(sub, prompt)
     if action != "read_only" and not policy_approved:
-        write_secret_subagent_trace(state, sub, short_uid("task"), "policy_gate_denied", "rejected", {"action": action, "prompt_preview": truncate_cells(prompt, 240)})
+        write_secret_subagent_trace(state, sub, short_uid("task"), "policy_gate_denied", "rejected", {"action": action, "prompt_preview": truncate_cells(task_objective, 240)})
         return f"Secret 子 agent 高风险操作暂未开放自动审批：{action}。"
     bus_task_id = short_uid("task")
     agent = ensure_subagent_agent(state, sub)
     sub.task_id += 1
     task_id = sub.task_id
-    context_pack, context_ref = build_context_pack(state, sub, prompt, bus_task_id, parent_task_id=parent_task_id)
+    context_pack, context_ref = build_context_pack(state, sub, task_objective, bus_task_id, parent_task_id=parent_task_id)
     sub.active_task_id = task_id
     sub.active_bus_task_id = bus_task_id
     sub.status = "running"
@@ -17935,7 +18148,7 @@ def start_secret_subagent_task(
         sub,
         bus_task_id,
         status="working",
-        prompt=prompt,
+        prompt=task_objective,
         parent_task_id=parent_task_id,
         task_title=task_title,
         artifact_refs=[context_ref],
@@ -17946,7 +18159,7 @@ def start_secret_subagent_task(
         bus_task_id,
         intent="delegate",
         status="working",
-        payload={"objective": prompt, "context_pack_ref": context_ref, "role": sub.role},
+        payload={"objective": task_objective, "context_pack_ref": context_ref, "role": sub.role},
         artifact_refs=[context_ref],
     )
     write_secret_subagent_trace(state, sub, bus_task_id, "delegated", "working", {"context_pack": context_ref, "source": source})
@@ -17961,7 +18174,7 @@ def start_secret_subagent_task(
         save_subagent_meta(sub, state)
         mark_subagent_messages_changed(state, sub)
         error = f"{type(exc).__name__}: {exc}"
-        write_secret_subagent_task_record(state, sub, bus_task_id, status="failed", prompt=prompt, error=error, parent_task_id=parent_task_id, task_title=task_title)
+        write_secret_subagent_task_record(state, sub, bus_task_id, status="failed", prompt=task_objective, error=error, parent_task_id=parent_task_id, task_title=task_title)
         write_secret_subagent_trace(state, sub, bus_task_id, "put_task_failed", "failed", {"error": error})
         return f"{sub.name} 启动失败: {error}"
     threading.Thread(target=consume_subagent_queue, args=(state, sub.agent_id, task_id, dq), daemon=True, name=f"secret-subagent-{sub.agent_id}-stream").start()
@@ -18026,6 +18239,7 @@ def start_subagent_task(
     prompt = (prompt or "").strip()
     if not prompt:
         return "子 agent 输入为空。"
+    task_objective = policy_relevant_subagent_prompt_text(prompt)
     if sub.security_context == "secret":
         return start_secret_subagent_task(
             state,
@@ -18060,7 +18274,7 @@ def start_subagent_task(
         if decision.approval_required:
             append_orchestrator_plan(
                 sub,
-                prompt,
+                task_objective,
                 bus_task_id,
                 status="approval_required",
                 source=source,
@@ -18072,11 +18286,11 @@ def start_subagent_task(
                 assigned_agent=sub.agent_id,
                 title=task_title or f"子 agent 执行: {sub.name}",
                 kind="subagent_task",
-                objective=truncate_cells(prompt, 240),
+                objective=truncate_cells(task_objective, 240),
                 parent_task_id=parent_task_id,
                 session_key=active_ui_session_key(state),
                 summary=policy_gate_text(decision),
-                **subagent_task_schema_kwargs(sub, prompt, decision=decision),
+                **subagent_task_schema_kwargs(sub, task_objective, decision=decision),
             )
             update_plan_step_from_child(parent_task_id)
             checkpoint = append_task_checkpoint(
@@ -18094,7 +18308,7 @@ def start_subagent_task(
         if not decision.allowed:
             append_orchestrator_plan(
                 sub,
-                prompt,
+                task_objective,
                 bus_task_id,
                 status="rejected",
                 source=source,
@@ -18107,11 +18321,11 @@ def start_subagent_task(
                 assigned_agent=sub.agent_id,
                 title=task_title or f"子 agent 执行: {sub.name}",
                 kind="subagent_task",
-                objective=truncate_cells(prompt, 240),
+                objective=truncate_cells(task_objective, 240),
                 parent_task_id=parent_task_id,
                 session_key=active_ui_session_key(state),
                 error=policy_gate_text(decision),
-                **subagent_task_schema_kwargs(sub, prompt, decision=decision),
+                **subagent_task_schema_kwargs(sub, task_objective, decision=decision),
             )
             update_plan_step_from_child(parent_task_id)
             checkpoint = append_task_checkpoint(
@@ -18129,11 +18343,11 @@ def start_subagent_task(
     agent = ensure_subagent_agent(state, sub)
     sub.task_id += 1
     task_id = sub.task_id
-    locked, lock_error = acquire_single_writer_lock(sub, bus_task_id, prompt)
+    locked, lock_error = acquire_single_writer_lock(sub, bus_task_id, task_objective)
     if not locked:
         append_orchestrator_plan(
             sub,
-            prompt,
+            task_objective,
             bus_task_id,
             status="rejected",
             source=source,
@@ -18146,11 +18360,11 @@ def start_subagent_task(
             assigned_agent=sub.agent_id,
             title=task_title or f"子 agent 执行: {sub.name}",
             kind="subagent_task",
-            objective=truncate_cells(prompt, 240),
+            objective=truncate_cells(task_objective, 240),
             parent_task_id=parent_task_id,
             session_key=active_ui_session_key(state),
             error=lock_error,
-            **subagent_task_schema_kwargs(sub, prompt, decision=decision),
+            **subagent_task_schema_kwargs(sub, task_objective, decision=decision),
         )
         update_plan_step_from_child(parent_task_id)
         checkpoint = append_task_checkpoint(
@@ -18163,10 +18377,10 @@ def start_subagent_task(
         )
         append_trace(bus_task_id, "single_writer_denied", agent_id=sub.agent_id, status="rejected", payload={"error": lock_error, "checkpoint_id": checkpoint.get("checkpoint_id", "")})
         return lock_error
-    context_pack, context_ref = build_context_pack(state, sub, prompt, bus_task_id)
+    context_pack, context_ref = build_context_pack(state, sub, task_objective, bus_task_id, parent_task_id=parent_task_id)
     append_orchestrator_plan(
         sub,
-        prompt,
+        task_objective,
         bus_task_id,
         status="working",
         source=source,
@@ -18190,11 +18404,11 @@ def start_subagent_task(
         assigned_agent=sub.agent_id,
         title=task_title or f"子 agent 执行: {sub.name}",
         kind="subagent_task",
-        objective=truncate_cells(prompt, 240),
+        objective=truncate_cells(task_objective, 240),
         parent_task_id=parent_task_id,
         session_key=active_ui_session_key(state),
         artifact_refs=[context_ref],
-        **subagent_task_schema_kwargs(sub, prompt, decision=decision),
+        **subagent_task_schema_kwargs(sub, task_objective, decision=decision),
     )
     update_plan_step_from_child(parent_task_id)
     append_agent_mail(
@@ -18205,7 +18419,7 @@ def start_subagent_task(
         task_id=bus_task_id,
         status="working",
         payload={
-            "objective": prompt,
+            "objective": task_objective,
             "context_pack_ref": context_ref,
             "role": sub.role,
             "output_contract": {"required_sections": role_output_contract(sub.role)},
@@ -18214,12 +18428,12 @@ def start_subagent_task(
         artifact_refs=[context_ref],
         budget=default_task_budget(sub.role),
         permissions=permissions_for_role(sub.role, security_context=sub.security_context),
-        context_policy=context_policy_for_task(prompt, security_context=sub.security_context),
-        task=task_contract_for_role(sub.role, prompt),
+        context_policy=context_policy_for_task(task_objective, security_context=sub.security_context),
+        task=task_contract_for_role(sub.role, task_objective),
         risks=risks_for_action(
             decision.action if decision is not None else infer_policy_action_for_subagent_task(sub, prompt),
             sub.role,
-            prompt,
+            task_objective,
         ),
         approval=approval_metadata(decision=decision) if decision is not None else approval_metadata(),
     )
@@ -18229,7 +18443,7 @@ def start_subagent_task(
         reason="subagent_delegated",
         state=state,
         agent_id=sub.agent_id,
-        summary=truncate_cells(prompt, 240),
+        summary=truncate_cells(task_objective, 240),
         extra={"context_pack_ref": context_ref},
     )
     append_trace(bus_task_id, "delegated", agent_id=sub.agent_id, status="working", payload={"context_pack": context_ref, "role": sub.role, "checkpoint_id": checkpoint.get("checkpoint_id", "")})
@@ -18247,7 +18461,7 @@ def start_subagent_task(
         release_single_writer_lock(bus_task_id)
         append_orchestrator_plan(
             sub,
-            prompt,
+            task_objective,
             bus_task_id,
             status="failed",
             source=source,
@@ -18261,11 +18475,11 @@ def start_subagent_task(
             assigned_agent=sub.agent_id,
             title=task_title or f"子 agent 执行: {sub.name}",
             kind="subagent_task",
-            objective=truncate_cells(prompt, 240),
+            objective=truncate_cells(task_objective, 240),
             parent_task_id=parent_task_id,
             session_key=active_ui_session_key(state),
             error=f"{type(exc).__name__}: {exc}",
-            **subagent_task_schema_kwargs(sub, prompt, decision=decision),
+            **subagent_task_schema_kwargs(sub, task_objective, decision=decision),
         )
         update_plan_step_from_child(parent_task_id)
         checkpoint = append_task_checkpoint(
