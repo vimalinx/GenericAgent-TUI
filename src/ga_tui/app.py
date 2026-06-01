@@ -11674,12 +11674,75 @@ def controls_from_json_payload(payload: Any, *, require_known: bool = False) -> 
     return execution_controls
 
 
-def controls_from_json_text(raw: str, *, require_known: bool = False) -> list[dict[str, Any]]:
+def repair_json_missing_tail(raw: str) -> str:
+    text = (raw or "").strip()
+    if not text:
+        return ""
+    stack: list[str] = []
+    in_string = False
+    escape = False
+    for ch in text:
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            stack.append("}")
+        elif ch == "[":
+            stack.append("]")
+        elif ch in {"}", "]"}:
+            if not stack or stack[-1] != ch:
+                return ""
+            stack.pop()
+    if in_string or escape or not stack:
+        return ""
+    return text.rstrip() + "".join(reversed(stack))
+
+
+def load_ga_control_json_text(raw: str) -> tuple[Any, bool, str]:
+    text = (raw or "").strip()
+    if not text:
+        return None, False, "empty control block"
     try:
-        payload = json.loads((raw or "").strip())
-    except Exception:
+        return json.loads(text), False, ""
+    except json.JSONDecodeError as exc:
+        repaired = repair_json_missing_tail(text)
+        if repaired:
+            try:
+                return json.loads(repaired), True, ""
+            except json.JSONDecodeError:
+                pass
+        return None, False, f"JSON parse error at line {exc.lineno} column {exc.colno}: {exc.msg}"
+    except Exception as exc:
+        return None, False, f"JSON parse error: {type(exc).__name__}: {exc}"
+
+
+def controls_from_json_text(raw: str, *, require_known: bool = False) -> list[dict[str, Any]]:
+    payload, _repaired, _error = load_ga_control_json_text(raw)
+    if payload is None:
         return []
     return controls_from_json_payload(payload, require_known=require_known)
+
+
+def tui_control_parse_errors(text: str, *, allow_json_fences: bool = False) -> list[str]:
+    errors: list[str] = []
+    blocks = TUI_CONTROL_RE.findall(text or "") + TUI_CONTROL_FENCE_RE.findall(text or "")
+    if allow_json_fences:
+        blocks.extend(TUI_CONTROL_JSON_FENCE_RE.findall(text or ""))
+    for raw in blocks:
+        payload, _repaired, error = load_ga_control_json_text(raw)
+        if error:
+            errors.append(error)
+            continue
+        if payload is not None and not controls_from_json_payload(payload, require_known=allow_json_fences):
+            errors.append("control JSON parsed but no known ga-control.v2 or agenttask.v2 action was found")
+    return errors
 
 
 def extract_tui_controls(text: str, *, allow_json_fences: bool = False) -> list[dict[str, Any]]:
@@ -11860,6 +11923,18 @@ def apply_tui_controls_from_text(state: State, text: str, source: str = "agent",
             mark_dirty(state)
         else:
             add_system(state, message)
+
+    if not controls:
+        for error in tui_control_parse_errors(text):
+            record_control_result("parse_error", "", f"控制块解析失败：{error}")
+        if agent_source and agent_control_results:
+            add_system(
+                state,
+                "Agent 控制结果：\n" + "\n".join(agent_control_results),
+                persist=True,
+                kind="agent_control_result",
+            )
+        return
 
     for control in controls:
         action = str(control.get("action") or control.get("op") or "").strip().lower()

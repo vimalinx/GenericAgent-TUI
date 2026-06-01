@@ -1489,6 +1489,24 @@ def assert_subagent_create_respects_force_new_and_topic_terms() -> None:
     assert a.extract_tui_controls(non_control_json, allow_json_fences=True) == []
     assert a.strip_tui_controls(non_control_json, allow_json_fences=True) == non_control_json
 
+    truncated_create = (
+        '<ga-control>{"schema_version":"ga-control.v2","actions":['
+        '{"action":"agent.create","name":"新闻主编","role":"researcher","lifecycle":"persistent","profile":"RSS新闻采集与日报排版"}]'
+        '</ga-control>'
+    )
+    repaired_controls = a.extract_tui_controls(truncated_create)
+    assert len(repaired_controls) == 1, repaired_controls
+    assert repaired_controls[0]["action"] == "subagent_create", repaired_controls
+    a.apply_tui_controls_from_text(state, truncated_create, source="agent")
+    news_agent = a.resolve_subagent(state, "新闻主编")
+    assert news_agent is not None, state.subagents
+    assert news_agent.persistent is True, news_agent
+
+    bad_control_count = len(state.messages)
+    a.apply_tui_controls_from_text(state, '<ga-control>{"schema_version":</ga-control>', source="agent")
+    assert len(state.messages) == bad_control_count + 1, [msg.content for msg in state.messages]
+    assert "控制块解析失败" in state.messages[-1].content, state.messages[-1].content
+
 
 def assert_tui_query_tools_expose_dashboard_state() -> None:
     root = tempfile.mkdtemp(prefix="ga_tui_query_tools_")
