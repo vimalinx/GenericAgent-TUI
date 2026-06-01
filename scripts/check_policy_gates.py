@@ -1454,6 +1454,7 @@ def assert_subagent_create_respects_force_new_and_topic_terms() -> None:
     assert exact_reuse_score >= 40, exact_reuse_score
     assert "schema_version:\"ga-control.v2\"" in a.TUI_AGENT_CONTROL_HINT
     assert "agent.delete" in a.TUI_AGENT_CONTROL_HINT
+    assert "每天/每日/定时/持续积累" in a.TUI_AGENT_CONTROL_HINT
     assert "delegate.create" in a.TUI_AGENT_CONTROL_HINT
     assert "能力说明" in a.TUI_AGENT_CONTROL_HINT
     assert "不要在示例、教程或解释中包含可执行 `<ga-control>` 标签" in a.TUI_AGENT_CONTROL_HINT
@@ -1489,6 +1490,20 @@ def assert_subagent_create_respects_force_new_and_topic_terms() -> None:
     non_control_json = "```json\n{\"note\":\"not a TUI action\"}\n```"
     assert a.extract_tui_controls(non_control_json, allow_json_fences=True) == []
     assert a.strip_tui_controls(non_control_json, allow_json_fences=True) == non_control_json
+
+    long_running_create = ga_control({
+        "action": "agent.create",
+        "name": "RSS日报编辑",
+        "role": "researcher",
+        "profile": "负责对接各种 RSS 信息源，每天拉取新闻、持续积累资料并输出日报。",
+    })
+    long_running_controls = a.extract_tui_controls(long_running_create)
+    assert len(long_running_controls) == 1, long_running_controls
+    a.apply_tui_controls_from_text(state, long_running_create, source="agent")
+    long_running_agent = a.resolve_subagent(state, "RSS日报编辑")
+    assert long_running_agent is not None, state.subagents
+    assert long_running_agent.persistent is True, long_running_agent
+    assert os.path.commonpath([a.SUBAGENTS_DIR, long_running_agent.home]) == a.SUBAGENTS_DIR, long_running_agent.home
 
     truncated_create = (
         '<ga-control>{"schema_version":"ga-control.v2","actions":['

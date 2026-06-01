@@ -319,7 +319,7 @@ TUI_AGENT_CONTROL_HINT = """
 规则：
 - `delegate.create` 是异步委派：发出后等待子 agent 结果进入 bus/系统消息，再汇总或完成计划步骤。
 - `delegate.create` 必须带 `routing`、`work_order`、`capability_contract`、`context_contract`、`output_contract`，让能力匹配、工作安排和输出契约完整可审计。
-- 默认创建临时会话 agent；只有用户明确要求长期/持久/永久/正式时，`agent.create` 才使用 `lifecycle:"persistent"` 或 `persistent:true`。
+- 默认创建临时会话 agent；用户明确要求长期/持久/永久/正式，或描述每天/每日/定时/持续积累这类长期职责时，`agent.create` 使用 `lifecycle:"persistent"` 或 `persistent:true`。
 - 用户明确要求删除/移除子 agent 时使用 `agent.delete`，不要只使用 `agent.stop`；删除会从 TUI agent 列表移除并保留原目录作为可审计文件。
 - 用户明确要求全新/不要复用时，使用 `reuse_policy:"force_new"` 或 `force_new:true`。
 - Secret Vault 已解锁时仍使用同样的 `ga-control.v2` / `agent.create` / `delegate.create` 控制；持久 Secret agent 写入加密 `secret_subagents`，不要检查或推断普通 `memory/subagents/` 目录。
@@ -7953,11 +7953,27 @@ SUBAGENT_PERSISTENT_INTENT_TOKENS = (
     "long-term",
     "permanent",
     "durable",
+    "scheduled",
+    "recurring",
+    "daily",
+    "weekly",
     "长期",
     "持久",
     "永久",
     "正式",
     "保存身份",
+    "每天",
+    "每日",
+    "每周",
+    "定时",
+    "定期",
+    "周期",
+    "持续",
+    "积累",
+    "以后",
+    "固定",
+    "日报",
+    "周报",
 )
 
 SUBAGENT_TEMPORARY_INTENT_TOKENS = (
