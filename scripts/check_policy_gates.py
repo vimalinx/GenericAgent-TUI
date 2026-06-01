@@ -789,6 +789,7 @@ def assert_context_pack_schema(path: str) -> dict:
 def assert_restored_process_group_main_speech_visible() -> None:
     restored = (
         "**LLM Running (Turn 1) ...**\n"
+        "<summary>检查已有子代理</summary>\n"
         "第一段主代理说明：先检查已有子代理。\n\n"
         "🛠️ Tool: `webscan` 📥 args:\n"
         "````text\n"
@@ -798,6 +799,7 @@ def assert_restored_process_group_main_speech_visible() -> None:
         "hidden tool output one\n"
         "`````\n\n"
         "**LLM Running (Turn 2) ...**\n"
+        "<summary>派发任务并等待回复</summary>\n"
         "第二段主代理说明：现在派发任务并等待回复。\n\n"
         "🛠️ Tool: `fileread` 📥 args:\n"
         "````text\n"
@@ -811,6 +813,7 @@ def assert_restored_process_group_main_speech_visible() -> None:
     )
     rendered = a.render_assistant_text(restored, done=True, fold_process=True, message_index=2)
     assert "过程组 G3" in rendered, rendered
+    assert "检查已有子代理 / 派发任务并等待回复" in rendered, rendered
     assert "第一段主代理说明：先检查已有子代理。" in rendered, rendered
     assert "第二段主代理说明：现在派发任务并等待回复。" in rendered, rendered
     assert "最终主代理总结：两个步骤都已处理。" in rendered, rendered
@@ -825,6 +828,7 @@ def assert_restored_process_group_main_speech_visible() -> None:
 def assert_process_detail_line_not_swallowed_by_code_fence() -> None:
     restored = (
         "**LLM Running (Turn 1) ...**\n"
+        "<summary>运行代码块示例</summary>\n"
         "主代理给出一段带代码块的说明：\n"
         "```python\n"
         "print('visible example')\n\n"
@@ -834,16 +838,17 @@ def assert_process_detail_line_not_swallowed_by_code_fence() -> None:
         "````\n"
     )
     rendered = a.render_assistant_text(restored, done=True, fold_process=True, message_index=9)
-    assert "▸ 细节 Turn 1" in rendered, rendered
+    assert "▸ 细节 Turn 1: 运行代码块示例" in rendered, rendered
     render_lines = a.markdown_blocks(rendered, 100)
     flattened = "\n".join(line.text for line in render_lines)
     assert "│ ▸ 细节 Turn 1" not in flattened, flattened
-    assert "▸ 细节 Turn 1" in flattened, flattened
+    assert "▸ 细节 Turn 1: 运行代码块示例" in flattened, flattened
 
 
 def assert_single_search_turn_keeps_final_reply_visible() -> None:
     restored = (
         "**LLM Running (Turn 1) ...**\n"
+        "<summary>查询 GenericAgent TUI 能力</summary>\n"
         "🛠️ Tool: `web_search` 📥 args:\n"
         "````text\n"
         "{\"query\":\"GenericAgent TUI 能力\"}\n"
@@ -857,6 +862,9 @@ def assert_single_search_turn_keeps_final_reply_visible() -> None:
     rendered = a.render_assistant_text(restored, done=True, fold_process=True, message_index=11)
     assert "在这个 TUI 里，我可以帮你管理会话、拆任务、调度子 Agent。" in rendered, rendered
     assert rendered.index("在这个 TUI 里") < rendered.index("▸ 过程 Turn 1"), rendered
+    assert "▸ 过程 Turn 1: 查询 GenericAgent TUI 能力" in rendered, rendered
+    assert "搜索/浏览输出已折叠" not in rendered, rendered
+    assert "<summary>" not in rendered, rendered
     assert "search results noise" not in rendered, rendered
     assert "{\"query\"" not in rendered, rendered
 

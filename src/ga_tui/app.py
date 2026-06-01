@@ -12487,6 +12487,15 @@ def process_summary_text(text: str) -> str:
     return compact_description(summaries[-1], 220)
 
 
+def process_title_text(text: str) -> str:
+    summary = process_summary_text(text)
+    if summary:
+        return summary
+    if process_has_search_noise(text):
+        return "搜索/浏览输出已折叠"
+    return process_preview(text)
+
+
 def process_tools(text: str) -> list[str]:
     names: list[str] = []
     for pattern in (TOOL_CALL_RE, TOOL_USE_NAME_RE):
@@ -13083,7 +13092,7 @@ def collapsed_process_line(marker: str, body: str, current: bool) -> str:
     turn = TURN_NO_RE.search(marker or "")
     turn_label = f"Turn {turn.group(1)}" if turn else "Turn"
     tools = process_tools(body)
-    summary = "搜索/浏览输出已折叠" if process_has_search_noise(body) else (process_summary_text(body) or process_preview(body))
+    summary = process_title_text(body)
     status = "正在执行" if current else "已折叠"
     suffix = f" · tool: {', '.join(tools[:3])}" if tools else ""
     if len(tools) > 3:
@@ -13095,11 +13104,13 @@ def process_detail_line(marker: str, body: str, current: bool) -> str:
     turn = TURN_NO_RE.search(marker or "")
     turn_label = f"Turn {turn.group(1)}" if turn else "Turn"
     tools = process_tools(body)
+    summary = process_summary_text(body)
+    title = f": {summary}" if summary else ""
     suffix = f" · tool: {', '.join(tools[:3])}" if tools else ""
     if len(tools) > 3:
         suffix += f" +{len(tools) - 3}"
     status = "正在执行" if current else "已折叠"
-    return f"▸ 细节 {turn_label}{suffix} ({status})"
+    return f"▸ 细节 {turn_label}{title}{suffix} ({status})"
 
 
 def process_speech_header(marker: str, body: str) -> str:
@@ -13126,9 +13137,11 @@ def expanded_process_header(marker: str, body: str, current: bool) -> str:
     turn = TURN_NO_RE.search(marker or "")
     turn_label = f"Turn {turn.group(1)}" if turn else "Turn"
     tools = process_tools(body)
+    summary = process_summary_text(body)
+    title = f": {summary}" if summary else ""
     suffix = f" · tool: {', '.join(tools[:3])}" if tools else ""
     status = "正在等待用户输入" if current else "已展开"
-    return f"▾ 过程 {turn_label}{suffix} ({status})"
+    return f"▾ 过程 {turn_label}{title}{suffix} ({status})"
 
 
 def process_turn_no(marker: str, fallback: int) -> int:
@@ -13145,7 +13158,11 @@ def process_group_header(label: str, turns: list[tuple[str, str]], current: bool
     icon = "▾" if expanded else "▸"
     status = "正在执行" if current else ("已展开" if expanded else "已折叠")
     tool_names: list[str] = []
+    summaries: list[str] = []
     for _marker, body in turns:
+        summary = process_summary_text(body)
+        if summary and summary not in summaries:
+            summaries.append(summary)
         for tool in process_tools(body):
             if tool not in tool_names:
                 tool_names.append(tool)
@@ -13154,7 +13171,8 @@ def process_group_header(label: str, turns: list[tuple[str, str]], current: bool
         if len(tool_names) >= 3:
             break
     suffix = f" · tool: {', '.join(tool_names)}" if tool_names else ""
-    return f"{icon} 过程组 {label}: {len(turns)} 条过程{suffix} ({status}，点击展开/收起)"
+    title = compact_description(" / ".join(summaries), 120) if summaries else f"{len(turns)} 条过程"
+    return f"{icon} 过程组 {label}: {title}{suffix} ({status}，点击展开/收起)"
 
 
 def collapsed_process_child_line(label: str, marker: str, body: str, current: bool) -> str:
@@ -13287,7 +13305,7 @@ def append_process_turn(
     if collapse_whole and has_process_noise:
         rendered.append(collapsed_process_line(marker, body, current=current))
         return
-    summary = process_summary_text(body) or process_preview(body)
+    summary = process_title_text(body)
     if summary and summary != "执行中":
         rendered.append(process_speech_summary_line(marker, body, summary))
         if has_call_noise and fold_details:
