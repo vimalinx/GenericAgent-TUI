@@ -13,7 +13,7 @@ The TUI owns these top-level responsibilities:
 - Human approval gates and single-writer enforcement.
 - Runtime provider selection and capability discovery.
 - Model routing, model validation, recent/default model records, and per-agent default model assignment.
-- Scheduled task registry and future recurring dispatch through `agenttask.v2`.
+- Scheduled task registry and recurring dispatch through governed `agenttask.v2` delegation.
 - A2A/MCP gateway metadata for external agents and tools.
 
 Runtime providers own narrow execution:
@@ -48,16 +48,18 @@ Runtime and top-level control metadata are exposed through:
 - `runtime_registry`: `agentruntime.registry.v1`, persisted at `runtime_providers.json`.
 - `model_orchestration`: `model_orchestration.v1`, built from the TUI model manager state.
 - `scheduled_task_registry`: `scheduledtask.registry.v1`, persisted at `schedules.jsonl`.
+- `scheduledtask.run.v1`: Scheduler run audit rows persisted at `schedule_runs.jsonl`.
 - `ga-control.v2` schedule actions: `schedule.create`, `schedule.update`, `schedule.enable`, `schedule.disable`, and `schedule.delete`.
 - `capability_registry.runtime_providers`: Provider details available to query tools.
-- MCP resources: `resource://agent-mail/runtime-providers` and `resource://agent-mail/schedules`.
-- TUI commands: `/runtimes` and `/schedules`.
+- MCP resources: `resource://agent-mail/runtime-providers`, `resource://agent-mail/schedules`, and `resource://agent-mail/schedule-runs`.
+- TUI commands: `/runtimes`, `/schedules`, and `/scheduler`.
 
 ## Design Rules
 
 - Do not let backend-specific APIs leak into orchestration code.
 - Do not choose a provider by natural-language name similarity. Use explicit provider/capability metadata.
 - Do not let scheduled jobs bypass task ledger, artifact, or approval policy.
+- Scheduled jobs must reserve an idempotency key before dispatch, record the run result, and then delegate through `agenttask.v2`.
 - Do not let model choice override policy gates. Model routing is subordinate to TUI governance.
 - Keep `GenericAgent` as the default adapter while making future adapters additive.
 

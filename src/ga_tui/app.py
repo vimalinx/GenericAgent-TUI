@@ -92,6 +92,7 @@ AGENT_BASELINE_REPORT_PATH = os.path.join(AGENT_HARNESS_DIR, "baseline_report.js
 AGENT_GOVERNANCE_PATH = os.path.join(AGENT_HARNESS_DIR, "governance_components.json")
 AGENT_RUNTIME_REGISTRY_PATH = os.path.join(AGENT_HARNESS_DIR, "runtime_providers.json")
 AGENT_SCHEDULES_PATH = os.path.join(AGENT_HARNESS_DIR, "schedules.jsonl")
+AGENT_SCHEDULE_RUNS_PATH = os.path.join(AGENT_HARNESS_DIR, "schedule_runs.jsonl")
 AGENT_GATEWAY_PUSH_SUBSCRIPTIONS_PATH = os.path.join(AGENT_HARNESS_DIR, "gateway_push_subscriptions.jsonl")
 AGENT_GATEWAY_PUSH_DELIVERIES_PATH = os.path.join(AGENT_HARNESS_DIR, "gateway_push_deliveries.jsonl")
 AGENT_GATEWAY_DAEMON_PID_PATH = os.path.join(AGENT_HARNESS_DIR, "gateway_daemon.pid")
@@ -99,6 +100,10 @@ AGENT_GATEWAY_DAEMON_STATUS_PATH = os.path.join(AGENT_HARNESS_DIR, "gateway_daem
 AGENT_GATEWAY_DAEMON_LOG_PATH = os.path.join(AGENT_HARNESS_DIR, "gateway_daemon.log")
 AGENT_BRIDGE_REGISTRY_PATH = os.path.join(AGENT_HARNESS_DIR, "bridge_registry.json")
 LLM_RECENT_MODELS_PATH = os.path.join(AGENT_HARNESS_DIR, "recent_models.json")
+try:
+    SCHEDULER_TICK_SECONDS = max(5.0, float(os.environ.get("GA_TUI_SCHEDULER_TICK_SECONDS", "30") or "30"))
+except ValueError:
+    SCHEDULER_TICK_SECONDS = 30.0
 SECRET_VAULT_DIR = os.path.abspath(os.path.expanduser(os.environ.get("GA_TUI_SECRET_VAULT_DIR") or os.path.join(ROOT_DIR, "memory", "secret_vault")))
 SECRET_VAULT_META_PATH = os.path.join(SECRET_VAULT_DIR, "vault.json")
 SECRET_VAULT_DATA_DIR = os.path.join(SECRET_VAULT_DIR, "data")
@@ -270,6 +275,7 @@ COMMANDS: list[tuple[str, str, str, bool]] = [
     ("/gateway", "", "查看 A2A/MCP gateway 脚手架", True),
     ("/runtimes", "", "查看 agent runtime/provider 注册表", True),
     ("/schedules", "", "查看顶层定时任务注册表", True),
+    ("/scheduler", "[tick|run <id>]", "查看或触发定时任务调度器", False),
     ("/baseline", "", "查看架构基线对比报告", True),
     ("/Secret", "[status|sessions|open-session n|open n]", "进入本地加密 Secret Vault", True),
     ("/lock", "", "锁定 Secret Vault 并清除明文状态", True),
@@ -5505,7 +5511,23 @@ def model_orchestration_registry(state: Optional[State] = None) -> dict[str, Any
 
 def scheduled_task_registry(state: Optional[State] = None) -> dict[str, Any]:
     del state
-    jobs = list(latest_schedule_records().values())
+    run_rows = latest_schedule_run_records()
+    last_runs = latest_schedule_runs_by_schedule_id()
+    seen_keys = {str(row.get("idempotency_key") or "").strip() for row in run_rows if row.get("idempotency_key")}
+    jobs = []
+    for row in latest_schedule_records().values():
+        job = dict(row)
+        due = schedule_due_info(job, last_run=last_runs.get(str(job.get("schedule_id") or "")), seen_keys=seen_keys)
+        job["scheduler"] = {
+            "due": bool(due.get("due")),
+            "status": due.get("status", ""),
+            "reason": due.get("reason", ""),
+            "trigger_kind": due.get("trigger_kind", ""),
+            "due_at": due.get("due_at", ""),
+            "idempotency_key": due.get("idempotency_key", ""),
+            "last_run": last_runs.get(str(job.get("schedule_id") or "")) or {},
+        }
+        jobs.append(job)
     jobs.sort(key=lambda row: str(row.get("updated_at") or row.get("created_at") or ""))
     active_jobs = [
         row for row in jobs
@@ -5516,8 +5538,10 @@ def scheduled_task_registry(state: Optional[State] = None) -> dict[str, Any]:
         "owner": "ga-tui.control_plane",
         "status": "registry_ready",
         "schedules_path": AGENT_SCHEDULES_PATH,
+        "runs_path": AGENT_SCHEDULE_RUNS_PATH,
         "job_count": len(jobs),
         "active_job_count": len(active_jobs),
+        "run_count": len(run_rows),
         "jobs": jobs[-50:],
         "dispatch": {
             "contract": "agenttask.v2",
@@ -5553,6 +5577,268 @@ def append_schedule_record(row: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
+def latest_schedule_run_records(limit: int = 1000) -> list[dict[str, Any]]:
+    return read_jsonl(AGENT_SCHEDULE_RUNS_PATH, limit=limit)
+
+
+def latest_schedule_runs_by_schedule_id(limit: int = 1000) -> dict[str, dict[str, Any]]:
+    latest: dict[str, dict[str, Any]] = {}
+    for row in latest_schedule_run_records(limit=limit):
+        schedule_id = str(row.get("schedule_id") or "").strip()
+        if schedule_id:
+            latest[schedule_id] = row
+    return latest
+
+
+def schedule_run_idempotency_keys(limit: int = 2000) -> set[str]:
+    keys: set[str] = set()
+    for row in latest_schedule_run_records(limit=limit):
+        key = str(row.get("idempotency_key") or "").strip()
+        if key:
+            keys.add(key)
+    return keys
+
+
+def append_schedule_run(row: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(row)
+    payload.setdefault("schema_version", "scheduledtask.run.v1")
+    payload.setdefault("run_id", short_uid("schedrun"))
+    payload.setdefault("timestamp", now_iso())
+    append_jsonl(AGENT_SCHEDULE_RUNS_PATH, payload)
+    return payload
+
+
+def schedule_record_trigger(row: dict[str, Any]) -> str:
+    for key in ("trigger", "cron", "interval", "at", "rrule"):
+        value = str(row.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def parse_schedule_timestamp(value: Any) -> Optional[float]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if re.fullmatch(r"\d+(?:\.\d+)?", text):
+        try:
+            return float(text)
+        except ValueError:
+            return None
+    normalized = text.replace("Z", "+00:00")
+    if re.search(r"[+-]\d{4}$", normalized):
+        normalized = normalized[:-5] + normalized[-5:-2] + ":" + normalized[-2:]
+    for candidate in (normalized, normalized.replace(" ", "T", 1)):
+        try:
+            return datetime.fromisoformat(candidate).timestamp()
+        except ValueError:
+            pass
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return time.mktime(time.strptime(text, fmt))
+        except ValueError:
+            pass
+    return None
+
+
+def parse_schedule_interval_seconds(value: Any) -> Optional[float]:
+    text = str(value or "").strip().lower()
+    if not text:
+        return None
+    text = re.sub(r"^(interval|every)\s*[:=]?\s*", "", text).strip()
+    match = re.fullmatch(
+        r"(\d+(?:\.\d+)?)\s*(s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)?",
+        text,
+    )
+    if not match:
+        return None
+    amount = float(match.group(1))
+    unit = match.group(2) or "s"
+    factor = 1.0
+    if unit.startswith("m"):
+        factor = 60.0
+    elif unit.startswith("h") or unit in {"hr", "hrs"}:
+        factor = 3600.0
+    elif unit.startswith("d"):
+        factor = 86400.0
+    seconds = amount * factor
+    return seconds if seconds > 0 else None
+
+
+def split_schedule_trigger(row: dict[str, Any]) -> tuple[str, str]:
+    trigger = schedule_record_trigger(row)
+    lowered = trigger.lower().strip()
+    for prefix in ("interval", "cron", "at", "rrule"):
+        for sep in (":", "="):
+            marker = prefix + sep
+            if lowered.startswith(marker):
+                return prefix, trigger[len(marker):].strip()
+        if lowered.startswith(prefix + " "):
+            return prefix, trigger[len(prefix):].strip()
+    if row.get("interval"):
+        return "interval", str(row.get("interval") or "").strip()
+    if row.get("cron"):
+        return "cron", str(row.get("cron") or "").strip()
+    if row.get("at"):
+        return "at", str(row.get("at") or "").strip()
+    if row.get("rrule"):
+        return "rrule", str(row.get("rrule") or "").strip()
+    if parse_schedule_interval_seconds(trigger) is not None:
+        return "interval", trigger
+    if len(trigger.split()) == 5:
+        return "cron", trigger
+    if parse_schedule_timestamp(trigger) is not None:
+        return "at", trigger
+    return "unknown", trigger
+
+
+def cron_field_matches(expr: str, value: int, minimum: int, maximum: int, *, weekday: bool = False) -> bool:
+    expr = (expr or "").strip()
+    if not expr:
+        return False
+    for part in expr.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        step = 1
+        if "/" in part:
+            part, step_text = part.split("/", 1)
+            if not step_text.isdigit() or int(step_text) <= 0:
+                return False
+            step = int(step_text)
+        if part in {"", "*"}:
+            start, end = minimum, maximum
+        elif "-" in part:
+            start_text, end_text = part.split("-", 1)
+            if not start_text.isdigit() or not end_text.isdigit():
+                return False
+            start, end = int(start_text), int(end_text)
+        elif part.isdigit():
+            start = end = int(part)
+        else:
+            return False
+        if weekday:
+            if start == 7:
+                start = 0
+            if end == 7:
+                end = 0
+            if start > end:
+                values = list(range(start, maximum + 1)) + list(range(minimum, end + 1))
+            else:
+                values = list(range(start, end + 1))
+            if value in values and ((value - values[0]) % step == 0):
+                return True
+            continue
+        if start < minimum or end > maximum or start > end:
+            return False
+        if start <= value <= end and ((value - start) % step == 0):
+            return True
+    return False
+
+
+def cron_matches_now(expr: str, now_epoch: float) -> tuple[bool, str]:
+    fields = (expr or "").split()
+    if len(fields) != 5:
+        return False, "cron must contain five fields"
+    current = time.localtime(now_epoch)
+    cron_weekday = (current.tm_wday + 1) % 7
+    checks = [
+        cron_field_matches(fields[0], current.tm_min, 0, 59),
+        cron_field_matches(fields[1], current.tm_hour, 0, 23),
+        cron_field_matches(fields[2], current.tm_mday, 1, 31),
+        cron_field_matches(fields[3], current.tm_mon, 1, 12),
+        cron_field_matches(fields[4], cron_weekday, 0, 7, weekday=True),
+    ]
+    return all(checks), ""
+
+
+def schedule_active(row: dict[str, Any]) -> bool:
+    status = str(row.get("status") or "enabled").strip().lower()
+    return status not in {"disabled", "deleted", "cancelled", "canceled"}
+
+
+def schedule_due_info(
+    row: dict[str, Any],
+    *,
+    now_epoch: Optional[float] = None,
+    last_run: Optional[dict[str, Any]] = None,
+    seen_keys: Optional[set[str]] = None,
+) -> dict[str, Any]:
+    now_epoch = time.time() if now_epoch is None else float(now_epoch)
+    schedule_id = str(row.get("schedule_id") or row.get("id") or "").strip()
+    status = str(row.get("status") or "enabled").strip().lower()
+    trigger_kind, trigger_value = split_schedule_trigger(row)
+    info: dict[str, Any] = {
+        "schedule_id": schedule_id,
+        "status": "pending",
+        "due": False,
+        "trigger_kind": trigger_kind,
+        "trigger": trigger_value,
+        "reason": "",
+        "due_at_epoch": None,
+        "due_at": "",
+        "idempotency_key": "",
+    }
+    if not schedule_id:
+        info.update(status="invalid", reason="missing schedule_id")
+        return info
+    if not schedule_active(row):
+        info.update(status="skipped", reason=f"schedule status is {status or 'inactive'}")
+        return info
+    keys = seen_keys or schedule_run_idempotency_keys()
+    if trigger_kind == "at":
+        due_epoch = parse_schedule_timestamp(trigger_value)
+        if due_epoch is None:
+            info.update(status="invalid", reason=f"invalid at trigger: {trigger_value}")
+            return info
+        key = f"{schedule_id}:at:{int(due_epoch)}"
+        info.update(due_at_epoch=due_epoch, due_at=time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(due_epoch)), idempotency_key=key)
+        if key in keys:
+            info.update(status="duplicate", reason="one-shot schedule already ran")
+            return info
+        if now_epoch >= due_epoch:
+            info.update(status="due", due=True, reason="at trigger reached")
+        else:
+            info.update(status="pending", reason="at trigger not reached")
+        return info
+    if trigger_kind == "interval":
+        seconds = parse_schedule_interval_seconds(trigger_value)
+        if seconds is None:
+            info.update(status="invalid", reason=f"invalid interval trigger: {trigger_value}")
+            return info
+        last_epoch = parse_schedule_timestamp((last_run or {}).get("timestamp") or (last_run or {}).get("started_at"))
+        anchor_epoch = last_epoch or parse_schedule_timestamp(row.get("created_at")) or parse_schedule_timestamp(row.get("updated_at")) or now_epoch
+        due_epoch = anchor_epoch + seconds
+        key = f"{schedule_id}:interval:{int(due_epoch)}"
+        info.update(due_at_epoch=due_epoch, due_at=time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(due_epoch)), idempotency_key=key)
+        if key in keys:
+            info.update(status="duplicate", reason="interval slot already ran")
+            return info
+        if now_epoch >= due_epoch:
+            info.update(status="due", due=True, reason="interval elapsed")
+        else:
+            info.update(status="pending", reason="interval not elapsed")
+        return info
+    if trigger_kind == "cron":
+        matched, error = cron_matches_now(trigger_value, now_epoch)
+        if error:
+            info.update(status="invalid", reason=error)
+            return info
+        due_epoch = int(now_epoch // 60) * 60
+        key = f"{schedule_id}:cron:{time.strftime('%Y%m%d%H%M', time.localtime(due_epoch))}"
+        info.update(due_at_epoch=due_epoch, due_at=time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(due_epoch)), idempotency_key=key)
+        if key in keys:
+            info.update(status="duplicate", reason="cron minute already ran")
+            return info
+        if matched:
+            info.update(status="due", due=True, reason="cron matched current minute")
+        else:
+            info.update(status="pending", reason="cron does not match current minute")
+        return info
+    info.update(status="invalid", reason=f"unsupported trigger: {schedule_record_trigger(row) or '-'}")
+    return info
+
+
 def schedule_trigger_from_control(control: dict[str, Any]) -> str:
     for key in ("cron", "interval", "trigger", "rrule", "at"):
         value = str(control.get(key) or "").strip()
@@ -5580,6 +5866,17 @@ def schedule_work_order_from_control(control: dict[str, Any]) -> dict[str, Any]:
 def schedule_record_from_control(control: dict[str, Any], *, schedule_id: str, status: str, source: str) -> dict[str, Any]:
     work_order = schedule_work_order_from_control(control)
     provider_id = str(control.get("provider_id") or control.get("runtime_provider_id") or "").strip()
+    routing = control.get("routing") if isinstance(control.get("routing"), dict) else {}
+    selector = routing.get("target_selector") if isinstance(routing.get("target_selector"), dict) else {}
+    target = str(
+        control.get("target")
+        or control.get("agent")
+        or routing.get("selected_agent")
+        or selector.get("agent_id")
+        or selector.get("target")
+        or selector.get("name")
+        or ""
+    ).strip()
     return {
         "schema_version": "scheduledtask.v1",
         "schedule_id": schedule_id,
@@ -5589,8 +5886,9 @@ def schedule_record_from_control(control: dict[str, Any], *, schedule_id: str, s
         "timezone": str(control.get("timezone") or control.get("tz") or "").strip(),
         "provider_id": provider_id or agent_runtime_registry().to_record()["default_provider_id"],
         "dispatch_contract": "agenttask.v2",
+        "target": target,
         "work_order": work_order,
-        "routing": control.get("routing") if isinstance(control.get("routing"), dict) else {},
+        "routing": routing,
         "capability_contract": control.get("capability_contract") if isinstance(control.get("capability_contract"), dict) else {},
         "context_contract": control.get("context_contract") if isinstance(control.get("context_contract"), dict) else {},
         "output_contract": control.get("output_contract") if isinstance(control.get("output_contract"), dict) else {},
@@ -5647,6 +5945,249 @@ def apply_schedule_control(state: State, action: str, target: str, value: str, c
     return f"已{label}定时任务：{row.get('name') or schedule_id}"
 
 
+def schedule_agenttask_control(row: dict[str, Any]) -> dict[str, Any]:
+    work_order = row.get("work_order") if isinstance(row.get("work_order"), dict) else {}
+    routing = row.get("routing") if isinstance(row.get("routing"), dict) else {}
+    routing = dict(routing)
+    target = str(row.get("target") or "").strip()
+    if target and not routing.get("selected_agent"):
+        routing["selected_agent"] = target
+    return {
+        "schema_version": AGENT_TASK_SCHEMA,
+        "action": "delegate.create",
+        "parent_task_id": str(row.get("parent_task_id") or row.get("task_id") or ""),
+        "routing": routing,
+        "work_order": work_order,
+        "capability_contract": row.get("capability_contract") if isinstance(row.get("capability_contract"), dict) else {},
+        "context_contract": row.get("context_contract") if isinstance(row.get("context_contract"), dict) else {},
+        "output_contract": row.get("output_contract") if isinstance(row.get("output_contract"), dict) else {},
+        "task_title": str(row.get("name") or row.get("title") or row.get("schedule_id") or "Scheduled task"),
+        "schedule_id": str(row.get("schedule_id") or ""),
+        "provider_id": str(row.get("provider_id") or ""),
+    }
+
+
+def schedule_dispatch_status(result: str) -> str:
+    text = str(result or "")
+    if text.startswith("APPROVAL_REQUIRED") or ("审批" in text and "需要" in text):
+        return "approval_required"
+    if "已排队" in text:
+        return "queued"
+    if "已启动" in text or "已发送" in text:
+        return "dispatched"
+    if "拒绝" in text:
+        return "rejected"
+    if any(marker in text for marker in ("失败", "找不到", "缺少", "为空", "error", "Error")):
+        return "failed"
+    return "dispatched" if text.strip() else "failed"
+
+
+def update_schedule_last_run(row: dict[str, Any], run: dict[str, Any]) -> None:
+    schedule = dict(row)
+    schedule.pop("scheduler", None)
+    schedule["last_run_id"] = run.get("run_id", "")
+    schedule["last_run_status"] = run.get("status", "")
+    schedule["last_run_at"] = run.get("timestamp") or now_iso()
+    schedule["last_idempotency_key"] = run.get("idempotency_key", "")
+    schedule["updated_at"] = now_iso()
+    append_schedule_record(schedule)
+
+
+def append_schedule_skip_run(row: dict[str, Any], info: dict[str, Any], *, status: str, reason: str) -> dict[str, Any]:
+    schedule_id = str(row.get("schedule_id") or row.get("id") or "").strip()
+    trigger = schedule_record_trigger(row)
+    base_key = info.get("idempotency_key") or f"{schedule_id}:{status}:{hashlib.sha1((trigger + reason).encode('utf-8')).hexdigest()[:16]}"
+    key = f"{base_key}:{status}"
+    if key in schedule_run_idempotency_keys():
+        return {}
+    run = append_schedule_run({
+        "schedule_id": schedule_id,
+        "schedule_name": row.get("name") or schedule_id,
+        "status": status,
+        "reason": reason,
+        "trigger": trigger,
+        "trigger_kind": info.get("trigger_kind", ""),
+        "due_at": info.get("due_at", ""),
+        "idempotency_key": key,
+        "provider_id": row.get("provider_id", ""),
+        "dispatch_contract": row.get("dispatch_contract") or "agenttask.v2",
+    })
+    update_schedule_last_run(row, run)
+    return run
+
+
+def dispatch_schedule_run(state: State, row: dict[str, Any], info: dict[str, Any], *, source: str = "scheduler") -> dict[str, Any]:
+    schedule_id = str(row.get("schedule_id") or row.get("id") or "").strip()
+    idempotency_key = str(info.get("idempotency_key") or "").strip()
+    if not schedule_id:
+        return append_schedule_run({"status": "failed", "reason": "missing schedule_id", "idempotency_key": idempotency_key})
+    if idempotency_key and idempotency_key in schedule_run_idempotency_keys():
+        return append_schedule_skip_run(row, info, status="duplicate", reason="idempotency key already exists")
+    run_id = short_uid("schedrun")
+    started = append_schedule_run({
+        "run_id": run_id,
+        "schedule_id": schedule_id,
+        "schedule_name": row.get("name") or schedule_id,
+        "status": "starting",
+        "reason": info.get("reason", ""),
+        "trigger": schedule_record_trigger(row),
+        "trigger_kind": info.get("trigger_kind", ""),
+        "due_at": info.get("due_at", ""),
+        "idempotency_key": idempotency_key,
+        "provider_id": row.get("provider_id", ""),
+        "dispatch_contract": row.get("dispatch_contract") or "agenttask.v2",
+        "source": source,
+    })
+    control = schedule_agenttask_control(row)
+    work_order = control.get("work_order") if isinstance(control.get("work_order"), dict) else {}
+    if not str(work_order.get("objective") or "").strip():
+        finished = dict(started)
+        finished.update({"status": "failed", "finished_at": now_iso(), "error": "missing work_order.objective"})
+        append_schedule_run(finished)
+        update_schedule_last_run(row, finished)
+        return finished
+    mapped = execution_control_from_v2(control)
+    if not mapped:
+        finished = dict(started)
+        finished.update({"status": "failed", "finished_at": now_iso(), "error": "could not map schedule to agenttask.v2 delegate.create"})
+        append_schedule_run(finished)
+        update_schedule_last_run(row, finished)
+        return finished
+    target = str(mapped.get("target") or "").strip()
+    if not target:
+        finished = dict(started)
+        finished.update({"status": "failed", "finished_at": now_iso(), "error": "missing routing.selected_agent or schedule target"})
+        append_schedule_run(finished)
+        update_schedule_last_run(row, finished)
+        return finished
+    sub = resolve_subagent(state, target)
+    if sub is None:
+        finished = dict(started)
+        finished.update({"status": "failed", "finished_at": now_iso(), "target": target, "error": f"subagent not found: {target}"})
+        append_schedule_run(finished)
+        update_schedule_last_run(row, finished)
+        return finished
+    before_tasks = set(latest_task_records())
+    try:
+        result = start_subagent_task(
+            state,
+            sub,
+            str(mapped.get("prompt") or ""),
+            source=f"{source}:{schedule_id}",
+            parent_task_id=str(mapped.get("parent_task_id") or ""),
+            task_title=str(mapped.get("task_title") or row.get("name") or schedule_id),
+        )
+    except Exception as exc:
+        result = f"{type(exc).__name__}: {exc}"
+    after_tasks = latest_task_records()
+    new_task_ids = [task_id for task_id in after_tasks if task_id not in before_tasks]
+    finished = dict(started)
+    finished.update({
+        "status": schedule_dispatch_status(result),
+        "finished_at": now_iso(),
+        "target": sub.agent_id,
+        "target_name": sub.name,
+        "result": result,
+        "task_id": new_task_ids[-1] if new_task_ids else str(getattr(sub, "active_bus_task_id", "") or ""),
+    })
+    if finished["status"] in {"failed", "rejected"}:
+        finished["error"] = result
+    append_schedule_run(finished)
+    update_schedule_last_run(row, finished)
+    return finished
+
+
+def scheduler_tick(
+    state: State,
+    *,
+    now_epoch: Optional[float] = None,
+    source: str = "scheduler",
+    target_schedule_id: str = "",
+    force: bool = False,
+    record_skips: bool = False,
+) -> dict[str, Any]:
+    now_epoch = time.time() if now_epoch is None else float(now_epoch)
+    records = latest_schedule_records()
+    last_runs = latest_schedule_runs_by_schedule_id()
+    seen_keys = schedule_run_idempotency_keys()
+    result = {
+        "schema_version": "scheduledtask.tick.v1",
+        "timestamp": now_iso(),
+        "source": source,
+        "checked": 0,
+        "due": 0,
+        "dispatched": 0,
+        "failed": 0,
+        "skipped": 0,
+        "invalid": 0,
+        "duplicates": 0,
+        "runs": [],
+    }
+    for schedule_id, row in sorted(records.items(), key=lambda item: str(item[1].get("updated_at") or item[1].get("created_at") or "")):
+        if target_schedule_id and schedule_id != target_schedule_id:
+            continue
+        result["checked"] += 1
+        info = schedule_due_info(row, now_epoch=now_epoch, last_run=last_runs.get(schedule_id), seen_keys=seen_keys)
+        if force and schedule_active(row):
+            info.update(
+                status="due",
+                due=True,
+                reason="manual scheduler run",
+                due_at_epoch=now_epoch,
+                due_at=time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(now_epoch)),
+                idempotency_key=f"{schedule_id}:manual:{int(now_epoch)}",
+            )
+        status = str(info.get("status") or "")
+        if info.get("due"):
+            result["due"] += 1
+            run = dispatch_schedule_run(state, row, info, source=source)
+            if run:
+                result["runs"].append(run)
+                seen_keys.add(str(run.get("idempotency_key") or ""))
+            if str(run.get("status") or "") in {"failed", "rejected"}:
+                result["failed"] += 1
+            else:
+                result["dispatched"] += 1
+            continue
+        if status == "invalid":
+            result["invalid"] += 1
+            trigger_hash = hashlib.sha1(schedule_record_trigger(row).encode("utf-8")).hexdigest()[:16]
+            invalid_key = f"{schedule_id}:invalid:{trigger_hash}"
+            if invalid_key not in seen_keys:
+                run = append_schedule_skip_run(row, {**info, "idempotency_key": invalid_key}, status="invalid", reason=str(info.get("reason") or "invalid schedule"))
+                if run:
+                    result["runs"].append(run)
+                    seen_keys.add(str(run.get("idempotency_key") or ""))
+            continue
+        if status == "duplicate":
+            result["duplicates"] += 1
+            if record_skips:
+                run = append_schedule_skip_run(row, info, status="duplicate", reason=str(info.get("reason") or "duplicate schedule slot"))
+                if run:
+                    result["runs"].append(run)
+            continue
+        result["skipped"] += 1
+        if record_skips and (target_schedule_id or force):
+            run = append_schedule_skip_run(row, info, status="skipped", reason=str(info.get("reason") or status or "not due"))
+            if run:
+                result["runs"].append(run)
+    return result
+
+
+def format_scheduler_tick_result(result: dict[str, Any]) -> str:
+    lines = [
+        "Scheduler",
+        f"checked: {result.get('checked', 0)} · due: {result.get('due', 0)} · dispatched: {result.get('dispatched', 0)} · failed: {result.get('failed', 0)}",
+        f"skipped: {result.get('skipped', 0)} · invalid: {result.get('invalid', 0)} · duplicate: {result.get('duplicates', 0)}",
+    ]
+    for run in (result.get("runs") or [])[-12:]:
+        lines.append(
+            f"- {run.get('schedule_id') or '-'} · {run.get('status') or '-'} · "
+            f"{truncate_cells(str(run.get('result') or run.get('error') or run.get('reason') or ''), 180)}"
+        )
+    return "\n".join(lines).rstrip()
+
+
 def format_runtime_registry(data: dict[str, Any]) -> str:
     lines = [
         "Agent Runtime Providers",
@@ -5670,6 +6211,7 @@ def format_scheduled_task_registry(data: dict[str, Any]) -> str:
         f"status: {data.get('status')}",
         f"jobs: {data.get('active_job_count', 0)} active / {data.get('job_count', 0)} total",
         f"store: {data.get('schedules_path') or AGENT_SCHEDULES_PATH}",
+        f"runs: {data.get('run_count', 0)} · {data.get('runs_path') or AGENT_SCHEDULE_RUNS_PATH}",
         f"dispatch: {(data.get('dispatch') or {}).get('contract', '-')}",
         "",
     ]
@@ -5677,9 +6219,17 @@ def format_scheduled_task_registry(data: dict[str, Any]) -> str:
     if not jobs:
         lines.append("No scheduled jobs registered yet. Future jobs should dispatch via agenttask.v2 and audit each run into the task ledger.")
     for row in jobs[-20:]:
+        scheduler = row.get("scheduler") if isinstance(row.get("scheduler"), dict) else {}
+        work_order = row.get("work_order") if isinstance(row.get("work_order"), dict) else {}
+        last_run = scheduler.get("last_run") if isinstance(scheduler.get("last_run"), dict) else {}
+        objective = str(work_order.get("objective") or row.get("objective") or row.get("task") or "")
+        run_suffix = f" · last:{last_run.get('status')}" if last_run else ""
+        due_suffix = f" · {scheduler.get('status') or '-'}"
+        if scheduler.get("due_at"):
+            due_suffix += f" @{scheduler.get('due_at')}"
         lines.append(
             f"- {row.get('schedule_id') or row.get('id') or '-'} · {row.get('status', 'enabled')} · "
-            f"{row.get('cron') or row.get('interval') or row.get('trigger') or '-'} · {truncate_cells(str(row.get('objective') or row.get('task') or ''), 140)}"
+            f"{schedule_record_trigger(row) or '-'}{due_suffix}{run_suffix} · {truncate_cells(objective, 140)}"
         )
     return "\n".join(lines).rstrip()
 
@@ -5864,6 +6414,7 @@ def mcp_resource_registry() -> list[dict[str, Any]]:
         {"uri": "resource://agent-mail/recovery-plans", "path": AGENT_RECOVERY_PLANS_PATH, "description": "Replayable recovery plan JSONL"},
         {"uri": "resource://agent-mail/runtime-providers", "path": AGENT_RUNTIME_REGISTRY_PATH, "description": "Agent runtime provider registry JSON"},
         {"uri": "resource://agent-mail/schedules", "path": AGENT_SCHEDULES_PATH, "description": "Top-level scheduled task registry JSONL"},
+        {"uri": "resource://agent-mail/schedule-runs", "path": AGENT_SCHEDULE_RUNS_PATH, "description": "Scheduled task run audit JSONL"},
         {"uri": "resource://agent-mail/gateway-daemon", "path": AGENT_GATEWAY_DAEMON_STATUS_PATH, "description": "Gateway daemon status JSON"},
         {"uri": "resource://agent-mail/gateway-push-subscriptions", "path": AGENT_GATEWAY_PUSH_SUBSCRIPTIONS_PATH, "description": "Gateway push subscriptions JSONL"},
         {"uri": "resource://agent-mail/gateway-push-deliveries", "path": AGENT_GATEWAY_PUSH_DELIVERIES_PATH, "description": "Gateway push delivery audit JSONL"},
@@ -6996,6 +7547,7 @@ def ensure_gateway_registry(state: Optional[State] = None) -> dict[str, Any]:
             "governance": AGENT_GOVERNANCE_PATH,
             "runtime_providers": AGENT_RUNTIME_REGISTRY_PATH,
             "schedules": AGENT_SCHEDULES_PATH,
+            "schedule_runs": AGENT_SCHEDULE_RUNS_PATH,
             "gateway_daemon_status": AGENT_GATEWAY_DAEMON_STATUS_PATH,
             "gateway_daemon_pid": AGENT_GATEWAY_DAEMON_PID_PATH,
         },
@@ -18791,6 +19343,28 @@ def submit(state: State, text: str) -> None:
         data = scheduled_task_registry(state)
         add_system(state, "在 TUI 输入框执行 /schedules 会打开 Scheduled Tasks 面板。\n" + format_scheduled_task_registry(data))
         return
+    m_scheduler = re.match(r"/scheduler(?:\s+(.*))?\s*$", text, re.I)
+    if m_scheduler:
+        args = (m_scheduler.group(1) or "").strip()
+        if not args or args == "status":
+            data = scheduled_task_registry(state)
+            add_system(state, "Scheduler 状态：\n" + format_scheduled_task_registry(data))
+            return
+        if args == "tick":
+            result = scheduler_tick(state, source="manual:scheduler_tick", record_skips=True)
+            add_system(state, format_scheduler_tick_result(result))
+            return
+        m_run = re.match(r"run\s+(\S+)\s*$", args, re.I)
+        if m_run:
+            target_id = m_run.group(1)
+            if target_id not in latest_schedule_records():
+                add_system(state, f"找不到定时任务：{target_id}")
+                return
+            result = scheduler_tick(state, source="manual:scheduler_run", target_schedule_id=target_id, force=True, record_skips=True)
+            add_system(state, format_scheduler_tick_result(result))
+            return
+        add_system(state, "Usage: /scheduler [status|tick|run <schedule_id>]")
+        return
     if text == "/baseline":
         report = architecture_baseline_report(state, gateway_data=ensure_gateway_registry(state))
         add_system(state, "在 TUI 输入框执行 /baseline 会打开 Architecture Baseline 面板。\n" + format_baseline_report(report))
@@ -21150,9 +21724,15 @@ def run(stdscr) -> dict[str, Any]:
         next_token_persist = time.monotonic() + 10
         next_clock_refresh = time.monotonic() + 1
         next_run_frame = time.monotonic()
+        next_scheduler_tick = time.monotonic() + min(5.0, SCHEDULER_TICK_SECONDS)
         while state.running:
             process_ui_queue(state)
             now = time.monotonic()
+            if now >= next_scheduler_tick:
+                schedule_result = scheduler_tick(state, source="daemon:scheduler_tick")
+                if schedule_result.get("runs") or int(schedule_result.get("due") or 0) or int(schedule_result.get("failed") or 0):
+                    add_system(state, format_scheduler_tick_result(schedule_result), persist=True, kind="scheduler_tick")
+                next_scheduler_tick = now + SCHEDULER_TICK_SECONDS
             if now >= next_token_persist:
                 persist_all_token_usage(state)
                 next_token_persist = now + 10

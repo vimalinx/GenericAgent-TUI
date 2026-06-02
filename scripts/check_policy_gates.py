@@ -50,6 +50,7 @@ def retarget_harness(root: str) -> None:
     a.AGENT_GOVERNANCE_PATH = os.path.join(a.AGENT_HARNESS_DIR, "governance_components.json")
     a.AGENT_RUNTIME_REGISTRY_PATH = os.path.join(a.AGENT_HARNESS_DIR, "runtime_providers.json")
     a.AGENT_SCHEDULES_PATH = os.path.join(a.AGENT_HARNESS_DIR, "schedules.jsonl")
+    a.AGENT_SCHEDULE_RUNS_PATH = os.path.join(a.AGENT_HARNESS_DIR, "schedule_runs.jsonl")
     a.AGENT_GATEWAY_PUSH_SUBSCRIPTIONS_PATH = os.path.join(a.AGENT_HARNESS_DIR, "gateway_push_subscriptions.jsonl")
     a.AGENT_GATEWAY_PUSH_DELIVERIES_PATH = os.path.join(a.AGENT_HARNESS_DIR, "gateway_push_deliveries.jsonl")
     a.AGENT_GATEWAY_DAEMON_PID_PATH = os.path.join(a.AGENT_HARNESS_DIR, "gateway_daemon.pid")
@@ -651,6 +652,7 @@ def assert_gateway_schema(registry: dict) -> None:
     assert any(item["uri"] == "resource://agent-mail/recovery-plans" for item in mcp["resources"]), mcp
     assert any(item["uri"] == "resource://agent-mail/runtime-providers" for item in mcp["resources"]), mcp
     assert any(item["uri"] == "resource://agent-mail/schedules" for item in mcp["resources"]), mcp
+    assert any(item["uri"] == "resource://agent-mail/schedule-runs" for item in mcp["resources"]), mcp
     assert any(item["uri"] == "resource://agent-mail/gateway-daemon" for item in mcp["resources"]), mcp
     assert any(item["uri"] == "resource://agent-mail/bridges" for item in mcp["resources"]), mcp
     assert any(item["name"] == "repo.read" for item in mcp["tools"]), mcp
@@ -2927,6 +2929,60 @@ def run_checks() -> None:
     assert schedule_records["sched_daily_digest"]["provider_id"] == "genericagent", schedule_records
     a.apply_tui_controls_from_text(state, ga_control({"action": "schedule.disable", "target": "sched_daily_digest"}), source="agent")
     assert a.latest_schedule_records()["sched_daily_digest"]["status"] == "disabled"
+    scheduler_worker = a.create_subagent(state, "Scheduler Worker", role="researcher")
+    due_schedule_control = ga_control({
+        "action": "schedule.create",
+        "schedule_id": "sched_due_once",
+        "name": "Due Once",
+        "at": "2026-01-01T00:00:00+0800",
+        "provider_id": "genericagent",
+        "routing": {
+            "selected_agent": scheduler_worker.name,
+            "target_selector": {"role": "researcher", "reuse_policy": "prefer_existing"},
+        },
+        "work_order": {
+            "objective": "Read local docs and produce a short scheduled digest.",
+            "success_criteria": ["return a concise digest"],
+            "stop_condition": "return scheduled digest and stop",
+        },
+        "capability_contract": {"tools_allowed": ["read"], "tools_forbidden": ["repo.write"], "write_policy": "none"},
+        "context_contract": {"history_mode": "summary", "artifact_reference_only": True},
+        "output_contract": {"format": "structured_markdown", "required_sections": ["summary", "artifact_refs"]},
+    })
+    a.apply_tui_controls_from_text(state, due_schedule_control, source="agent")
+    due_info = a.schedule_due_info(a.latest_schedule_records()["sched_due_once"], now_epoch=1780000000.0)
+    assert due_info["due"] and due_info["idempotency_key"], due_info
+    tick = a.scheduler_tick(state, now_epoch=1780000000.0, source="test:scheduler")
+    assert tick["checked"] >= 2 and tick["due"] >= 1 and tick["dispatched"] >= 1, tick
+    schedule_runs = a.read_jsonl(a.AGENT_SCHEDULE_RUNS_PATH)
+    due_runs = [row for row in schedule_runs if row.get("schedule_id") == "sched_due_once"]
+    assert any(row.get("status") == "starting" for row in due_runs), due_runs
+    assert any(row.get("status") == "dispatched" for row in due_runs), due_runs
+    assert any(row.get("task_id") for row in due_runs if row.get("status") == "dispatched"), due_runs
+    scheduled_task_rows = [
+        row for row in a.read_jsonl(a.AGENT_TASK_LEDGER_PATH)
+        if row.get("assigned_agent") == scheduler_worker.agent_id and row.get("status") == "working"
+    ]
+    assert scheduled_task_rows, a.read_jsonl(a.AGENT_TASK_LEDGER_PATH)
+    assert "[GA TUI AgentTask Envelope v2]" in scheduler_worker.messages[-2].content, scheduler_worker.messages
+    duplicate_tick = a.scheduler_tick(state, now_epoch=1780000000.0, source="test:scheduler_duplicate")
+    assert duplicate_tick["dispatched"] == 0 and duplicate_tick["duplicates"] >= 1, duplicate_tick
+    disabled_tick = a.scheduler_tick(state, now_epoch=1780000000.0, source="test:scheduler_disabled", target_schedule_id="sched_daily_digest", record_skips=True)
+    assert disabled_tick["dispatched"] == 0 and disabled_tick["skipped"] == 1, disabled_tick
+    invalid_schedule = a.append_schedule_record({
+        "schedule_id": "sched_invalid",
+        "name": "Invalid Schedule",
+        "status": "enabled",
+        "trigger": "not a schedule",
+        "provider_id": "genericagent",
+        "dispatch_contract": "agenttask.v2",
+        "work_order": {"objective": "Should not run."},
+    })
+    invalid_info = a.schedule_due_info(invalid_schedule, now_epoch=1780000000.0)
+    assert invalid_info["status"] == "invalid", invalid_info
+    invalid_tick = a.scheduler_tick(state, now_epoch=1780000000.0, source="test:scheduler_invalid")
+    assert invalid_tick["invalid"] >= 1, invalid_tick
+    assert any(row.get("schedule_id") == "sched_invalid" and row.get("status") == "invalid" for row in a.read_jsonl(a.AGENT_SCHEDULE_RUNS_PATH))
     registry = a.ensure_gateway_registry(state)
     assert registry["internal_agent_mail"]["artifact_index"] == a.AGENT_ARTIFACT_INDEX_PATH, registry
     assert registry["internal_agent_mail"]["policy_decisions"] == a.AGENT_POLICY_DECISIONS_PATH, registry
@@ -2940,6 +2996,7 @@ def run_checks() -> None:
     assert registry["internal_agent_mail"]["recovery_plans"] == a.AGENT_RECOVERY_PLANS_PATH, registry
     assert registry["internal_agent_mail"]["runtime_providers"] == a.AGENT_RUNTIME_REGISTRY_PATH, registry
     assert registry["internal_agent_mail"]["schedules"] == a.AGENT_SCHEDULES_PATH, registry
+    assert registry["internal_agent_mail"]["schedule_runs"] == a.AGENT_SCHEDULE_RUNS_PATH, registry
     assert_gateway_schema(registry)
     baseline_report = registry["baseline_comparison"]
     assert_baseline_report_schema(baseline_report)
@@ -2952,7 +3009,7 @@ def run_checks() -> None:
     runtime_text = a.format_runtime_registry(registry["runtime_registry"])
     assert "Agent Runtime Providers" in runtime_text and "genericagent" in runtime_text, runtime_text
     schedule_text = a.format_scheduled_task_registry(registry["scheduled_task_registry"])
-    assert "Scheduled Tasks" in schedule_text and "agenttask.v2" in schedule_text, schedule_text
+    assert "Scheduled Tasks" in schedule_text and "agenttask.v2" in schedule_text and "schedule_runs.jsonl" in schedule_text, schedule_text
     model_text = a.format_model_orchestration_registry(registry["model_orchestration"])
     assert "Model Orchestration" in model_text, model_text
     gateway_panel_keys = {item.key for item in a.gateway_panel_items(state)}
