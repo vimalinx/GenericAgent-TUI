@@ -100,6 +100,7 @@ AGENT_GATEWAY_DAEMON_STATUS_PATH = os.path.join(AGENT_HARNESS_DIR, "gateway_daem
 AGENT_GATEWAY_DAEMON_LOG_PATH = os.path.join(AGENT_HARNESS_DIR, "gateway_daemon.log")
 AGENT_BRIDGE_REGISTRY_PATH = os.path.join(AGENT_HARNESS_DIR, "bridge_registry.json")
 LLM_RECENT_MODELS_PATH = os.path.join(AGENT_HARNESS_DIR, "recent_models.json")
+SCHEDULE_RUN_ATTEMPT_STATUSES = {"starting", "dispatched", "queued", "approval_required", "failed", "rejected"}
 try:
     SCHEDULER_TICK_SECONDS = max(5.0, float(os.environ.get("GA_TUI_SCHEDULER_TICK_SECONDS", "30") or "30"))
 except ValueError:
@@ -5513,11 +5514,13 @@ def scheduled_task_registry(state: Optional[State] = None) -> dict[str, Any]:
     del state
     run_rows = latest_schedule_run_records()
     last_runs = latest_schedule_runs_by_schedule_id()
+    last_attempts = latest_schedule_attempt_runs_by_schedule_id()
     seen_keys = {str(row.get("idempotency_key") or "").strip() for row in run_rows if row.get("idempotency_key")}
     jobs = []
     for row in latest_schedule_records().values():
         job = dict(row)
-        due = schedule_due_info(job, last_run=last_runs.get(str(job.get("schedule_id") or "")), seen_keys=seen_keys)
+        schedule_id = str(job.get("schedule_id") or "")
+        due = schedule_due_info(job, last_run=last_attempts.get(schedule_id), seen_keys=seen_keys)
         job["scheduler"] = {
             "due": bool(due.get("due")),
             "status": due.get("status", ""),
@@ -5525,7 +5528,8 @@ def scheduled_task_registry(state: Optional[State] = None) -> dict[str, Any]:
             "trigger_kind": due.get("trigger_kind", ""),
             "due_at": due.get("due_at", ""),
             "idempotency_key": due.get("idempotency_key", ""),
-            "last_run": last_runs.get(str(job.get("schedule_id") or "")) or {},
+            "last_run": last_runs.get(schedule_id) or {},
+            "last_attempt": last_attempts.get(schedule_id) or {},
         }
         jobs.append(job)
     jobs.sort(key=lambda row: str(row.get("updated_at") or row.get("created_at") or ""))
@@ -5581,13 +5585,21 @@ def latest_schedule_run_records(limit: int = 1000) -> list[dict[str, Any]]:
     return read_jsonl(AGENT_SCHEDULE_RUNS_PATH, limit=limit)
 
 
-def latest_schedule_runs_by_schedule_id(limit: int = 1000) -> dict[str, dict[str, Any]]:
+def latest_schedule_runs_by_schedule_id(limit: int = 1000, statuses: Optional[set[str]] = None) -> dict[str, dict[str, Any]]:
     latest: dict[str, dict[str, Any]] = {}
+    allowed = {str(item).strip().lower() for item in statuses} if statuses is not None else None
     for row in latest_schedule_run_records(limit=limit):
+        status = str(row.get("status") or "").strip().lower()
+        if allowed is not None and status not in allowed:
+            continue
         schedule_id = str(row.get("schedule_id") or "").strip()
         if schedule_id:
             latest[schedule_id] = row
     return latest
+
+
+def latest_schedule_attempt_runs_by_schedule_id(limit: int = 1000) -> dict[str, dict[str, Any]]:
+    return latest_schedule_runs_by_schedule_id(limit=limit, statuses=SCHEDULE_RUN_ATTEMPT_STATUSES)
 
 
 def schedule_run_idempotency_keys(limit: int = 2000) -> set[str]:
@@ -5608,11 +5620,60 @@ def append_schedule_run(row: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
+def schedule_time_repeat_trigger(schedule_value: Any, repeat_value: Any = "") -> str:
+    schedule_text = str(schedule_value or "").strip()
+    repeat_text = str(repeat_value or "").strip().lower()
+    if not schedule_text:
+        return ""
+    repeat_norm = re.sub(r"\s+", "", repeat_text.replace("-", "_"))
+    every_match = re.fullmatch(r"every_(\d+(?:\.\d+)?)([mhd])", repeat_norm)
+    if every_match:
+        unit = {"m": "m", "h": "h", "d": "d"}[every_match.group(2)]
+        return f"interval:{every_match.group(1)}{unit}"
+    if parse_schedule_interval_seconds(schedule_text) is not None and repeat_norm in {"", "interval", "repeat"}:
+        return f"interval:{schedule_text}"
+    time_match = re.fullmatch(r"(\d{1,2}):(\d{2})", schedule_text)
+    if not time_match:
+        return ""
+    hour = int(time_match.group(1))
+    minute = int(time_match.group(2))
+    if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+        return ""
+    if repeat_norm in {"", "daily", "day", "每天", "每日"}:
+        return f"cron:{minute} {hour} * * *"
+    if repeat_norm in {"weekday", "weekdays", "workday", "workdays", "工作日", "工作天"}:
+        return f"cron:{minute} {hour} * * 1-5"
+    return ""
+
+
+def normalize_schedule_trigger_text(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    interval_seconds = parse_schedule_interval_seconds(text)
+    if interval_seconds is not None:
+        return f"interval:{text}"
+    daily_match = re.fullmatch(r"(?:daily|每天|每日)\s+(\d{1,2}):(\d{2})", text, re.I)
+    if daily_match:
+        return schedule_time_repeat_trigger(f"{daily_match.group(1)}:{daily_match.group(2)}", "daily")
+    weekday_match = re.fullmatch(r"(?:weekday|weekdays|工作日|工作天)\s+(\d{1,2}):(\d{2})", text, re.I)
+    if weekday_match:
+        return schedule_time_repeat_trigger(f"{weekday_match.group(1)}:{weekday_match.group(2)}", "weekday")
+    return ""
+
+
 def schedule_record_trigger(row: dict[str, Any]) -> str:
-    for key in ("trigger", "cron", "interval", "at", "rrule"):
+    for key in ("cron", "interval", "at", "rrule", "trigger"):
         value = str(row.get(key) or "").strip()
         if value:
             return value
+    legacy = schedule_time_repeat_trigger(row.get("schedule"), row.get("repeat"))
+    if legacy:
+        return legacy
+    schedule = row.get("schedule") if isinstance(row.get("schedule"), dict) else {}
+    legacy = schedule_time_repeat_trigger(schedule.get("schedule"), schedule.get("repeat"))
+    if legacy:
+        return legacy
     return ""
 
 
@@ -5646,6 +5707,18 @@ def parse_schedule_interval_seconds(value: Any) -> Optional[float]:
     if not text:
         return None
     text = re.sub(r"^(interval|every)\s*[:=]?\s*", "", text).strip()
+    zh_match = re.fullmatch(r"(?:每|每隔)?\s*(\d+(?:\.\d+)?)\s*(秒|秒钟|分钟|分|小时|时|天|日)", text)
+    if zh_match:
+        amount = float(zh_match.group(1))
+        unit = zh_match.group(2)
+        if unit in {"秒", "秒钟"}:
+            return amount if amount > 0 else None
+        if unit in {"分钟", "分"}:
+            return amount * 60.0 if amount > 0 else None
+        if unit in {"小时", "时"}:
+            return amount * 3600.0 if amount > 0 else None
+        if unit in {"天", "日"}:
+            return amount * 86400.0 if amount > 0 else None
     match = re.fullmatch(
         r"(\d+(?:\.\d+)?)\s*(s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)?",
         text,
@@ -5683,6 +5756,10 @@ def split_schedule_trigger(row: dict[str, Any]) -> tuple[str, str]:
         return "at", str(row.get("at") or "").strip()
     if row.get("rrule"):
         return "rrule", str(row.get("rrule") or "").strip()
+    normalized = normalize_schedule_trigger_text(trigger)
+    if normalized:
+        normalized_kind, _, normalized_value = normalized.partition(":")
+        return normalized_kind, normalized_value.strip()
     if parse_schedule_interval_seconds(trigger) is not None:
         return "interval", trigger
     if len(trigger.split()) == 5:
@@ -5785,7 +5862,7 @@ def schedule_due_info(
     if not schedule_active(row):
         info.update(status="skipped", reason=f"schedule status is {status or 'inactive'}")
         return info
-    keys = seen_keys or schedule_run_idempotency_keys()
+    keys = seen_keys if seen_keys is not None else schedule_run_idempotency_keys()
     if trigger_kind == "at":
         due_epoch = parse_schedule_timestamp(trigger_value)
         if due_epoch is None:
@@ -5843,12 +5920,18 @@ def schedule_trigger_from_control(control: dict[str, Any]) -> str:
     for key in ("cron", "interval", "trigger", "rrule", "at"):
         value = str(control.get(key) or "").strip()
         if value:
-            return value
+            return normalize_schedule_trigger_text(value) or value
     schedule = control.get("schedule") if isinstance(control.get("schedule"), dict) else {}
     for key in ("cron", "interval", "trigger", "rrule", "at"):
         value = str(schedule.get(key) or "").strip()
         if value:
-            return value
+            return normalize_schedule_trigger_text(value) or value
+    legacy = schedule_time_repeat_trigger(control.get("schedule"), control.get("repeat"))
+    if legacy:
+        return legacy
+    legacy = schedule_time_repeat_trigger(schedule.get("schedule"), schedule.get("repeat"))
+    if legacy:
+        return legacy
     return ""
 
 
@@ -6108,7 +6191,7 @@ def scheduler_tick(
 ) -> dict[str, Any]:
     now_epoch = time.time() if now_epoch is None else float(now_epoch)
     records = latest_schedule_records()
-    last_runs = latest_schedule_runs_by_schedule_id()
+    last_runs = latest_schedule_attempt_runs_by_schedule_id()
     seen_keys = schedule_run_idempotency_keys()
     result = {
         "schema_version": "scheduledtask.tick.v1",
@@ -6135,7 +6218,7 @@ def scheduler_tick(
                 reason="manual scheduler run",
                 due_at_epoch=now_epoch,
                 due_at=time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(now_epoch)),
-                idempotency_key=f"{schedule_id}:manual:{int(now_epoch)}",
+                idempotency_key=f"{schedule_id}:manual:{int(now_epoch)}:{time.time_ns()}",
             )
         status = str(info.get("status") or "")
         if info.get("due"):

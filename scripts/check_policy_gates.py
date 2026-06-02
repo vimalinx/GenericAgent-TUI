@@ -2947,6 +2947,40 @@ def run_checks() -> None:
     assert schedule_records["sched_daily_digest"]["provider_id"] == "genericagent", schedule_records
     a.apply_tui_controls_from_text(state, ga_control({"action": "schedule.disable", "target": "sched_daily_digest"}), source="agent")
     assert a.latest_schedule_records()["sched_daily_digest"]["status"] == "disabled"
+    assert a.schedule_trigger_from_control({"schedule": "08:00", "repeat": "daily"}) == "cron:0 8 * * *"
+    assert a.schedule_trigger_from_control({"schedule": {"schedule": "08:30", "repeat": "weekday"}}) == "cron:30 8 * * 1-5"
+    assert a.split_schedule_trigger({"trigger": "每天 08:00"}) == ("cron", "0 8 * * *")
+    assert a.split_schedule_trigger({"trigger": "每 1 分钟"}) == ("interval", "每 1 分钟")
+    assert a.parse_schedule_interval_seconds("每 1 分钟") == 60.0
+    interval_anchor_row = a.append_schedule_record({
+        "schedule_id": "sched_interval_anchor",
+        "name": "Interval Anchor",
+        "status": "enabled",
+        "trigger": "interval:60s",
+        "created_at": "1970-01-01T00:00:00+00:00",
+        "work_order": {"objective": "Interval anchor probe."},
+    })
+    a.append_schedule_run({
+        "schedule_id": "sched_interval_anchor",
+        "status": "dispatched",
+        "timestamp": "1970-01-01T00:16:40+00:00",
+        "idempotency_key": "sched_interval_anchor:interval:1060",
+    })
+    a.append_schedule_run({
+        "schedule_id": "sched_interval_anchor",
+        "status": "skipped",
+        "timestamp": "1970-01-01T00:17:30+00:00",
+        "idempotency_key": "sched_interval_anchor:skipped:probe",
+    })
+    assert a.latest_schedule_runs_by_schedule_id()["sched_interval_anchor"]["status"] == "skipped"
+    assert a.latest_schedule_attempt_runs_by_schedule_id()["sched_interval_anchor"]["status"] == "dispatched"
+    interval_info = a.schedule_due_info(
+        interval_anchor_row,
+        now_epoch=1060.0,
+        last_run=a.latest_schedule_attempt_runs_by_schedule_id()["sched_interval_anchor"],
+        seen_keys=set(),
+    )
+    assert interval_info["due"] and interval_info["due_at_epoch"] == 1060.0, interval_info
     scheduler_worker = a.create_subagent(state, "Scheduler Worker", role="researcher")
     due_schedule_control = ga_control({
         "action": "schedule.create",
