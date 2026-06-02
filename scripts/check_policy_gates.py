@@ -1805,6 +1805,45 @@ def assert_self_intro_does_not_consume_mutual_chat_step() -> None:
     assert "两个代理互相聊天对话" in next_line, continuation_prompt
 
 
+def assert_control_result_continues_intermediate_workflow_step() -> None:
+    root = tempfile.mkdtemp(prefix="ga_tui_control_continue_")
+    retarget_harness(root)
+    install_fake_agent_runtime()
+    main_agent = SequencedFakeAgent([
+        (
+            "开始执行计划。第1步：创建新闻管家持久 agent。\n"
+            + ga_control(create_agent_action(
+                "新闻管家",
+                persistent=True,
+                profile="负责 RSS 信息源、每日新闻拉取、质量筛选和报纸排版。",
+            ))
+        ),
+        "收到控制结果，继续后续阶段，本测试不再发控制块。",
+    ])
+    state = a.State(agent=main_agent)
+    state.running = True
+    assert a.start_main_agent_task(
+        state,
+        "做吧",
+        source="user",
+        visible_user_text="做吧",
+        remember_user=True,
+        clear_history=True,
+    )
+    for _ in range(5):
+        drain_ui(state)
+    assert len(main_agent.prompts) == 2, main_agent.prompts
+    continuation_prompt, continuation_source = main_agent.prompts[1]
+    assert continuation_source == "ga-tui:auto_control_continue", main_agent.prompts
+    assert "Control results:" in continuation_prompt, continuation_prompt
+    assert "新闻管家" in continuation_prompt, continuation_prompt
+    assert "Continue the user-approved workflow yourself" in continuation_prompt, continuation_prompt
+    assert any("自动续跑主控：控制块已执行" in msg.content for msg in state.messages if msg.role == "system"), state.messages
+    news_agent = a.resolve_subagent(state, "新闻管家")
+    assert news_agent is not None, state.subagents
+    assert news_agent.persistent is True, news_agent
+
+
 def assert_top_bar_header_requested_fields() -> None:
     agent = ContextFakeAgent()
     agent.log_path = "/tmp/model_responses/session-alpha.jsonl"
@@ -1964,6 +2003,7 @@ def run_checks() -> None:
     assert_legacy_subagent_result_backfills_to_restored_session()
     assert_recent_sessions_use_last_message_activity()
     assert_self_intro_does_not_consume_mutual_chat_step()
+    assert_control_result_continues_intermediate_workflow_step()
 
     root = tempfile.mkdtemp(prefix="ga_tui_policy_check_")
     retarget_harness(root)

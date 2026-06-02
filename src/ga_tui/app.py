@@ -233,6 +233,8 @@ INTERACTIVE_TOOLS = ASK_USER_TOOLS | {"human_intervention", "user_input"}
 TOKEN_PANEL_H = 10
 AUTO_PLAN_CONTINUE_MAX_PER_SIGNATURE = 1
 AUTO_PLAN_CONTINUE_MAX_PER_PLAN = 12
+AUTO_CONTROL_CONTINUE_MAX_PER_SIGNATURE = 1
+AUTO_CONTROL_CONTINUE_MAX_PER_SESSION = 8
 PASTE_START = "\x1b[200~"
 PASTE_END = "\x1b[201~"
 RUN_FRAMES = ("[=     ]", "[==    ]", "[ ===  ]", "[  === ]", "[    ==]", "[     =]")
@@ -724,6 +726,9 @@ class State:
     auto_plan_continue_attempts: dict[str, int] = field(default_factory=dict)
     auto_plan_continue_plan_attempts: dict[str, int] = field(default_factory=dict)
     auto_plan_continue_last_blocked: str = ""
+    auto_control_continue_attempts: dict[str, int] = field(default_factory=dict)
+    auto_control_continue_count: int = 0
+    auto_control_continue_last_blocked: str = ""
     selection_active: bool = False
     selection_start: Optional[tuple[int, int]] = None
     selection_end: Optional[tuple[int, int]] = None
@@ -7234,6 +7239,10 @@ def start_main_agent_task(
         state.last_error = "当前主控仍在运行，不能启动新的主控任务。"
         mark_dirty(state)
         return False
+    if str(source or "").startswith("user"):
+        state.auto_control_continue_attempts = {}
+        state.auto_control_continue_count = 0
+        state.auto_control_continue_last_blocked = ""
     secret_task = bool(state.secret_vault.unlocked)
     if secret_task:
         network_decision = secret_network_gate(state, operation=source or "main_agent_task")
@@ -7360,7 +7369,7 @@ def format_plan_continuation_prompt(
         "Do not call browser/search/file/code tools such as web_scan, webexecute_js, file_read, or code_run just to decide what to do; the task ledger above is authoritative.",
         f"When a control belongs to the next step, attach it with parent_task_id={next_task_id!r} or an equivalent step reference.",
         "Do not repeat completed steps. Reuse existing subagents before creating new ones.",
-        "Temporary subagents are the default unless the user/control explicitly asks for persistent/long-term agents.",
+        "Temporary subagents are the default unless the user/control explicitly asks for persistent/long-term agents or describes recurring duties such as daily scheduled collection.",
         "If you need child agent output before summarizing, delegate with agenttask.v2 delegate.create and wait for results instead of inventing a summary.",
         "If the plan is blocked, emit task.update/task.fail for the blocked step with a concrete reason.",
         "Examples to adapt, not copy literally:",
@@ -7418,6 +7427,135 @@ def maybe_queue_orchestrator_plan_continuation(state: State, reason: str) -> boo
     )
     prompt = format_plan_continuation_prompt(state, reason=reason, unfinished_rows=unfinished_rows)
     return start_main_agent_task(state, prompt, source="ga-tui:auto_plan_continue", clear_history=False)
+
+
+CONTROL_CONTINUATION_ACTIONS = {
+    "subagent_create",
+    "agent_create",
+    "create_subagent",
+    "new_subagent",
+    "subagent_profile",
+    "subagent_role",
+    "subagent_model",
+    "task_plan",
+    "task_update",
+    "task_start",
+}
+
+CONTROL_CONTINUATION_WORKFLOW_TOKENS = (
+    "执行计划",
+    "开始执行",
+    "继续执行",
+    "第1步",
+    "第 1 步",
+    "第2步",
+    "第 2 步",
+    "第3步",
+    "第 3 步",
+    "step 1",
+    "step 2",
+    "step 3",
+    "phase 1",
+    "phase 2",
+    "phase 3",
+    "1.1",
+    "2.1",
+    "3.1",
+    "上岗培训",
+)
+
+
+def control_result_continuation_signature(text: str, control_results: list[str]) -> str:
+    payload = "\n".join([strip_tui_controls(text), *control_results])
+    digest = hashlib.sha1(payload.encode("utf-8", errors="ignore")).hexdigest()
+    return digest[:16]
+
+
+def control_result_continuation_needed(text: str, controls: list[dict[str, Any]]) -> bool:
+    if not controls:
+        return False
+    visible_text = normalize_subagent_identity_text(strip_tui_controls(text))
+    if not any(compact_identity_text(token) in compact_identity_text(visible_text) for token in CONTROL_CONTINUATION_WORKFLOW_TOKENS):
+        return False
+    actions = {str(control.get("action") or "").strip().lower().replace("-", "_") for control in controls}
+    if actions & {"subagent_ask", "subagent_run", "subagent_input", "agent_ask", "agent_run"}:
+        return False
+    return bool(actions & CONTROL_CONTINUATION_ACTIONS)
+
+
+def format_control_result_continuation_prompt(
+    *,
+    reason: str,
+    control_results: list[str],
+    original_text: str,
+) -> str:
+    visible = truncate_cells(strip_tui_controls(original_text).strip(), 1200)
+    lines = [
+        "[GA TUI Control Result Continuation]",
+        f"Reason: {reason}",
+        "",
+        "The previous turn executed real TUI controls but ended after an intermediate workflow step.",
+        "Continue the user-approved workflow yourself; do not ask the user to confirm the already-approved next step.",
+        "Use TUI query tools if needed, then emit the next hidden <ga-control> block for delegation, task updates, configuration, or blocker reporting.",
+        "If the prior visible plan was only natural language and no task ledger exists, first create or update the task ledger before continuing.",
+        "Do not repeat controls that already succeeded.",
+        "",
+        "Control results:",
+        *control_results,
+    ]
+    if visible:
+        lines += ["", "Previous visible text:", visible]
+    lines.append("[/GA TUI Control Result Continuation]")
+    return "\n".join(lines)
+
+
+def maybe_queue_orchestrator_control_continuation(
+    state: State,
+    *,
+    reason: str,
+    text: str,
+    controls: list[dict[str, Any]],
+    control_results: list[str],
+) -> bool:
+    if state.status != "idle" or state.active_task_id is not None:
+        return False
+    if state.pending_interaction or active_subagent_work_exists(state):
+        return False
+    if state.active_plan_task_id:
+        return False
+    if not control_results or not control_result_continuation_needed(text, controls):
+        return False
+    if state.auto_control_continue_count >= AUTO_CONTROL_CONTINUE_MAX_PER_SESSION:
+        if state.auto_control_continue_last_blocked != "session-limit":
+            message = f"控制结果续跑已停止：当前会话达到 {AUTO_CONTROL_CONTINUE_MAX_PER_SESSION} 次续跑上限。"
+            state.auto_control_continue_last_blocked = "session-limit"
+            state.last_error = message
+            add_system(state, message, persist=True, kind="orchestrator_auto_continue_blocked")
+        return False
+    signature = control_result_continuation_signature(text, control_results)
+    attempts = int(state.auto_control_continue_attempts.get(signature) or 0)
+    if attempts >= AUTO_CONTROL_CONTINUE_MAX_PER_SIGNATURE:
+        if state.auto_control_continue_last_blocked != signature:
+            message = "控制结果续跑已停止：相同控制结果没有推进，需要主控重新规划或用户介入。"
+            state.auto_control_continue_last_blocked = signature
+            state.last_error = message
+            add_system(state, message, persist=True, kind="orchestrator_auto_continue_blocked")
+        return False
+    state.auto_control_continue_attempts[signature] = attempts + 1
+    state.auto_control_continue_count += 1
+    state.auto_control_continue_last_blocked = ""
+    add_system(
+        state,
+        "自动续跑主控：控制块已执行，继续后续流程。",
+        persist=True,
+        kind="orchestrator_auto_continue",
+    )
+    prompt = format_control_result_continuation_prompt(
+        reason=reason,
+        control_results=control_results,
+        original_text=text,
+    )
+    return start_main_agent_task(state, prompt, source="ga-tui:auto_control_continue", clear_history=False)
 
 
 def queue_approval(
@@ -11927,7 +12065,7 @@ def recent_user_subagent_context(state: State, limit: int = 1) -> str:
     return "\n".join(reversed(parts))
 
 
-def apply_tui_controls_from_text(state: State, text: str, source: str = "agent", default_target: str = "current") -> None:
+def apply_tui_controls_from_text(state: State, text: str, source: str = "agent", default_target: str = "current") -> list[str]:
     agent_source = "agent" in source
     controls = attach_implicit_plan_to_controls(state, extract_tui_controls(text), source=source)
     agent_control_results: list[str] = []
@@ -11955,7 +12093,7 @@ def apply_tui_controls_from_text(state: State, text: str, source: str = "agent",
                 persist=True,
                 kind="agent_control_result",
             )
-        return
+        return agent_control_results
 
     for control in controls:
         action = str(control.get("action") or control.get("op") or "").strip().lower()
@@ -12029,6 +12167,7 @@ def apply_tui_controls_from_text(state: State, text: str, source: str = "agent",
             persist=True,
             kind="agent_control_result",
         )
+    return agent_control_results
 
 
 def apply_secret_subagent_controls_from_text(state: State, text: str, source: str = "secret-agent") -> int:
@@ -19894,7 +20033,9 @@ def process_ui_queue(state: State) -> bool:
             finished_secret = state.active_task_secret
             secret_user_text = state.active_secret_user_text
             secret_session_id = state.active_secret_session_id
-            had_tui_controls = bool(extract_tui_controls(text, allow_json_fences=state.active_task_secret))
+            tui_controls = extract_tui_controls(text, allow_json_fences=state.active_task_secret)
+            had_tui_controls = bool(tui_controls)
+            control_results: list[str] = []
             state.status = "idle"
             state.active_task_id = None
             state.active_task_source = ""
@@ -19928,13 +20069,21 @@ def process_ui_queue(state: State) -> bool:
                 suffix = f" Secret 子 agent 控制已加密执行 {applied_secret_controls} 个。" if applied_secret_controls else (" Secret 输出中的非子 agent TUI 控制已忽略。" if had_tui_controls else "")
                 state.last_error = (f"Secret transcript encrypted: {os.path.basename(secret_ref)}" if ok else secret_ref) + suffix
             else:
-                apply_tui_controls_from_text(state, text, source="agent", default_target="current")
+                control_results = apply_tui_controls_from_text(state, text, source="agent", default_target="current")
                 if maybe_autoname_current_session(state):
                     state.dirty = True
                 if load_history(state, force=True):
                     state.dirty = True
             if not finished_secret and (had_tui_controls or finished_source == "ga-tui:auto_plan_continue"):
-                maybe_queue_orchestrator_plan_continuation(state, f"main_done:{finished_source or 'agent'}")
+                plan_queued = maybe_queue_orchestrator_plan_continuation(state, f"main_done:{finished_source or 'agent'}")
+                if not plan_queued and had_tui_controls:
+                    maybe_queue_orchestrator_control_continuation(
+                        state,
+                        reason=f"main_done:{finished_source or 'agent'}",
+                        text=text,
+                        controls=tui_controls,
+                        control_results=control_results,
+                    )
         state.follow_bottom = True
 
 
