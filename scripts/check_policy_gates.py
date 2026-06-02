@@ -70,8 +70,11 @@ def retarget_harness(root: str) -> None:
 
 
 class FakeAgent:
+    def __init__(self) -> None:
+        self.prompts: list[tuple[str, str]] = []
+
     def put_task(self, prompt: str, source: str = "") -> queue.Queue:
-        del prompt, source
+        self.prompts.append((prompt, source))
         dq: queue.Queue = queue.Queue()
         dq.put({"done": "ok"})
         return dq
@@ -2979,7 +2982,13 @@ def run_checks() -> None:
         if row.get("assigned_agent") == scheduler_worker.agent_id and row.get("status") == "working"
     ]
     assert scheduled_task_rows, a.read_jsonl(a.AGENT_TASK_LEDGER_PATH)
-    assert "[GA TUI AgentTask Envelope v2]" in scheduler_worker.messages[-2].content, scheduler_worker.messages
+    visible_scheduler_prompts = [msg.content for msg in scheduler_worker.messages if msg.role == "user"]
+    assert any("╭─ 子 Agent 工作单" in content for content in visible_scheduler_prompts), scheduler_worker.messages
+    assert all("[GA TUI AgentTask Envelope v2]" not in content for content in visible_scheduler_prompts), scheduler_worker.messages
+    assert all('"tools_forbidden": [' not in content for content in visible_scheduler_prompts), scheduler_worker.messages
+    assert scheduler_worker.agent.prompts, scheduler_worker.agent
+    assert "[GA TUI AgentTask Envelope v2]" in scheduler_worker.agent.prompts[-1][0], scheduler_worker.agent.prompts
+    assert '"tools_forbidden": [' in scheduler_worker.agent.prompts[-1][0], scheduler_worker.agent.prompts[-1][0]
     duplicate_tick = a.scheduler_tick(state, now_epoch=1780000000.0, source="test:scheduler_duplicate")
     assert duplicate_tick["dispatched"] == 0 and duplicate_tick["duplicates"] >= 1, duplicate_tick
     disabled_tick = a.scheduler_tick(state, now_epoch=1780000000.0, source="test:scheduler_disabled", target_schedule_id="sched_daily_digest", record_skips=True)
@@ -3076,13 +3085,19 @@ def run_checks() -> None:
     assert len(a.read_jsonl(a.AGENT_APPROVALS_PATH)) == approvals_before_contract_delegate
     contract_sub = a.resolve_subagent(state, "Contract Researcher")
     assert contract_sub is not None
+    visible_contract_prompts = [msg.content for msg in contract_sub.messages if msg.role == "user"]
     assert any(
-        msg.role == "user"
-        and "[GA TUI AgentTask Envelope v2]" in msg.content
-        and '"tools_forbidden": [' in msg.content
-        and '"deploy"' in msg.content
-        for msg in contract_sub.messages
+        "╭─ 子 Agent 工作单" in content
+        and "整理项目结构，输出证据引用。" in content
+        and "内部协议与工具权限已隐藏" in content
+        for content in visible_contract_prompts
     ), contract_sub.messages
+    assert all("[GA TUI AgentTask Envelope v2]" not in content for content in visible_contract_prompts), contract_sub.messages
+    assert all('"tools_forbidden": [' not in content for content in visible_contract_prompts), contract_sub.messages
+    assert contract_sub.agent.prompts, contract_sub.agent
+    assert "[GA TUI AgentTask Envelope v2]" in contract_sub.agent.prompts[-1][0], contract_sub.agent.prompts
+    assert '"tools_forbidden": [' in contract_sub.agent.prompts[-1][0], contract_sub.agent.prompts[-1][0]
+    assert '"deploy"' in contract_sub.agent.prompts[-1][0], contract_sub.agent.prompts[-1][0]
     contract_task_rows = [
         row
         for row in a.read_jsonl(a.AGENT_TASK_LEDGER_PATH)

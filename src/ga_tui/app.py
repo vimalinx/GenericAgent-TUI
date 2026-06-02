@@ -12367,6 +12367,67 @@ def format_agenttask_worker_prompt(control: dict[str, Any]) -> str:
     return "\n".join(str(item) for item in sections).strip()
 
 
+def display_prompt_for_subagent_task(prompt: str) -> str:
+    prompt = clean_text((prompt or "").strip())
+    payload = agenttask_payload_from_prompt(prompt)
+    if not payload:
+        return prompt
+
+    work_order = agenttask_work_order(payload)
+    routing = agenttask_routing(payload)
+    selector = agenttask_target_selector(payload)
+    output_contract = agenttask_contract(payload, "output_contract")
+    objective = agenttask_objective(payload) or policy_relevant_subagent_prompt_text(prompt)
+    selected_agent = str(
+        routing.get("selected_agent")
+        or selector.get("agent_id")
+        or selector.get("target")
+        or selector.get("name")
+        or payload.get("target")
+        or ""
+    ).strip()
+    mode = str(routing.get("mode") or "").strip()
+
+    lines = ["╭─ 子 Agent 工作单"]
+    if selected_agent:
+        lines.append(f"│ 发送给：{selected_agent}")
+    if mode:
+        lines.append(f"│ 调度模式：{mode}")
+
+    def add_text_section(title: str, value: Any) -> None:
+        text = clean_text(str(value or "")).strip()
+        if not text:
+            return
+        lines.extend(["│", f"│ {title}"])
+        for item in text.splitlines():
+            lines.append(f"│ {item}" if item else "│")
+
+    def add_list_section(title: str, values: Any) -> None:
+        if not isinstance(values, list):
+            return
+        items = [clean_text(str(item or "")).strip() for item in values]
+        items = [item for item in items if item]
+        if not items:
+            return
+        lines.extend(["│", f"│ {title}"])
+        for item in items:
+            lines.append(f"│ - {item}")
+
+    add_text_section("目标", objective)
+    add_text_section("背景", work_order.get("background"))
+    add_list_section("不要做", work_order.get("non_goals"))
+    add_list_section("完成标准", work_order.get("success_criteria"))
+    add_text_section("停止条件", work_order.get("stop_condition"))
+    required = output_contract.get("required_sections")
+    add_list_section("需要返回的内容", required)
+    output_format = str(output_contract.get("format") or "").strip()
+    if output_format:
+        add_text_section("输出格式", output_format)
+
+    lines.extend(["│", "│ 内部协议与工具权限已隐藏，执行侧仍保留完整 agenttask.v2。", "╰─"])
+    return "\n".join(lines)
+
+
 def execution_control_from_v2(control: dict[str, Any]) -> Optional[dict[str, Any]]:
     action = normalized_control_action(control)
     common = {
@@ -19516,7 +19577,7 @@ def queue_subagent_task(
     sub.task_queue.append((prompt, source, bool(policy_approved), parent_task_id, task_title))
     sub.updated_at = time.time()
     save_subagent_meta(sub, state)
-    append_subagent_event(sub, f"{source}:queued", prompt, state=state)
+    append_subagent_event(sub, f"{source}:queued", display_prompt_for_subagent_task(prompt), state=state)
     mark_dirty(state)
     return f"{sub.name} 正在运行，已排队 1 个任务（队列 {len(sub.task_queue)}）。"
 
@@ -19675,12 +19736,13 @@ def start_secret_subagent_task(
     sub.status = "running"
     sub.updated_at = time.time()
     sub.pending_interaction = None
-    sub.messages.append(Message("user", prompt))
+    visible_prompt = display_prompt_for_subagent_task(prompt)
+    sub.messages.append(Message("user", visible_prompt))
     sub.messages.append(Message("assistant", "", done=False))
     save_subagent_meta(sub, state)
     save_subagent_chat_session(state, sub, source=source)
     mark_subagent_messages_changed(state, sub)
-    append_subagent_event(sub, source, prompt, state=state)
+    append_subagent_event(sub, source, visible_prompt, state=state)
     write_secret_subagent_task_record(
         state,
         sub,
@@ -19930,12 +19992,13 @@ def start_subagent_task(
     sub.status = "running"
     sub.updated_at = time.time()
     sub.pending_interaction = None
-    sub.messages.append(Message("user", prompt))
+    visible_prompt = display_prompt_for_subagent_task(prompt)
+    sub.messages.append(Message("user", visible_prompt))
     sub.messages.append(Message("assistant", "", done=False))
     save_subagent_meta(sub)
     save_subagent_chat_session(state, sub, source=source)
     mark_subagent_messages_changed(state, sub)
-    append_subagent_event(sub, source, prompt)
+    append_subagent_event(sub, source, visible_prompt)
     append_task_ledger(
         bus_task_id,
         status="working",
