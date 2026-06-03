@@ -340,8 +340,8 @@ TUI_AGENT_CONTROL_HINT = """
 - 如果当前控制块只是一个中间步骤，且需要主控继续生成后续控制，在本次 `ga-control.v2` 批量 envelope 或最后一个 action 上显式写 `continue_after:true` 或 `workflow_state:"in_progress"`。
 - 如果控制动作属于某个计划步骤，必须显式提供 `plan_step_id` 或 `parent_task_id`。TUI 不会按“自我介绍/互相聊天/汇总”等词自动绑定步骤。
 - Secret Vault 已解锁时仍使用同样的 `ga-control.v2` / `agent.create` / `delegate.create` 控制；持久 Secret agent 写入加密 `secret_subagents`，不要检查或推断普通 `memory/subagents/` 目录。
-- 定时任务由 TUI 顶层登记和治理；用户只需要表达自然意图，不需要说 `schedule_id`、`cron`、`interval`、`at` 这些术语。你负责把“每天早上八点”“每分钟”“明天上午九点”等自然语言翻译成新的 `schedule.create` 结构。
-- `schedule.create` 只能使用新协议字段：`cron`、`interval`、`at`，或标准化 `trigger`（例如 `cron:0 8 * * *`、`interval:1m`、`at:YYYY-MM-DDT09:00:00+08:00`）。不要输出旧 `schedule` / `repeat` 字段，也不要把中文自然时间原样塞进 `trigger`。
+- 定时任务由 TUI 顶层登记和治理；用户只需要表达自然意图，不需要说 `schedule_id`、`cron`、`interval`、`at` 这些术语。你负责把“每天早上八点”“每分钟”“明天上午九点”等自然语言翻译成当前 `ScheduleCreate` 结构。
+- `ScheduleCreate` 的触发器 schema 只由 `cron`、`interval`、`at`，或标准化 `trigger` 前缀定义（例如 `cron:0 8 * * *`、`interval:1m`、`at:YYYY-MM-DDT09:00:00+08:00`）。schema 外字段由通用边界处理，不在当前协议里枚举历史字段。
 - 用户说“每天 8 点”时输出 `cron:"0 8 * * *"`；说“工作日 8 点半”时输出 `cron:"30 8 * * 1-5"`；说“每 1 分钟”时输出 `interval:"1m"`；说“明天 9 点”时按当前日期和时区输出 ISO `at`。
 - 用户没有指定 `schedule_id` 时可以省略，让 TUI 自动生成；但必须提供明确目标 agent（优先先用 `agent_match` / `agent_list` 查询）和完整 `work_order` / capability / context / output contracts，并通过 `agenttask.v2` 派发，不允许绕过任务账本和审批门。
 - 你是主控 Orchestrator；读任务可并行，写任务保持单写者；子 agent 返回 artifact/证据/摘要，不要无结构自由聊天。

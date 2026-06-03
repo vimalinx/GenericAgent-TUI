@@ -2949,15 +2949,17 @@ def run_checks() -> None:
     a.apply_tui_controls_from_text(state, ga_control({"action": "schedule.disable", "target": "sched_daily_digest"}), source="agent")
     assert a.latest_schedule_records()["sched_daily_digest"]["status"] == "disabled"
     assert "用户只需要表达自然意图" in a.TUI_AGENT_CONTROL_HINT
+    assert "ScheduleCreate" in a.TUI_AGENT_CONTROL_HINT
+    assert "schema 外字段由通用边界处理" in a.TUI_AGENT_CONTROL_HINT
     assert 'cron:"0 8 * * *"' in a.TUI_AGENT_CONTROL_HINT
     assert 'interval:"1m"' in a.TUI_AGENT_CONTROL_HINT
-    assert a.schedule_trigger_from_control({"schedule": "08:00", "repeat": "daily"}) == ""
-    assert a.schedule_trigger_from_control({"schedule": {"schedule": "08:30", "repeat": "weekday"}}) == ""
-    assert a.split_schedule_trigger({"trigger": "每天 08:00"}) == ("unknown", "每天 08:00")
-    assert a.split_schedule_trigger({"trigger": "每 1 分钟"}) == ("unknown", "每 1 分钟")
-    assert a.parse_schedule_interval_seconds("每 1 分钟") is None
+    assert a.split_schedule_trigger({"cron": "0 8 * * *"}) == ("cron", "0 8 * * *")
     assert a.split_schedule_trigger({"interval": "1m"}) == ("interval", "1m")
+    assert a.split_schedule_trigger({"at": "2026-01-01T00:00:00+0800"}) == ("at", "2026-01-01T00:00:00+0800")
     assert a.split_schedule_trigger({"trigger": "interval:1m"}) == ("interval", "1m")
+    assert a.schedule_trigger_from_control({"unsupported_field": "x"}) == ""
+    assert a.split_schedule_trigger({"trigger": "free form words"}) == ("unknown", "free form words")
+    assert a.parse_schedule_interval_seconds("free form words") is None
     interval_anchor_row = a.append_schedule_record({
         "schedule_id": "sched_interval_anchor",
         "name": "Interval Anchor",
