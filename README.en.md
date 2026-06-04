@@ -267,6 +267,7 @@ Type `/help` inside the TUI for the full command list.
 /continue [n]        List or restore historical sessions
 /sessions            List historical sessions
 /new                 Create a new empty session
+/temp                Create a temporary session without history logs, session memory, or memory candidates
 /clear               Clear the current screen
 /status              Show current status
 /stop                Stop the current task

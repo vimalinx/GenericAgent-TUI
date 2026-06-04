@@ -33,6 +33,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import unicodedata
+import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -61,6 +62,7 @@ FRONTENDS_DIR = os.path.join(ROOT_DIR, "frontends")
 MODEL_RESPONSES_DIR = os.path.join(ROOT_DIR, "temp", "model_responses")
 TOKEN_USAGE_PATH = os.path.join(MODEL_RESPONSES_DIR, "session_token_usage.json")
 SESSION_META_PATH = os.path.join(MODEL_RESPONSES_DIR, "session_meta.json")
+L4_RAW_SESSIONS_DIR = os.path.join(ROOT_DIR, "memory", "L4_raw_sessions")
 UI_DURABLE_SYSTEM_MESSAGES_KEY = "ui_durable_system_messages"
 UI_DURABLE_SYSTEM_MESSAGE_LIMIT = 200
 SUBAGENT_CONTEXT_REPLY_LIMIT = 2200
@@ -254,6 +256,7 @@ COMMANDS: list[tuple[str, str, str, bool]] = [
     ("/sessions", "", "列出历史会话", True),
     ("/clear", "", "清空当前屏幕", True),
     ("/new", "", "新建空会话", True),
+    ("/temp", "", "新建不落盘临时会话", True),
     ("/status", "", "显示当前状态", True),
     ("/stop", "", "中止当前任务", True),
     ("/resume", "", "让 agent 总结最近会话", True),
@@ -669,6 +672,7 @@ class BackgroundSession:
     active_task_secret: bool = False
     active_secret_user_text: str = ""
     secret_origin: dict[str, Any] = field(default_factory=dict)
+    temporary_session: bool = False
 
 
 @dataclass
@@ -797,6 +801,7 @@ class State:
     restore_token: int = 0
     current_title: str = "main"
     selected_session: Any = "main"
+    temporary_session: bool = False
     command_index: int = 0
     fold_process: bool = True
     markdown: bool = True
@@ -1165,6 +1170,8 @@ def agent_log_path(agent: Any) -> str:
 
 
 def active_ui_session_path(state: State) -> str:
+    if state.temporary_session:
+        return ""
     if state.history_ui_path:
         return state.history_ui_path
     return agent_log_path(state.agent)
@@ -1173,6 +1180,8 @@ def active_ui_session_path(state: State) -> str:
 def active_ui_session_key(state: State) -> str:
     if state.secret_vault.unlocked:
         return state.secret_vault.session_id or "secret"
+    if state.temporary_session:
+        return ""
     return session_key(active_ui_session_path(state))
 
 
@@ -1189,6 +1198,12 @@ def persist_ui_system_message_for_path(path: str, text: str, *, kind: str = "") 
     content = str(text or "")
     message_kind = (kind or durable_ui_system_message_kind(content)).strip()
     key = session_key(path)
+    try:
+        if path and normalized_path(path) == normalized_path(os.devnull):
+            return False
+    except Exception:
+        if path == os.devnull:
+            return False
     if not content.strip() or not message_kind or not key:
         return False
 
@@ -1718,6 +1733,105 @@ def cached_session_rows(state: State, exclude_pid: Optional[int] = None) -> tupl
     rows.extend(missing_rows)
     rows.sort(key=lambda item: item[1], reverse=True)
     return rows, changed
+
+
+def l4_archive_zip_paths() -> list[str]:
+    return sorted(glob.glob(os.path.join(L4_RAW_SESSIONS_DIR, "*.zip")))
+
+
+def l4_member_time_hint(zip_path: str, member_name: str) -> float:
+    match = re.match(r"^(\d{2})(\d{2})_(\d{2})(\d{2})-", os.path.basename(member_name or ""))
+    zip_year = re.match(r"^(\d{4})-", os.path.basename(zip_path or ""))
+    if not match or not zip_year:
+        return 0.0
+    try:
+        return time.mktime(time.strptime(
+            f"{zip_year.group(1)}-{match.group(1)}-{match.group(2)} {match.group(3)}:{match.group(4)}:00",
+            "%Y-%m-%d %H:%M:%S",
+        ))
+    except Exception:
+        return 0.0
+
+
+def l4_recovery_needles(meta: dict[str, Any]) -> list[tuple[str, int]]:
+    needles: list[tuple[str, int]] = []
+    raw_preview_messages = meta.get("ui_preview_messages")
+    if isinstance(raw_preview_messages, list):
+        for item in raw_preview_messages:
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role") or "")
+            content = clean_text(str(item.get("content") or ""))
+            content = re.sub(r"^（预览）", "", content).strip()
+            if len(content) >= 10:
+                needles.append((content, 20 if role == "user" else 8))
+    for field_name, weight in (("preview", 3), ("description", 2)):
+        content = compact_description(str(meta.get(field_name) or ""), 180)
+        if len(content) >= 12:
+            needles.append((content, weight))
+    unique: list[tuple[str, int]] = []
+    seen: set[str] = set()
+    for needle, weight in needles:
+        if needle in seen:
+            continue
+        seen.add(needle)
+        unique.append((needle, weight))
+    return unique[:12]
+
+
+def l4_archive_candidate_score(zip_path: str, member_name: str, content: str, meta: dict[str, Any]) -> int:
+    score = 0
+    for needle, weight in l4_recovery_needles(meta):
+        if needle and needle in content:
+            score += weight
+    last_user_at = session_meta_epoch(meta.get("last_user_at"))
+    member_time = l4_member_time_hint(zip_path, member_name)
+    if last_user_at and member_time:
+        if abs(last_user_at - member_time) <= 36 * 3600:
+            score += 3
+        elif time.strftime("%Y-%m", time.localtime(last_user_at)) == time.strftime("%Y-%m", time.localtime(member_time)):
+            score += 1
+    return score
+
+
+def restore_missing_source_from_l4_archive(state: State, path: str, meta: dict[str, Any]) -> tuple[bool, str]:
+    if os.path.exists(path):
+        return True, "源文件已存在。"
+    best: tuple[int, str, str, str] | None = None
+    for zip_path in l4_archive_zip_paths():
+        try:
+            with zipfile.ZipFile(zip_path) as archive:
+                for member_name in archive.namelist():
+                    if not member_name.endswith(".txt"):
+                        continue
+                    try:
+                        content = archive.read(member_name).decode("utf-8", errors="replace")
+                    except Exception:
+                        continue
+                    score = l4_archive_candidate_score(zip_path, member_name, content, meta)
+                    if score <= 0:
+                        continue
+                    if best is None or score > best[0]:
+                        best = (score, zip_path, member_name, content)
+        except Exception:
+            continue
+    if best is None or best[0] < 12:
+        return False, "未找到可信的 L4 归档映射。"
+    score, zip_path, member_name, content = best
+    write_text_atomic(path, content)
+    state.session_meta = load_session_meta_registry()
+    key = session_key(path)
+    entry = dict(state.session_meta.get(key, {}))
+    entry.update({
+        "source_restored_from": "L4_raw_sessions",
+        "source_restored_archive": os.path.basename(zip_path),
+        "source_restored_member": member_name,
+        "source_restored_score": score,
+        "source_restored_at": time.time(),
+    })
+    state.session_meta[key] = entry
+    save_session_meta_registry(state.session_meta)
+    return True, f"已从 L4 归档恢复源文件：{os.path.basename(zip_path)}::{member_name}"
 
 
 def new_session_log_path() -> str:
@@ -2873,6 +2987,7 @@ def restore_secret_imported_session(state: State, target: str) -> str:
     state.messages = list(messages)
     state.current_title = f"Secret: {title}"
     state.selected_session = secret_session_sidebar_key(state.secret_vault.session_id)
+    state.temporary_session = False
     cancel_normal_history_restore(state)
     state.history_ui_loaded_rounds = loaded_rounds
     state.history_ui_total_rounds = total_rounds
@@ -2958,6 +3073,7 @@ def restore_secret_native_session(state: State, target: str) -> str:
     state.messages = list(messages)
     state.current_title = f"Secret: {title}"
     state.selected_session = secret_session_sidebar_key(session_id)
+    state.temporary_session = False
     cancel_normal_history_restore(state)
     state.history_ui_loaded_rounds = sum(1 for msg in messages if msg.role == "user")
     state.history_ui_total_rounds = state.history_ui_loaded_rounds
@@ -3814,6 +3930,7 @@ def enter_secret_unlocked_state(state: State, key: bytes, message: str) -> str:
     vault.last_unlocked_at = time.time()
     state.current_title = "Secret Vault"
     state.selected_session = secret_session_sidebar_key(vault.session_id)
+    state.temporary_session = False
     state.messages.clear()
     reset_agent_runtime_context_no_snapshot(state.agent)
     cancel_normal_history_restore(state)
@@ -3960,6 +4077,7 @@ def lock_secret_vault(state: State, reason: str = "manual") -> str:
     reset_input_history_browse(state)
     state.current_title = "main"
     state.selected_session = "main"
+    state.temporary_session = False
     cancel_normal_history_restore(state)
     set_input_text(state, "")
     reset_agent_runtime_context_no_snapshot(state.agent)
@@ -3989,6 +4107,7 @@ def secret_status_text(state: State) -> str:
 
 SECRET_BLOCKED_NORMAL_COMMANDS = {
     "/memory", "/mem", "/tasks", "/bus", "/artifacts", "/recover", "/evals", "/gateway", "/baseline", "/continue", "/sessions",
+    "/temp",
 }
 
 
@@ -8307,6 +8426,9 @@ def start_main_agent_task(
     if secret_task:
         set_agent_log_path(state.agent, os.devnull)
         bind_agent_token_session(state, state.agent)
+    elif state.temporary_session:
+        set_agent_log_path(state.agent, os.devnull)
+        bind_agent_token_session(state, state.agent)
     if visible_user_text is not None:
         state.messages.append(Message("user", visible_user_text))
     state.messages.append(Message("assistant", "", done=False))
@@ -9960,6 +10082,8 @@ def queue_curated_memory_candidate(
     text = clean_text(text).strip()
     if not text:
         return "记忆候选内容为空。"
+    if state.temporary_session:
+        return "临时会话不写入记忆候选。"
     if not target_sub.persistent:
         return f"{target_sub.name} 是临时会话子 agent，已忽略长期记忆候选。"
     if target_sub.security_context == "secret":
@@ -12060,6 +12184,10 @@ def rename_current_session(state: State, raw_name: str) -> str:
     name = compact_title(raw_name, 80)
     if not name:
         return "名称不能为空。"
+    if state.temporary_session:
+        state.current_title = name
+        mark_dirty(state)
+        return f"当前临时会话已命名为: {name}；仅本次界面生效，不会持久化。"
     persist_msg = ""
     if session_names is not None:
         try:
@@ -12283,6 +12411,8 @@ def toggle_category_collapsed(state: State, raw: str) -> str:
 
 
 def current_session_path(state: State) -> str:
+    if state.temporary_session:
+        return ""
     return str(getattr(state.agent, "log_path", "") or "")
 
 
@@ -12312,6 +12442,7 @@ def clear_active_session_after_meta_action(state: State, message: str) -> None:
     state.messages.clear()
     state.current_title = "main"
     state.selected_session = "main"
+    state.temporary_session = False
     state.status = "idle"
     state.active_task_id = None
     state.active_task_source = ""
@@ -13491,6 +13622,8 @@ def top_bar_session_id(state: State) -> str:
     sub = selected_subagent(state)
     if sub is not None:
         return sub.agent_id or sub.name or "subagent"
+    if state.temporary_session:
+        return "temp"
     return active_ui_session_key(state) or "main"
 
 
@@ -13518,6 +13651,8 @@ def display_scope_key(state: State) -> str:
     sub = selected_subagent(state)
     if sub is not None:
         return f"sub:{sub.agent_id}"
+    if state.temporary_session:
+        return "session:temp"
     return f"session:{str(state.selected_session or 'main')}"
 
 
@@ -13955,6 +14090,8 @@ def ai_category_worker(
 
 
 def maybe_start_ai_title_job(state: State, path: str, messages: list[Message], agent: Any) -> bool:
+    if state.temporary_session or agent_log_path_is_devnull(agent):
+        return False
     if session_names is None or not path or agent is None:
         return False
     key = os.path.basename(path)
@@ -13975,6 +14112,8 @@ def maybe_start_ai_title_job(state: State, path: str, messages: list[Message], a
 
 
 def maybe_start_ai_description_job(state: State, path: str, messages: list[Message], agent: Any, force: bool = False) -> bool:
+    if state.temporary_session or agent_log_path_is_devnull(agent):
+        return False
     if not path or agent is None:
         return False
     key = os.path.basename(path)
@@ -14030,6 +14169,8 @@ def session_title_for_category(state: State, path: str) -> str:
 
 
 def maybe_start_ai_category_job(state: State, path: str, agent: Any, force: bool = False) -> bool:
+    if state.temporary_session or agent_log_path_is_devnull(agent):
+        return False
     if not path or agent is None:
         return False
     key = session_key(path)
@@ -14059,6 +14200,8 @@ def maybe_start_ai_category_job(state: State, path: str, agent: Any, force: bool
 
 
 def maybe_autoname_current_session(state: State, force: bool = False) -> bool:
+    if state.temporary_session or agent_log_path_is_devnull(state.agent):
+        return False
     if session_names is None:
         return False
     path = getattr(state.agent, "log_path", "")
@@ -14086,6 +14229,8 @@ def maybe_autoname_current_session(state: State, force: bool = False) -> bool:
 
 
 def maybe_autoname_background_session(state: State, bg: BackgroundSession, force: bool = False) -> bool:
+    if bg.temporary_session or agent_log_path_is_devnull(bg.agent):
+        return False
     if bg.security_context == "secret":
         title = secret_session_title_for_messages(bg.title, bg.messages)
         if title and bg.title != title:
@@ -14165,6 +14310,7 @@ def reset_active_session(state: State, title: str = "main", agent: Any = None) -
     state.follow_bottom = True
     state.current_title = title
     state.selected_session = "main"
+    state.temporary_session = False
     mark_messages_changed(state)
 
 
@@ -14196,6 +14342,7 @@ def park_active_session(state: State, reset: bool = True) -> Optional[str]:
         active_task_secret=bool(state.active_task_secret or secret_context),
         active_secret_user_text=state.active_secret_user_text,
         secret_origin=dict(state.secret_active_origin) if secret_context else {},
+        temporary_session=bool(state.temporary_session),
     )
     if reset:
         reset_active_session(state)
@@ -14230,6 +14377,7 @@ def stash_idle_active_session(state: State) -> Optional[str]:
         active_task_secret=False,
         active_secret_user_text="",
         secret_origin=dict(state.secret_active_origin) if secret_context else {},
+        temporary_session=bool(state.temporary_session),
     )
     return key
 
@@ -14282,14 +14430,18 @@ def switch_to_background_session_with_mode(state: State, key: str, stash_current
         state.secret_vault.session_id = bg.secret_session_id or state.secret_vault.session_id or secret_new_session_id()
         state.secret_active_origin = dict(bg.secret_origin)
         set_agent_log_path(state.agent, os.devnull)
+        state.temporary_session = False
     else:
         state.secret_active_origin = {}
+        state.temporary_session = bool(bg.temporary_session)
+        if state.temporary_session:
+            set_agent_log_path(state.agent, os.devnull)
     state.pending_interaction = bg.pending_interaction
     clear_history_ui_state(state)
     state.scroll = 0
     state.follow_bottom = True
     state.current_title = bg.title
-    state.selected_session = secret_session_sidebar_key(state.secret_vault.session_id) if bg.security_context == "secret" else "main"
+    state.selected_session = secret_session_sidebar_key(state.secret_vault.session_id) if bg.security_context == "secret" else ("temp" if state.temporary_session else "main")
     state.last_error = ""
     bind_agent_token_session(state, state.agent)
     mark_messages_changed(state)
@@ -14342,6 +14494,7 @@ def new_secret_current_session(state: State, keep_running: bool = True) -> bool:
     state.messages.clear()
     state.current_title = "Secret Vault"
     state.selected_session = secret_session_sidebar_key(state.secret_vault.session_id)
+    state.temporary_session = False
     state.status = "idle"
     state.active_task_id = None
     state.active_task_source = ""
@@ -14380,6 +14533,7 @@ def new_current_session(state: State, keep_running: bool = True) -> bool:
     state.messages.clear()
     state.current_title = "main"
     state.selected_session = "main"
+    state.temporary_session = False
     state.status = "idle"
     state.active_task_id = None
     state.active_task_source = ""
@@ -14395,6 +14549,42 @@ def new_current_session(state: State, keep_running: bool = True) -> bool:
     set_input_text(state, "")
     state.last_error = ""
     load_history(state, force=True)
+    mark_messages_changed(state)
+    return bool(parked)
+
+
+def new_temporary_session(state: State, keep_running: bool = True) -> bool:
+    state.restore_token += 1
+    parked = park_active_session(state) if keep_running else None
+    if parked is None:
+        persist_agent_token_usage(state, state.agent)
+        try:
+            if state.status in {"running", "aborting"}:
+                state.agent.abort()
+            reset_conversation(state.agent, message=None)
+            reset_agent_to_default_llm(state)
+        except Exception:
+            pass
+    set_agent_log_path(state.agent, os.devnull)
+    bind_agent_token_session(state, state.agent)
+    state.messages.clear()
+    state.current_title = "临时会话"
+    state.selected_session = "temp"
+    state.temporary_session = True
+    state.status = "idle"
+    state.active_task_id = None
+    state.active_task_source = ""
+    state.active_stream_target = None
+    state.active_task_secret = False
+    state.active_secret_user_text = ""
+    state.active_secret_session_id = ""
+    clear_all_queued_inputs(state)
+    state.secret_active_origin = {}
+    clear_active_plan_state(state)
+    state.pending_interaction = None
+    clear_history_ui_state(state)
+    set_input_text(state, "")
+    state.last_error = ""
     mark_messages_changed(state)
     return bool(parked)
 
@@ -19093,6 +19283,9 @@ def handle_subagent_command(state: State, text: str) -> bool:
 
     m_remember = re.match(r"/agent\s+(?:remember|mem)\s+(\S+)\s+([\s\S]+)$", raw, re.I)
     if m_remember:
+        if state.temporary_session:
+            add_system(state, "临时会话不写入子 agent 记忆。")
+            return True
         sub = resolve_subagent(state, m_remember.group(1))
         if sub is None:
             add_system(state, f"找不到子 agent: {m_remember.group(1)}")
@@ -19559,6 +19752,8 @@ def apply_subagent_control(
         return start_subagent_task(state, sub, prompt, source=source, parent_task_id=parent_task_id, task_title=task_title)
 
     if action in {"subagent_remember", "subagent_memory", "agent_remember", "agent_memory"}:
+        if state.temporary_session:
+            return "临时会话不写入子 agent 记忆。"
         memory = str(control.get("memory") or control.get("note") or value or "").strip()
         if "agent" in source:
             return queue_curated_memory_candidate(state, sub, memory, source=source)
@@ -19694,7 +19889,8 @@ def submit(state: State, text: str) -> None:
         md = "开启" if state.markdown else "关闭"
         view = "归档" if state.show_archived else "普通"
         filt = state.session_filter_category or "全部"
-        add_system(state, f"状态: {state.status}；当前会话: {state.current_title or 'main'}；后台会话: {len(state.background_sessions)} 个；历史会话: {len(state.history)} 个；视图: {view}；筛选: {filt}；过程折叠: {fold}；Markdown: {md}\n{secret_status_text(state)}")
+        temp = "；临时: 开启（不写入历史/记忆）" if state.temporary_session else ""
+        add_system(state, f"状态: {state.status}；当前会话: {state.current_title or 'main'}{temp}；后台会话: {len(state.background_sessions)} 个；历史会话: {len(state.history)} 个；视图: {view}；筛选: {filt}；过程折叠: {fold}；Markdown: {md}\n{secret_status_text(state)}")
         return
     if text == "/fold":
         state.fold_process = not state.fold_process
@@ -19862,6 +20058,14 @@ def submit(state: State, text: str) -> None:
             add_system(state, "已新建空 Secret 会话；原运行任务已转入后台。" if parked else "已新建空 Secret 会话。")
         else:
             add_system(state, "已新建空会话；原运行任务已转入后台。" if parked else "已新建空会话。")
+        return
+    if text == "/temp":
+        active_sub = selected_subagent(state)
+        if active_sub is not None:
+            add_system(state, "当前选中子 agent；请先切回主控会话再使用 /temp。")
+            return
+        parked = new_temporary_session(state, keep_running=True)
+        add_system(state, "已新建临时会话；本会话不会写入历史日志、会话记忆或记忆候选；原运行任务已转入后台。" if parked else "已新建临时会话；本会话不会写入历史日志、会话记忆或记忆候选。")
         return
     if text == "/rename":
         add_system(state, "Usage: /rename <name>")
@@ -21207,7 +21411,13 @@ def restore_history(state: State, path: str) -> None:
             state.session_meta = load_session_meta_registry()
         meta = session_meta_for(state, path)
         if meta.get("source_missing") or meta.get("archive_backed"):
-            state.last_error = "该会话源文件已物理归档或缺失，侧边栏仅保留登记信息；需要先通过归档映射恢复流程找回源文件。"
+            restored, message = restore_missing_source_from_l4_archive(state, path, meta)
+            if restored:
+                restore_history(state, path)
+                if state.last_error:
+                    state.last_error = f"{message}；{state.last_error}"
+                return
+            state.last_error = f"该会话源文件已物理归档或缺失；{message}"
         else:
             state.last_error = "该会话源文件不存在，不能直接恢复。"
         mark_dirty(state)
@@ -21224,6 +21434,7 @@ def restore_history(state: State, path: str) -> None:
     token = state.restore_token
     state.selected_session = path
     state.current_title = session_title_for_path(state, path)
+    state.temporary_session = False
     state.status = "restoring"
     state.active_task_id = None
     state.active_task_source = ""

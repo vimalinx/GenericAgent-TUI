@@ -267,6 +267,7 @@ ga-tui-integration install-core-shim --root /path/to/GenericAgent --target tuiap
 /continue [n]        列出或恢复历史会话
 /sessions            列出历史会话
 /new                 新建空会话
+/temp                新建不写入历史日志、会话记忆或记忆候选的临时会话
 /clear               清空当前屏幕
 /status              显示当前状态
 /stop                中止当前任务

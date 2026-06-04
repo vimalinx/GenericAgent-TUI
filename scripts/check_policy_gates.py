@@ -13,6 +13,7 @@ import json
 import threading
 import urllib.request
 import curses
+import zipfile
 from pathlib import Path
 
 
@@ -26,6 +27,7 @@ def retarget_harness(root: str) -> None:
     a.MODEL_RESPONSES_DIR = os.path.join(root, "model_responses")
     a.TOKEN_USAGE_PATH = os.path.join(a.MODEL_RESPONSES_DIR, "session_token_usage.json")
     a.SESSION_META_PATH = os.path.join(a.MODEL_RESPONSES_DIR, "session_meta.json")
+    a.L4_RAW_SESSIONS_DIR = os.path.join(root, "memory", "L4_raw_sessions")
     a.SESSION_TRASH_DIR = os.path.join(a.MODEL_RESPONSES_DIR, ".trash")
     a.AGENT_HARNESS_DIR = os.path.join(root, "harness")
     a.AGENT_TASK_LEDGER_PATH = os.path.join(a.AGENT_HARNESS_DIR, "tasks.jsonl")
@@ -1857,17 +1859,33 @@ def assert_recent_sessions_use_last_message_activity() -> None:
     assert all(a.normalized_path(item[0]) not in used_paths for _idx, item in deduped_recent), deduped_recent
 
 
-def assert_missing_source_history_rows_stay_visible_but_not_restorable() -> None:
+def assert_missing_source_history_rows_restore_from_l4_archive() -> None:
     root = tempfile.mkdtemp(prefix="ga_tui_missing_source_history_")
     retarget_harness(root)
     os.makedirs(a.MODEL_RESPONSES_DIR, exist_ok=True)
+    os.makedirs(a.L4_RAW_SESSIONS_DIR, exist_ok=True)
     missing_path = os.path.join(a.MODEL_RESPONSES_DIR, "model_responses_missing_source.txt")
+    archive_text = (
+        "=== Prompt === 2026-01-01 12:00:00\n"
+        "=== USER ===\n"
+        "archived user turn\n"
+        "=== Response === 2026-01-01 12:01:00\n"
+        "archived assistant turn\n"
+    )
+    archive_path = os.path.join(a.L4_RAW_SESSIONS_DIR, "2026-01.zip")
+    with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("0101_1200-0101_1201.txt", archive_text)
     a.save_session_meta_registry({
         os.path.basename(missing_path): {
             "preview": "archived session preview",
             "description": "Missing raw source retained in TUI registry",
-            "last_user_at": 1000.0,
-            "rounds": 3,
+            "last_user_at": time.mktime(time.strptime("2026-01-01 12:00:00", "%Y-%m-%d %H:%M:%S")),
+            "rounds": 1,
+            "ui_preview_messages": [
+                {"role": "user", "content": "archived user turn"},
+            ],
+            "ui_preview_loaded_rounds": 1,
+            "ui_preview_total_rounds": 1,
         },
     })
     state = a.State(agent=FakeLLMAgent())
@@ -1880,9 +1898,14 @@ def assert_missing_source_history_rows_stay_visible_but_not_restorable() -> None
     assert state.history_descriptions[missing_path] == "Missing raw source retained in TUI registry", state.history_descriptions
     state.status = "idle"
     a.restore_history(state, missing_path)
-    assert state.status == "idle", state.status
-    assert "源文件已物理归档或缺失" in state.last_error, state.last_error
-    assert getattr(state.agent, "log_path", "") != missing_path, getattr(state.agent, "log_path", "")
+    assert os.path.exists(missing_path), missing_path
+    assert "archived user turn" in a.read_text_file(missing_path)
+    assert "已从 L4 归档恢复源文件" in state.last_error, state.last_error
+    assert state.history_ui_path == missing_path, state.history_ui_path
+    assert getattr(state.agent, "log_path", "") == missing_path, getattr(state.agent, "log_path", "")
+    restored_meta = a.load_session_meta_registry().get(os.path.basename(missing_path), {})
+    assert restored_meta.get("source_restored_archive") == "2026-01.zip", restored_meta
+    assert restored_meta.get("source_restored_member") == "0101_1200-0101_1201.txt", restored_meta
 
 
 def assert_self_intro_does_not_consume_mutual_chat_step() -> None:
@@ -2108,6 +2131,52 @@ def assert_secret_native_restore_hydrates_backend_context_blocks() -> None:
         a.secret_network_gate = old_secret_network_gate
 
 
+def assert_temp_session_is_non_persistent() -> None:
+    root = tempfile.mkdtemp(prefix="ga_tui_temp_session_")
+    retarget_harness(root)
+    install_fake_agent_runtime()
+    os.makedirs(a.MODEL_RESPONSES_DIR, exist_ok=True)
+    agent = FakeLLMAgent()
+    normal_path = a.new_session_log_path()
+    a.set_agent_log_path(agent, normal_path)
+    state = a.State(agent=agent)
+    state.running = True
+    a.bind_agent_token_session(state, agent)
+
+    a.submit(state, "/temp")
+    assert state.temporary_session is True
+    assert state.current_title == "临时会话"
+    assert state.selected_session == "temp"
+    assert a.agent_log_path_is_devnull(state.agent)
+    assert a.agent_log_path(state.agent) == os.devnull
+    assert state.agent.llmclient.log_path == os.devnull
+    assert state.agent.llmclient.backend.log_path == os.devnull
+    assert a.active_ui_session_path(state) == ""
+    assert a.active_ui_session_key(state) == ""
+    assert "会话ID: temp" in a.top_bar_header(state, timestamp=0)
+    assert a.display_scope_key(state) == "session:temp"
+    assert any(cmd == "/temp" for cmd, _args, _desc, _sendable in a.command_matches("/te", state))
+
+    a.add_system(state, "Agent 控制结果：\n- temp control result", persist=True, kind="agent_control_result")
+    assert a.load_session_meta_registry() == {}
+    rename_result = a.rename_current_session(state, "Scratch")
+    assert "不会持久化" in rename_result, rename_result
+    assert state.current_title == "Scratch"
+    assert a.load_session_meta_registry() == {}
+
+    target = a.create_subagent(state, "Temp Memory Target", role="memory_curator", persistent=True)
+    memory_result = a.queue_curated_memory_candidate(state, target, "stable long-term preference", source="temp-test")
+    assert "临时会话" in memory_result, memory_result
+    assert a.read_jsonl(a.AGENT_MEMORY_CANDIDATES_PATH) == []
+    assert a.read_jsonl(a.AGENT_APPROVALS_PATH) == []
+
+    a.submit(state, "/new")
+    assert state.temporary_session is False
+    assert state.selected_session == "main"
+    assert not a.agent_log_path_is_devnull(state.agent)
+    assert os.path.basename(a.agent_log_path(state.agent)).startswith("model_responses_")
+
+
 def run_checks() -> None:
     assert_top_bar_header_requested_fields()
     assert_long_secret_render_reuses_stable_message_blocks()
@@ -2126,9 +2195,10 @@ def run_checks() -> None:
     assert_tui_query_tools_expose_dashboard_state()
     assert_legacy_subagent_result_backfills_to_restored_session()
     assert_recent_sessions_use_last_message_activity()
-    assert_missing_source_history_rows_stay_visible_but_not_restorable()
+    assert_missing_source_history_rows_restore_from_l4_archive()
     assert_self_intro_does_not_consume_mutual_chat_step()
     assert_control_result_continues_intermediate_workflow_step()
+    assert_temp_session_is_non_persistent()
 
     root = tempfile.mkdtemp(prefix="ga_tui_policy_check_")
     retarget_harness(root)
