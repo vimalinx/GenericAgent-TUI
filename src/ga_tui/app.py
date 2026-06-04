@@ -753,6 +753,15 @@ class PolicyDecision:
 
 
 @dataclass
+class SubagentDispatchResult:
+    status: str
+    message: str
+    task_id: str = ""
+    approval_id: str = ""
+    error: str = ""
+
+
+@dataclass
 class State:
     agent: Any
     ui_queue: queue.Queue = field(default_factory=queue.Queue)
@@ -6272,21 +6281,6 @@ def schedule_agenttask_control(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def schedule_dispatch_status(result: str) -> str:
-    text = str(result or "")
-    if text.startswith("APPROVAL_REQUIRED") or ("审批" in text and "需要" in text):
-        return "approval_required"
-    if "已排队" in text:
-        return "queued"
-    if "已启动" in text or "已发送" in text:
-        return "dispatched"
-    if "拒绝" in text:
-        return "rejected"
-    if any(marker in text for marker in ("失败", "找不到", "缺少", "为空", "error", "Error")):
-        return "failed"
-    return "dispatched" if text.strip() else "failed"
-
-
 def update_schedule_last_run(row: dict[str, Any], run: dict[str, Any]) -> None:
     schedule = dict(row)
     schedule.pop("scheduler", None)
@@ -6430,9 +6424,8 @@ def dispatch_schedule_run(state: State, row: dict[str, Any], info: dict[str, Any
         append_schedule_run(finished)
         update_schedule_last_run(row, finished)
         return finished
-    before_tasks = set(latest_task_records())
     try:
-        result = start_subagent_task(
+        dispatch = start_subagent_task_structured(
             state,
             sub,
             str(mapped.get("prompt") or ""),
@@ -6441,20 +6434,20 @@ def dispatch_schedule_run(state: State, row: dict[str, Any], info: dict[str, Any
             task_title=str(mapped.get("task_title") or row.get("name") or schedule_id),
         )
     except Exception as exc:
-        result = f"{type(exc).__name__}: {exc}"
-    after_tasks = latest_task_records()
-    new_task_ids = [task_id for task_id in after_tasks if task_id not in before_tasks]
+        dispatch = SubagentDispatchResult(status="failed", message=f"{type(exc).__name__}: {exc}", error=f"{type(exc).__name__}: {exc}")
     finished = dict(started)
     finished.update({
-        "status": schedule_dispatch_status(result),
+        "status": dispatch.status,
         "finished_at": now_iso(),
         "target": sub.agent_id,
         "target_name": sub.name,
-        "result": result,
-        "task_id": new_task_ids[-1] if new_task_ids else str(getattr(sub, "active_bus_task_id", "") or ""),
+        "result": dispatch.message,
+        "task_id": dispatch.task_id,
     })
-    if finished["status"] in {"failed", "rejected"}:
-        finished["error"] = result
+    if dispatch.approval_id:
+        finished["approval_id"] = dispatch.approval_id
+    if dispatch.status in {"failed", "rejected"}:
+        finished["error"] = dispatch.error or dispatch.message
     append_schedule_run(finished)
     update_schedule_last_run(row, finished)
     return finished
@@ -20108,6 +20101,54 @@ def queue_subagent_task(
     append_subagent_event(sub, f"{source}:queued", display_prompt_for_subagent_task(prompt), state=state)
     mark_dirty(state)
     return f"{sub.name} 正在运行，已排队 1 个任务（队列 {len(sub.task_queue)}）。"
+
+
+def dispatch_result_from_task_row(row: dict[str, Any], message: str) -> SubagentDispatchResult:
+    status = str(row.get("status") or "").strip().lower()
+    approval = row.get("approval") if isinstance(row.get("approval"), dict) else {}
+    approval_id = str(approval.get("approval_id") or "")
+    task_id = str(row.get("task_id") or "")
+    if status == "working":
+        return SubagentDispatchResult(status="dispatched", message=message, task_id=task_id, approval_id=approval_id)
+    if status in {"approval_required", "failed", "rejected"}:
+        error = str(row.get("error") or "") if status in {"failed", "rejected"} else ""
+        return SubagentDispatchResult(status=status, message=message, task_id=task_id, approval_id=approval_id, error=error)
+    if status:
+        return SubagentDispatchResult(status=status, message=message, task_id=task_id, approval_id=approval_id)
+    return SubagentDispatchResult(status="failed", message=message, task_id=task_id, approval_id=approval_id, error=message)
+
+
+def start_subagent_task_structured(
+    state: State,
+    sub: SubAgentRuntime,
+    prompt: str,
+    source: str = "user",
+    policy_approved: bool = False,
+    parent_task_id: str = "",
+    task_title: str = "",
+) -> SubagentDispatchResult:
+    before_tasks = latest_task_records()
+    before_queue_len = len(sub.task_queue)
+    before_active_task_id = str(getattr(sub, "active_bus_task_id", "") or "")
+    message = start_subagent_task(
+        state,
+        sub,
+        prompt,
+        source=source,
+        policy_approved=policy_approved,
+        parent_task_id=parent_task_id,
+        task_title=task_title,
+    )
+    after_tasks = latest_task_records()
+    new_task_ids = [task_id for task_id in after_tasks if task_id not in before_tasks]
+    if new_task_ids:
+        return dispatch_result_from_task_row(after_tasks[new_task_ids[-1]], message)
+    active_task_id = str(getattr(sub, "active_bus_task_id", "") or "")
+    if active_task_id and active_task_id != before_active_task_id:
+        return SubagentDispatchResult(status="dispatched", message=message, task_id=active_task_id)
+    if len(sub.task_queue) > before_queue_len:
+        return SubagentDispatchResult(status="queued", message=message)
+    return SubagentDispatchResult(status="failed", message=message, error=message)
 
 
 def maybe_start_next_subagent_task(state: State, sub: SubAgentRuntime) -> Optional[str]:

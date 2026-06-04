@@ -3222,6 +3222,38 @@ def run_checks() -> None:
     assert scheduler_worker.agent.prompts, scheduler_worker.agent
     assert "[GA TUI AgentTask Envelope v2]" in scheduler_worker.agent.prompts[-1][0], scheduler_worker.agent.prompts
     assert '"tools_forbidden": [' in scheduler_worker.agent.prompts[-1][0], scheduler_worker.agent.prompts[-1][0]
+    scheduled_ops = a.create_subagent(state, "Scheduled Ops Agent", role="ops")
+    approval_schedule_control = ga_control({
+        "action": "schedule.create",
+        "schedule_id": "sched_ops_approval",
+        "name": "Scheduled Ops Approval",
+        "at": "2026-01-01T00:00:00+0800",
+        "provider_id": "genericagent",
+        "execution": {
+            "mode": "agent_task",
+            "routing": {
+                "selected_agent": scheduled_ops.name,
+                "target_selector": {"role": "ops", "reuse_policy": "prefer_existing"},
+            },
+            "work_order": {
+                "objective": "deploy production with sudo",
+                "success_criteria": ["deployment is approved first"],
+                "stop_condition": "wait for approval before deployment",
+            },
+            "capability_contract": {"tools_allowed": ["shell"], "tools_forbidden": ["deploy"], "write_policy": "approved_only"},
+            "context_contract": {"history_mode": "summary", "artifact_reference_only": True},
+            "output_contract": {"format": "structured_markdown", "required_sections": ["summary", "approval_refs"]},
+        },
+    })
+    a.apply_tui_controls_from_text(state, approval_schedule_control, source="agent")
+    approval_tick = a.scheduler_tick(state, now_epoch=1780000100.0, source="test:scheduler_approval", target_schedule_id="sched_ops_approval")
+    approval_runs = [row for row in approval_tick["runs"] if row.get("schedule_id") == "sched_ops_approval"]
+    approval_final = [row for row in approval_runs if row.get("status") == "approval_required"][-1]
+    assert approval_final["task_id"], approval_final
+    assert approval_final["approval_id"], approval_final
+    approval_task = a.latest_task_records()[approval_final["task_id"]]
+    assert approval_task["status"] == "approval_required", approval_task
+    assert approval_task["approval"]["approval_id"] == approval_final["approval_id"], approval_task
     duplicate_tick = a.scheduler_tick(state, now_epoch=1780000000.0, source="test:scheduler_duplicate")
     assert duplicate_tick["dispatched"] == 0 and duplicate_tick["duplicates"] >= 1, duplicate_tick
     disabled_tick = a.scheduler_tick(state, now_epoch=1780000000.0, source="test:scheduler_disabled", target_schedule_id="sched_daily_digest", record_skips=True)
