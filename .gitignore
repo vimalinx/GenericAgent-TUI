@@ -7,10 +7,20 @@ dist/
 build/
 *.egg-info/
 
-# Local agent/dev workflow state. Keep public releases source-only.
-.agents/
+# Local agent/dev workflow runtime state. Track Trellis project metadata,
+# specs, tasks, journals, scripts, workflow, and bundled skills.
+.agents/**/__pycache__/
+.agents/**/*.pyc
 .codex/
-.trellis/
+.trellis/.backup-*/
+.trellis/.cache/
+.trellis/.current-task
+.trellis/.developer
+.trellis/.runtime/
+.trellis/.template-hashes.json
+.trellis/worktrees/
+.trellis/**/*.new
+.trellis/**/*.tmp
 goal-*/
 memory/
 temp/
