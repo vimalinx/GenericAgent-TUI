@@ -3007,6 +3007,7 @@ def run_checks() -> None:
     assert "用户只需要表达自然意图" in a.TUI_AGENT_CONTROL_HINT
     assert "ScheduleCreate" in a.TUI_AGENT_CONTROL_HINT
     assert "schedule_create" in a.TUI_AGENT_CONTROL_HINT
+    assert "local_action" in a.TUI_AGENT_CONTROL_HINT
     assert "不要读取、修改或启动外部 scheduler" in a.TUI_AGENT_CONTROL_HINT
     assert "schema 外字段由通用边界处理" in a.TUI_AGENT_CONTROL_HINT
     assert 'cron:"0 8 * * *"' in a.TUI_AGENT_CONTROL_HINT
@@ -3048,6 +3049,29 @@ def run_checks() -> None:
         seen_keys=set(),
     )
     assert interval_info["due"] and interval_info["due_at_epoch"] == 1060.0, interval_info
+    beep_calls: list[str] = []
+    old_emit_beep = a.emit_tui_beep
+    try:
+        a.emit_tui_beep = lambda: beep_calls.append("beep") or "beep emitted"
+        local_beep_control = ga_control({
+            "action": "schedule.create",
+            "schedule_id": "sched_local_beep",
+            "name": "Local Beep",
+            "at": "2026-01-01T00:00:00+0800",
+            "local_action": {"type": "beep", "message": "test beep"},
+        })
+        a.apply_tui_controls_from_text(state, local_beep_control, source="agent")
+        local_record = a.latest_schedule_records()["sched_local_beep"]
+        assert local_record["dispatch_contract"] == "tui.local_action.v1", local_record
+        assert local_record["local_action"]["type"] == "beep", local_record
+        local_tick = a.scheduler_tick(state, now_epoch=1780000000.0, source="test:scheduler_local_beep", target_schedule_id="sched_local_beep")
+        assert local_tick["due"] == 1 and local_tick["dispatched"] == 1 and local_tick["failed"] == 0, local_tick
+        assert beep_calls == ["beep"], beep_calls
+        local_runs = [row for row in a.read_jsonl(a.AGENT_SCHEDULE_RUNS_PATH) if row.get("schedule_id") == "sched_local_beep"]
+        assert any(row.get("status") == "starting" for row in local_runs), local_runs
+        assert any(row.get("status") == "completed" and row.get("result") == "beep emitted" for row in local_runs), local_runs
+    finally:
+        a.emit_tui_beep = old_emit_beep
     scheduler_worker = a.create_subagent(state, "Scheduler Worker", role="researcher")
     due_schedule_control = ga_control({
         "action": "schedule.create",

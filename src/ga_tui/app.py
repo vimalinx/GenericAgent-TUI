@@ -345,7 +345,8 @@ TUI_AGENT_CONTROL_HINT = """
 - 创建定时任务时不要读取、修改或启动外部 scheduler 文件、外部定时任务 SOP 或其他程序的调度目录；当前有效调度状态只来自 TUI 调度工具和 `schedule.create` 控制动作。
 - `ScheduleCreate` 的触发器 schema 只由 `cron`、`interval`、`at`，或标准化 `trigger` 前缀定义（例如 `cron:0 8 * * *`、`interval:1m`、`at:YYYY-MM-DDT09:00:00+08:00`）。schema 外字段由通用边界处理，不在当前协议里枚举历史字段。
 - 用户说“每天 8 点”时输出 `cron:"0 8 * * *"`；说“工作日 8 点半”时输出 `cron:"30 8 * * 1-5"`；说“每 1 分钟”时输出 `interval:"1m"`；说“明天 9 点”时按当前日期和时区输出 ISO `at`。
-- 用户没有指定 `schedule_id` 时可以省略，让 TUI 自动生成；但必须提供明确目标 agent（优先先用 `agent_match` / `agent_list` 查询）和完整 `work_order` / capability / context / output contracts，并通过 `agenttask.v2` 派发，不允许绕过任务账本和审批门。
+- 用户要求“响一声蜂鸣/提醒我一下”这类 TUI 本地提醒时，不需要创建子 agent；在 `ScheduleCreate` 中设置 `local_action:{"type":"beep","message":"..."}`，由 TUI 调度器到点直接执行并写入 schedule-run 审计。
+- 除 TUI 本地提醒外，用户没有指定 `schedule_id` 时可以省略，让 TUI 自动生成；但必须提供明确目标 agent（优先先用 `agent_match` / `agent_list` 查询）和完整 `work_order` / capability / context / output contracts，并通过 `agenttask.v2` 派发，不允许绕过任务账本和审批门。
 - 你是主控 Orchestrator；读任务可并行，写任务保持单写者；子 agent 返回 artifact/证据/摘要，不要无结构自由聊天。
 - 批量操作历史会话时优先用 `/sessions` 输出的稳定 `id:xxxxxx` 或完整文件名作为 target；不要用 `S01`/`1` 这种当前视图相对编号，除非同时提供 `expected_title`。
 [/GenericAgent-TUI ga-control v2]
@@ -502,6 +503,7 @@ TUI_SCHEDULE_TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "capability_contract": {"type": "object", "description": "agenttask.v2 capability contract."},
                     "context_contract": {"type": "object", "description": "agenttask.v2 context contract."},
                     "output_contract": {"type": "object", "description": "agenttask.v2 output contract."},
+                    "local_action": {"type": "object", "description": "Optional audited TUI-local action for reminders. Supported type: beep."},
                     "status": {"type": "string", "enum": ["enabled", "disabled"], "description": "Initial schedule status.", "default": "enabled"},
                 },
             },
@@ -6047,6 +6049,10 @@ def schedule_record_from_control(control: dict[str, Any], *, schedule_id: str, s
         "updated_at": now_iso(),
         "source": source,
     }
+    local_action = control.get("local_action") if isinstance(control.get("local_action"), dict) else {}
+    if local_action:
+        record["local_action"] = tui_query_json_safe(local_action)
+        record["dispatch_contract"] = "tui.local_action.v1"
     for key in ("cron", "interval", "at"):
         value = str(control.get(key) or "").strip()
         if value:
@@ -6172,6 +6178,53 @@ def append_schedule_skip_run(row: dict[str, Any], info: dict[str, Any], *, statu
     return run
 
 
+def emit_tui_beep() -> str:
+    try:
+        curses.beep()
+        return "beep emitted"
+    except Exception:
+        pass
+    try:
+        stream = getattr(sys, "__stdout__", None) or sys.stdout
+        stream.write("\a")
+        stream.flush()
+        return "beep emitted"
+    except Exception as exc:
+        return f"beep failed: {type(exc).__name__}: {exc}"
+
+
+def dispatch_schedule_local_action(row: dict[str, Any], started: dict[str, Any]) -> Optional[dict[str, Any]]:
+    local_action = row.get("local_action") if isinstance(row.get("local_action"), dict) else {}
+    if not local_action:
+        return None
+    action_type = str(local_action.get("type") or "").strip().lower().replace("-", "_")
+    if action_type == "beep":
+        result = emit_tui_beep()
+        status = "completed" if "failed" not in result.lower() else "failed"
+        finished = dict(started)
+        finished.update({
+            "status": status,
+            "finished_at": now_iso(),
+            "local_action": tui_query_json_safe(local_action),
+            "result": result,
+        })
+        if status == "failed":
+            finished["error"] = result
+        append_schedule_run(finished)
+        update_schedule_last_run(row, finished)
+        return finished
+    finished = dict(started)
+    finished.update({
+        "status": "failed",
+        "finished_at": now_iso(),
+        "local_action": tui_query_json_safe(local_action),
+        "error": f"unsupported local action: {action_type or '-'}",
+    })
+    append_schedule_run(finished)
+    update_schedule_last_run(row, finished)
+    return finished
+
+
 def dispatch_schedule_run(state: State, row: dict[str, Any], info: dict[str, Any], *, source: str = "scheduler") -> dict[str, Any]:
     schedule_id = str(row.get("schedule_id") or row.get("id") or "").strip()
     idempotency_key = str(info.get("idempotency_key") or "").strip()
@@ -6194,6 +6247,9 @@ def dispatch_schedule_run(state: State, row: dict[str, Any], info: dict[str, Any
         "dispatch_contract": row.get("dispatch_contract") or "agenttask.v2",
         "source": source,
     })
+    local_run = dispatch_schedule_local_action(row, started)
+    if local_run is not None:
+        return local_run
     control = schedule_agenttask_control(row)
     work_order = control.get("work_order") if isinstance(control.get("work_order"), dict) else {}
     if not str(work_order.get("objective") or "").strip():
