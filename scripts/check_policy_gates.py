@@ -1412,8 +1412,8 @@ def assert_running_main_input_is_queued_and_interruptible() -> None:
     assert state.agent.prompts[-1] == ("draft ctrl c", "user:queued_after_interrupt"), state.agent.prompts
 
 
-def assert_subagent_create_respects_explicit_lifecycle_and_reuse_policy() -> None:
-    root = tempfile.mkdtemp(prefix="ga_tui_subagent_create_")
+def assert_agent_create_respects_explicit_lifecycle_and_reuse_policy() -> None:
+    root = tempfile.mkdtemp(prefix="ga_tui_agent_create_")
     retarget_harness(root)
     state = a.State(agent=ContextFakeAgent())
     state.running = True
@@ -1453,12 +1453,6 @@ def assert_subagent_create_respects_explicit_lifecycle_and_reuse_policy() -> Non
     )
     falsesocial_agents = [sub for sub in state.subagents.values() if "falsesocial" in sub.agent_id]
     assert len(falsesocial_agents) == 2, [(sub.agent_id, sub.name) for sub in state.subagents.values()]
-    a.apply_tui_controls_from_text(
-        state,
-        '<ga-tui>{"action":"subagent_create","name":"Legacy Should Not Run","persistent":true}</ga-tui>',
-        source="agent",
-    )
-    assert a.resolve_subagent(state, "Legacy Should Not Run") is None
 
     security_agent = a.SubAgentRuntime(
         agent_id="agent-network-security",
@@ -1507,11 +1501,11 @@ def assert_subagent_create_respects_explicit_lifecycle_and_reuse_policy() -> Non
     assert "能力说明" in a.TUI_AGENT_CONTROL_HINT
     assert "不要在示例、教程或解释中包含可执行 `<ga-control>` 标签" in a.TUI_AGENT_CONTROL_HINT
     assert "回复末尾隐藏块" in a.TUI_AGENT_CONTROL_HINT
-    assert '<ga-tui>{"action":"subagent_ask"' not in a.TUI_AGENT_CONTROL_HINT
     assert "secret_subagents" in a.TUI_AGENT_CONTROL_HINT
     assert "memory/subagents/" in a.TUI_AGENT_CONTROL_HINT
     assert "agent_list" in a.TUI_AGENT_CONTROL_HINT
     assert "task_get" in a.TUI_AGENT_CONTROL_HINT
+    assert_retired_control_vocabulary_is_quarantined(state)
     hint_agent = FakeLLMAgent()
     for client in hint_agent.llmclients:
         client.backend.extra_sys_prompt = "prefix\n[GenericAgent-TUI session control]\nold\n[/GenericAgent-TUI session control]\n"
@@ -1560,14 +1554,10 @@ def assert_subagent_create_respects_explicit_lifecycle_and_reuse_policy() -> Non
     )
     repaired_controls = a.extract_tui_controls(truncated_create)
     assert len(repaired_controls) == 1, repaired_controls
-    assert repaired_controls[0]["action"] == "subagent_create", repaired_controls
     a.apply_tui_controls_from_text(state, truncated_create, source="agent")
     news_agent = a.resolve_subagent(state, "新闻主编")
     assert news_agent is not None, state.subagents
     assert news_agent.persistent is True, news_agent
-    remove_controls = a.extract_tui_controls(ga_control({"action": "agent.remove", "target": "agent-to-remove"}))
-    assert len(remove_controls) == 1, remove_controls
-    assert remove_controls[0]["action"] == "subagent_delete", remove_controls
     delete_control = ga_control({"action": "agent.delete", "target": news_agent.agent_id})
     delete_controls = a.extract_tui_controls(delete_control)
     assert len(delete_controls) == 1, delete_controls
@@ -1724,8 +1714,29 @@ def assert_tui_query_tools_expose_dashboard_state() -> None:
     assert schedule_outcome.next_prompt == "\n", schedule_outcome.next_prompt
 
 
-def assert_legacy_subagent_result_backfills_to_restored_session() -> None:
-    root = tempfile.mkdtemp(prefix="ga_tui_legacy_subagent_restore_")
+def assert_retired_control_vocabulary_is_quarantined(state: a.State) -> None:
+    retired_tokens = ("<ga-tui>", "subagent_ask", "subagent_create", "task_update")
+    for token in retired_tokens:
+        assert token not in a.TUI_AGENT_CONTROL_HINT, token
+    for relative_path in (
+        "README.md",
+        "docs/runtime-provider-control-plane.md",
+        ".trellis/spec/backend/agent-control-protocol.md",
+    ):
+        text = a.read_text_file(os.path.join(a.APP_ROOT_DIR, relative_path), "")
+        for token in retired_tokens:
+            assert token not in text, (relative_path, token)
+
+    before_count = len(state.subagents)
+    old_external_action = ga_control({"action": "subagent_create", "name": "Retired External Action"})
+    assert a.extract_tui_controls(old_external_action) == []
+    a.apply_tui_controls_from_text(state, old_external_action, source="agent")
+    assert len(state.subagents) == before_count, state.subagents
+    assert a.strip_tui_controls('visible\n<ga-tui>{"action":"subagent_create","name":"Hidden"}</ga-tui>') == "visible"
+
+
+def assert_historical_subagent_result_quarantine_backfill() -> None:
+    root = tempfile.mkdtemp(prefix="ga_tui_historical_subagent_restore_")
     old_model_dir = a.MODEL_RESPONSES_DIR
     old_session_meta = a.SESSION_META_PATH
     try:
@@ -2191,9 +2202,9 @@ def run_checks() -> None:
     assert_live_subagent_result_reaches_main_context()
     assert_selected_subagent_chat_is_direct_session()
     assert_running_main_input_is_queued_and_interruptible()
-    assert_subagent_create_respects_explicit_lifecycle_and_reuse_policy()
+    assert_agent_create_respects_explicit_lifecycle_and_reuse_policy()
     assert_tui_query_tools_expose_dashboard_state()
-    assert_legacy_subagent_result_backfills_to_restored_session()
+    assert_historical_subagent_result_quarantine_backfill()
     assert_recent_sessions_use_last_message_activity()
     assert_missing_source_history_rows_restore_from_l4_archive()
     assert_self_intro_does_not_consume_mutual_chat_step()
@@ -3097,16 +3108,8 @@ def run_checks() -> None:
     assert a.split_schedule_trigger(updated_daily) == ("interval", "10m"), updated_daily
     a.apply_tui_controls_from_text(state, ga_control({"action": "schedule.disable", "target": "sched_daily_digest"}), source="agent")
     assert a.latest_schedule_records()["sched_daily_digest"]["status"] == "disabled"
-    assert "用户只需要表达自然意图" in a.TUI_AGENT_CONTROL_HINT
-    assert "ScheduleCreate" in a.TUI_AGENT_CONTROL_HINT
-    assert "schedule_create" in a.TUI_AGENT_CONTROL_HINT
-    assert "execution" in a.TUI_AGENT_CONTROL_HINT
-    assert "tui_action" in a.TUI_AGENT_CONTROL_HINT
-    assert "agent_task" in a.TUI_AGENT_CONTROL_HINT
-    assert "不要读取、修改或启动外部 scheduler" in a.TUI_AGENT_CONTROL_HINT
-    assert "schema 外字段由通用边界处理" in a.TUI_AGENT_CONTROL_HINT
-    assert 'cron:"0 8 * * *"' in a.TUI_AGENT_CONTROL_HINT
-    assert 'interval:"1m"' in a.TUI_AGENT_CONTROL_HINT
+    for prompt_token in ("ScheduleCreate", "schedule_create", "schedule_list", "execution", "tui_action", "agent_task"):
+        assert prompt_token in a.TUI_AGENT_CONTROL_HINT, prompt_token
     assert a.split_schedule_trigger({"cron": "0 8 * * *"}) == ("cron", "0 8 * * *")
     assert a.split_schedule_trigger({"interval": "1m"}) == ("interval", "1m")
     assert a.split_schedule_trigger({"at": "2026-01-01T00:00:00+0800"}) == ("at", "2026-01-01T00:00:00+0800")

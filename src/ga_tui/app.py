@@ -47,9 +47,21 @@ PROJECT_AGENTS_PATH = os.path.join(APP_ROOT_DIR, "AGENTS.md")
 
 try:
     from .integration import find_genericagent_root as _find_genericagent_root
+    from .compat_legacy import (
+        historical_subagent_row_matches_session,
+        parse_timestamp_value,
+        session_control_blocks_with_historical_markers,
+        strip_retired_tui_markup,
+    )
     from .runtime import RuntimeAdapter, RuntimeRegistry, genericagent_provider_spec
 except Exception:
     from integration import find_genericagent_root as _find_genericagent_root  # type: ignore
+    from compat_legacy import (  # type: ignore
+        historical_subagent_row_matches_session,
+        parse_timestamp_value,
+        session_control_blocks_with_historical_markers,
+        strip_retired_tui_markup,
+    )
     from runtime import RuntimeAdapter, RuntimeRegistry, genericagent_provider_spec  # type: ignore
 
 
@@ -226,11 +238,8 @@ RESPONSE_BLOCK_WITH_TIME_RE = re.compile(r"^=== Response ===\s*([^\n]*)\n(.*?)(?
 TUI_CONTROL_RE = re.compile(r"(?<!`)<ga[-_]control>\s*([\s\S]*?)\s*</ga[-_]control>", re.IGNORECASE)
 TUI_CONTROL_FENCE_RE = re.compile(r"```ga[-_]control\s*([\s\S]*?)```", re.IGNORECASE)
 TUI_CONTROL_JSON_FENCE_RE = re.compile(r"```(?:json|js|javascript|code)?[ \t]*\n([\s\S]*?)(?:^```|\Z)", re.IGNORECASE | re.MULTILINE)
-LEGACY_TUI_CONTROL_RE = re.compile(r"(?<!`)<ga[-_]tui>\s*([\s\S]*?)\s*</ga[-_]tui>", re.IGNORECASE)
-LEGACY_TUI_CONTROL_FENCE_RE = re.compile(r"```ga[-_]tui\s*([\s\S]*?)```", re.IGNORECASE)
 SUBAGENT_MEMORY_RE = re.compile(r"<ga[-_]subagent[-_]memory>\s*([\s\S]*?)\s*</ga[-_]subagent[-_]memory>", re.IGNORECASE)
 SUBAGENT_PROMPT_RE = re.compile(r"\n?\[GA TUI SubAgent Profile\][\s\S]*?\[/GA TUI SubAgent Profile\]\n?", re.IGNORECASE)
-LEGACY_SUBAGENT_BACKFILL_WINDOW_SECONDS = 2 * 60 * 60
 RESTORE_DISPLAY_ROUNDS = 3
 HISTORY_EXPAND_ROUNDS = 3
 RESTORE_CACHE_LIMIT = 8
@@ -306,7 +315,7 @@ COMMANDS: list[tuple[str, str, str, bool]] = [
 TUI_AGENT_CONTROL_HINT = """
 
 [GenericAgent-TUI ga-control v2]
-当用户要求你管理 TUI、拆任务或调度子 agent 时，只能输出隐藏 `<ga-control>` 控制块；旧 `<ga-tui>` / subagent_ask / subagent_create / task_update 格式已经废弃，不要再使用。
+当用户要求你管理 TUI、拆任务或调度子 agent 时，当前唯一控制协议是 `ga-control.v2`，只能输出隐藏 `<ga-control>` 控制块。
 只有用户明确要求实际执行创建、委派、修改会话、更新计划等操作时才输出真实 `<ga-control>`。
 用户只是询问“能做什么 / 怎么用 / 举个例子 / 讲讲能力 / 演示一下概念”时属于能力说明，不要创建计划或子 agent，不要输出真实 `<ga-control>`。
 如果需要展示协议示例，必须使用可见的转义文本，例如 `&lt;ga-control&gt;...&lt;/ga-control&gt;`，或者只展示 JSON payload；不要在示例、教程或解释中包含可执行 `<ga-control>` 标签。
@@ -1308,29 +1317,6 @@ def subagent_name_from_task_row(row: dict[str, Any]) -> str:
     return agent_id
 
 
-def parse_timestamp_value(text: str) -> float:
-    value = str(text or "").strip()
-    if not value:
-        return 0.0
-    for candidate, fmt in (
-        (value[:19], "%Y-%m-%dT%H:%M:%S"),
-        (value[:19], "%Y-%m-%d %H:%M:%S"),
-        (value[:24], "%Y-%m-%dT%H:%M:%S%z"),
-    ):
-        try:
-            return datetime.strptime(candidate, fmt).timestamp()
-        except Exception:
-            continue
-    return 0.0
-
-
-def legacy_match_text(text: str) -> str:
-    text = str(text or "")
-    text = text.replace("\\n", " ").replace('\\"', '"').replace("\\'", "'")
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
-
-
 def subagent_result_task_first_timestamps(rows: list[dict[str, Any]]) -> dict[str, float]:
     first_seen: dict[str, float] = {}
     for row in rows:
@@ -1357,45 +1343,6 @@ def completed_subagent_result_row(row: dict[str, Any]) -> bool:
     return assigned.startswith(("agent-", "tmp-agent-", "tmp-")) or title.startswith(("子 agent", "subagent"))
 
 
-def session_subagent_control_blocks(path: str) -> list[tuple[float, str]]:
-    try:
-        with open(path, encoding="utf-8", errors="replace") as fh:
-            content = fh.read()
-    except OSError:
-        return []
-    blocks: list[tuple[float, str]] = []
-    action_markers = ("delegate.create", "agenttask.v2", "subagent_ask", "subagent_run", "subagent_input", "agent_ask", "agent_run")
-    for timestamp, response_body in RESPONSE_BLOCK_WITH_TIME_RE.findall(content):
-        if not any(marker in response_body for marker in action_markers):
-            continue
-        blocks.append((parse_timestamp_value(timestamp), legacy_match_text(response_body)))
-    return blocks
-
-
-def legacy_subagent_row_matches_session(
-    path: str,
-    row: dict[str, Any],
-    first_task_timestamp: float,
-    control_blocks: Optional[list[tuple[float, str]]] = None,
-) -> bool:
-    if str(row.get("session_key") or "").strip():
-        return False
-    objective = legacy_match_text(row.get("objective") or "")
-    if len(objective) < 8:
-        return False
-    blocks = control_blocks if control_blocks is not None else session_subagent_control_blocks(path)
-    for anchor_timestamp, response_body in blocks:
-        if objective not in response_body:
-            continue
-        if anchor_timestamp > 0 and first_task_timestamp > 0:
-            if first_task_timestamp < anchor_timestamp - 5:
-                continue
-            if first_task_timestamp > anchor_timestamp + LEGACY_SUBAGENT_BACKFILL_WINDOW_SECONDS:
-                continue
-        return True
-    return False
-
-
 def backfill_durable_subagent_result_messages_for_path(path: str) -> int:
     owner_key = session_key(path)
     if not owner_key:
@@ -1404,7 +1351,7 @@ def backfill_durable_subagent_result_messages_for_path(path: str) -> int:
     seen: set[tuple[str, str]] = set()
     rows = read_jsonl(AGENT_TASK_LEDGER_PATH)
     first_timestamps = subagent_result_task_first_timestamps(rows)
-    legacy_control_blocks: Optional[list[tuple[float, str]]] = None
+    historical_control_blocks: Optional[list[tuple[float, str]]] = None
     for row in rows:
         if not completed_subagent_result_row(row):
             continue
@@ -1415,9 +1362,9 @@ def backfill_durable_subagent_result_messages_for_path(path: str) -> int:
             if row_session_key != owner_key:
                 continue
         else:
-            if legacy_control_blocks is None:
-                legacy_control_blocks = session_subagent_control_blocks(path)
-            if not legacy_subagent_row_matches_session(path, row, first_timestamps.get(task_id, 0.0), legacy_control_blocks):
+            if historical_control_blocks is None:
+                historical_control_blocks = session_control_blocks_with_historical_markers(path, RESPONSE_BLOCK_WITH_TIME_RE)
+            if not historical_subagent_row_matches_session(row, first_timestamps.get(task_id, 0.0), historical_control_blocks):
                 continue
         key = (task_id, artifact_ref)
         if not task_id or not artifact_ref or key in seen:
@@ -12703,40 +12650,39 @@ def rename_session_path(state: State, path: str, raw_name: str) -> str:
 GA_CONTROL_SCHEMA = "ga-control.v2"
 AGENT_TASK_SCHEMA = "agenttask.v2"
 
-KNOWN_TUI_CONTROL_ACTIONS = {
-    "session_pin",
-    "session_unpin",
-    "session_category",
-    "session_filter",
-    "session_clear_filter",
-    "session_collapse_category",
-    "session_expand_category",
-    "session_archive",
-    "session_unarchive",
-    "session_delete",
-    "session_rename",
-    "session_show_archived",
-    "session_hide_archived",
-    "task_plan_create",
-    "task_update",
-    "task_done",
-    "task_start",
-    "task_fail",
-    "task_cancel",
-    "schedule_create",
-    "schedule_update",
-    "schedule_enable",
-    "schedule_disable",
-    "schedule_delete",
-    "agent_create",
-    "agent_profile_update",
-    "agent_role_update",
-    "agent_model_update",
-    "agent_stop",
-    "agent_delete",
-    "agent_remove",
-    "delegate_create",
-    "memory_candidate",
+CURRENT_TUI_CONTROL_ACTIONS = {
+    "session.pin",
+    "session.unpin",
+    "session.category",
+    "session.filter",
+    "session.clear_filter",
+    "session.collapse_category",
+    "session.expand_category",
+    "session.archive",
+    "session.unarchive",
+    "session.delete",
+    "session.rename",
+    "session.show_archived",
+    "session.hide_archived",
+    "task.plan.create",
+    "task.update",
+    "task.done",
+    "task.start",
+    "task.fail",
+    "task.cancel",
+    "schedule.create",
+    "schedule.update",
+    "schedule.enable",
+    "schedule.disable",
+    "schedule.delete",
+    "agent.create",
+    "agent.profile.update",
+    "agent.role.update",
+    "agent.model.update",
+    "agent.stop",
+    "agent.delete",
+    "delegate.create",
+    "memory.candidate",
 }
 
 SESSION_V2_TO_EXECUTION_ACTION = {
@@ -12761,7 +12707,8 @@ def normalized_control_action(control: dict[str, Any]) -> str:
 
 
 def known_tui_control(control: dict[str, Any]) -> bool:
-    return normalized_control_action(control) in KNOWN_TUI_CONTROL_ACTIONS
+    action = str(control.get("action") or "").strip().lower()
+    return action in CURRENT_TUI_CONTROL_ACTIONS
 
 
 def action_schema_valid(control: dict[str, Any]) -> bool:
@@ -13172,10 +13119,9 @@ def strip_tui_controls(text: str, *, allow_json_fences: bool = False) -> str:
         text = TUI_CONTROL_JSON_FENCE_RE.sub(strip_json_control_fence, text)
     text = TUI_CONTROL_RE.sub("", text)
     text = TUI_CONTROL_FENCE_RE.sub("", text)
-    text = LEGACY_TUI_CONTROL_RE.sub("", text)
-    text = LEGACY_TUI_CONTROL_FENCE_RE.sub("", text)
-    text = re.sub(r"(?<!`)<ga[-_](?:control|tui)>[\s\S]*$", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"```ga[-_](?:control|tui)[\s\S]*$", "", text, flags=re.IGNORECASE)
+    text = strip_retired_tui_markup(text)
+    text = re.sub(r"(?<!`)<ga[-_]control>[\s\S]*$", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"```ga[-_]control[\s\S]*$", "", text, flags=re.IGNORECASE)
     return text.strip()
 
 
