@@ -345,8 +345,9 @@ TUI_AGENT_CONTROL_HINT = """
 - 创建定时任务时不要读取、修改或启动外部 scheduler 文件、外部定时任务 SOP 或其他程序的调度目录；当前有效调度状态只来自 TUI 调度工具和 `schedule.create` 控制动作。
 - `ScheduleCreate` 的触发器 schema 只由 `cron`、`interval`、`at`，或标准化 `trigger` 前缀定义（例如 `cron:0 8 * * *`、`interval:1m`、`at:YYYY-MM-DDT09:00:00+08:00`）。schema 外字段由通用边界处理，不在当前协议里枚举历史字段。
 - 用户说“每天 8 点”时输出 `cron:"0 8 * * *"`；说“工作日 8 点半”时输出 `cron:"30 8 * * 1-5"`；说“每 1 分钟”时输出 `interval:"1m"`；说“明天 9 点”时按当前日期和时区输出 ISO `at`。
-- 用户要求“响一声蜂鸣/提醒我一下”这类 TUI 本地提醒时，不需要创建子 agent；在 `ScheduleCreate` 中设置 `local_action:{"type":"beep","message":"..."}`，由 TUI 调度器到点直接执行并写入 schedule-run 审计。
-- 除 TUI 本地提醒外，用户没有指定 `schedule_id` 时可以省略，让 TUI 自动生成；但必须提供明确目标 agent（优先先用 `agent_match` / `agent_list` 查询）和完整 `work_order` / capability / context / output contracts，并通过 `agenttask.v2` 派发，不允许绕过任务账本和审批门。
+- `ScheduleCreate` 必须带 `execution` 判别式执行对象。`execution.mode:"tui_action"` 表示 TUI 本地动作；`execution.mode:"agent_task"` 表示通过 `agenttask.v2` 委派给子 agent。
+- 用户要求“响一声蜂鸣/提醒我一下”这类 TUI 本地提醒时，不需要创建子 agent；设置 `execution:{"mode":"tui_action","action":"beep","message":"..."}`，由 TUI 调度器到点直接执行并写入 schedule-run 审计。
+- 除 TUI 本地提醒外，用户没有指定 `schedule_id` 时可以省略，让 TUI 自动生成；但必须在 `execution.mode:"agent_task"` 中提供明确目标 agent（优先先用 `agent_match` / `agent_list` 查询）和完整 `routing` / `work_order` / capability / context / output contracts，并通过 `agenttask.v2` 派发，不允许绕过任务账本和审批门。
 - 你是主控 Orchestrator；读任务可并行，写任务保持单写者；子 agent 返回 artifact/证据/摘要，不要无结构自由聊天。
 - 批量操作历史会话时优先用 `/sessions` 输出的稳定 `id:xxxxxx` 或完整文件名作为 target；不要用 `S01`/`1` 这种当前视图相对编号，除非同时提供 `expected_title`。
 [/GenericAgent-TUI ga-control v2]
@@ -497,13 +498,30 @@ TUI_SCHEDULE_TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "trigger": {"type": "string", "description": "Standardized trigger string prefixed with cron:, interval:, or at:."},
                     "timezone": {"type": "string", "description": "Optional timezone label."},
                     "provider_id": {"type": "string", "description": "Optional runtime provider id."},
-                    "target": {"type": "string", "description": "Target subagent id/name when routing.selected_agent is omitted."},
-                    "routing": {"type": "object", "description": "agenttask.v2 routing contract with selected_agent or target_selector."},
-                    "work_order": {"type": "object", "description": "agenttask.v2 work order. Must include objective for dispatchable schedules."},
-                    "capability_contract": {"type": "object", "description": "agenttask.v2 capability contract."},
-                    "context_contract": {"type": "object", "description": "agenttask.v2 context contract."},
-                    "output_contract": {"type": "object", "description": "agenttask.v2 output contract."},
-                    "local_action": {"type": "object", "description": "Optional audited TUI-local action for reminders. Supported type: beep."},
+                    "execution": {
+                        "type": "object",
+                        "description": "Discriminated execution object for scheduled work.",
+                        "properties": {
+                            "mode": {
+                                "type": "string",
+                                "enum": ["tui_action", "agent_task"],
+                                "description": "tui_action runs a local TUI action; agent_task dispatches through agenttask.v2.",
+                            },
+                            "action": {
+                                "type": "string",
+                                "enum": ["beep"],
+                                "description": "Required when mode=tui_action. Current supported action: beep.",
+                            },
+                            "message": {"type": "string", "description": "Optional message for the TUI action audit row."},
+                            "payload": {"type": "object", "description": "Optional bounded payload for the TUI action."},
+                            "routing": {"type": "object", "description": "Required when mode=agent_task. agenttask.v2 routing contract with selected_agent."},
+                            "work_order": {"type": "object", "description": "Required when mode=agent_task. Must include objective."},
+                            "capability_contract": {"type": "object", "description": "agenttask.v2 capability contract."},
+                            "context_contract": {"type": "object", "description": "agenttask.v2 context contract."},
+                            "output_contract": {"type": "object", "description": "agenttask.v2 output contract."},
+                        },
+                        "required": ["mode"],
+                    },
                     "status": {"type": "string", "enum": ["enabled", "disabled"], "description": "Initial schedule status.", "default": "enabled"},
                 },
             },
@@ -6005,31 +6023,66 @@ def schedule_trigger_from_control(control: dict[str, Any]) -> str:
     return ""
 
 
-def schedule_work_order_from_control(control: dict[str, Any]) -> dict[str, Any]:
-    work_order = control.get("work_order") if isinstance(control.get("work_order"), dict) else {}
-    if work_order:
-        return work_order
-    task = control.get("task") if isinstance(control.get("task"), dict) else {}
-    if task:
-        return task
-    objective = str(control.get("objective") or control.get("prompt") or control.get("message") or "").strip()
-    return {"objective": objective} if objective else {}
+def schedule_execution_from_control(control: dict[str, Any]) -> dict[str, Any]:
+    raw = control.get("execution") if isinstance(control.get("execution"), dict) else {}
+    mode = str(raw.get("mode") or "").strip().lower().replace("-", "_")
+    if mode == "tui_action":
+        action = str(raw.get("action") or "").strip().lower().replace("-", "_")
+        execution: dict[str, Any] = {"mode": "tui_action", "action": action}
+        message = str(raw.get("message") or "").strip()
+        if message:
+            execution["message"] = message
+        payload = raw.get("payload") if isinstance(raw.get("payload"), dict) else {}
+        if payload:
+            execution["payload"] = tui_query_json_safe(payload)
+        return execution
+    if mode == "agent_task":
+        return {
+            "mode": "agent_task",
+            "routing": raw.get("routing") if isinstance(raw.get("routing"), dict) else {},
+            "work_order": raw.get("work_order") if isinstance(raw.get("work_order"), dict) else {},
+            "capability_contract": raw.get("capability_contract") if isinstance(raw.get("capability_contract"), dict) else {},
+            "context_contract": raw.get("context_contract") if isinstance(raw.get("context_contract"), dict) else {},
+            "output_contract": raw.get("output_contract") if isinstance(raw.get("output_contract"), dict) else {},
+        }
+    return {}
 
 
-def schedule_record_from_control(control: dict[str, Any], *, schedule_id: str, status: str, source: str) -> dict[str, Any]:
-    work_order = schedule_work_order_from_control(control)
-    provider_id = str(control.get("provider_id") or control.get("runtime_provider_id") or "").strip()
-    routing = control.get("routing") if isinstance(control.get("routing"), dict) else {}
+def schedule_execution_target(execution: dict[str, Any]) -> str:
+    routing = execution.get("routing") if isinstance(execution.get("routing"), dict) else {}
     selector = routing.get("target_selector") if isinstance(routing.get("target_selector"), dict) else {}
-    target = str(
-        control.get("target")
-        or control.get("agent")
-        or routing.get("selected_agent")
+    return str(
+        routing.get("selected_agent")
         or selector.get("agent_id")
         or selector.get("target")
         or selector.get("name")
         or ""
     ).strip()
+
+
+def schedule_execution_error(execution: dict[str, Any]) -> str:
+    mode = str(execution.get("mode") or "").strip().lower()
+    if mode == "tui_action":
+        action = str(execution.get("action") or "").strip().lower()
+        if action == "beep":
+            return ""
+        return "schedule execution action is unsupported."
+    if mode == "agent_task":
+        work_order = execution.get("work_order") if isinstance(execution.get("work_order"), dict) else {}
+        if not str(work_order.get("objective") or "").strip():
+            return "schedule execution missing work_order.objective."
+        if not schedule_execution_target(execution):
+            return "schedule execution missing routing.selected_agent."
+        return ""
+    return "schedule execution mode is required."
+
+
+def schedule_record_from_control(control: dict[str, Any], *, schedule_id: str, status: str, source: str) -> dict[str, Any]:
+    provider_id = str(control.get("provider_id") or control.get("runtime_provider_id") or "").strip()
+    execution = schedule_execution_from_control(control)
+    target = schedule_execution_target(execution)
+    mode = str(execution.get("mode") or "").strip().lower()
+    dispatch_contract = "tui_action.v1" if mode == "tui_action" else "agenttask.v2"
     record = {
         "schema_version": "scheduledtask.v1",
         "schedule_id": schedule_id,
@@ -6038,26 +6091,49 @@ def schedule_record_from_control(control: dict[str, Any], *, schedule_id: str, s
         "trigger": schedule_trigger_from_control(control),
         "timezone": str(control.get("timezone") or control.get("tz") or "").strip(),
         "provider_id": provider_id or agent_runtime_registry().to_record()["default_provider_id"],
-        "dispatch_contract": "agenttask.v2",
+        "dispatch_contract": dispatch_contract,
+        "execution": tui_query_json_safe(execution),
         "target": target,
-        "work_order": work_order,
-        "routing": routing,
-        "capability_contract": control.get("capability_contract") if isinstance(control.get("capability_contract"), dict) else {},
-        "context_contract": control.get("context_contract") if isinstance(control.get("context_contract"), dict) else {},
-        "output_contract": control.get("output_contract") if isinstance(control.get("output_contract"), dict) else {},
         "created_at": str(control.get("created_at") or now_iso()),
         "updated_at": now_iso(),
         "source": source,
     }
-    local_action = control.get("local_action") if isinstance(control.get("local_action"), dict) else {}
-    if local_action:
-        record["local_action"] = tui_query_json_safe(local_action)
-        record["dispatch_contract"] = "tui.local_action.v1"
     for key in ("cron", "interval", "at"):
         value = str(control.get(key) or "").strip()
         if value:
             record[key] = value
     return record
+
+
+def schedule_record_updates_from_control(control: dict[str, Any], *, source: str) -> dict[str, Any]:
+    updates: dict[str, Any] = {"updated_at": now_iso(), "source": source}
+    name = str(control.get("name") or control.get("title") or "").strip()
+    if name:
+        updates["name"] = name
+    status = str(control.get("status") or "").strip()
+    if status:
+        updates["status"] = status
+    if "timezone" in control or "tz" in control:
+        updates["timezone"] = str(control.get("timezone") or control.get("tz") or "").strip()
+    if "provider_id" in control or "runtime_provider_id" in control:
+        provider_id = str(control.get("provider_id") or control.get("runtime_provider_id") or "").strip()
+        if provider_id:
+            updates["provider_id"] = provider_id
+    if schedule_trigger_from_control(control):
+        for key in ("cron", "interval", "at", "trigger"):
+            updates[key] = ""
+        updates["trigger"] = schedule_trigger_from_control(control)
+        for key in ("cron", "interval", "at"):
+            value = str(control.get(key) or "").strip()
+            if value:
+                updates[key] = value
+    if isinstance(control.get("execution"), dict):
+        execution = schedule_execution_from_control(control)
+        mode = str(execution.get("mode") or "").strip().lower()
+        updates["execution"] = tui_query_json_safe(execution)
+        updates["target"] = schedule_execution_target(execution)
+        updates["dispatch_contract"] = "tui_action.v1" if mode == "tui_action" else "agenttask.v2"
+    return updates
 
 
 def apply_schedule_control(state: State, action: str, target: str, value: str, control: dict[str, Any], source: str = "agent") -> Optional[str]:
@@ -6072,6 +6148,9 @@ def apply_schedule_control(state: State, action: str, target: str, value: str, c
         if not trigger:
             return "缺少 schedule 触发器：需要 cron、interval、trigger 或 at。"
         row = schedule_record_from_control(control, schedule_id=schedule_id, status=str(control.get("status") or "enabled"), source=source)
+        execution_error = schedule_execution_error(row.get("execution") if isinstance(row.get("execution"), dict) else {})
+        if execution_error:
+            return execution_error
         append_schedule_record(row)
         return f"已登记定时任务：{row['name']} ({schedule_id}) · {trigger}"
     schedule_id = str(target or control.get("schedule_id") or control.get("id") or "").strip()
@@ -6082,15 +6161,12 @@ def apply_schedule_control(state: State, action: str, target: str, value: str, c
         return f"找不到定时任务：{schedule_id}"
     if action == "schedule_update":
         row = dict(existing)
-        updates = schedule_record_from_control(
-            control,
-            schedule_id=schedule_id,
-            status=str(existing.get("status") or "enabled"),
-            source=source,
-        )
-        row.update({key: item for key, item in updates.items() if item not in ("", {}, [])})
+        row.update(schedule_record_updates_from_control(control, source=source))
         row["created_at"] = existing.get("created_at") or row.get("created_at") or now_iso()
         row["updated_at"] = now_iso()
+        execution_error = schedule_execution_error(row.get("execution") if isinstance(row.get("execution"), dict) else {})
+        if execution_error:
+            return execution_error
         append_schedule_record(row)
         return f"已更新定时任务：{row.get('name') or schedule_id}"
     status = {
@@ -6108,8 +6184,9 @@ def apply_schedule_control(state: State, action: str, target: str, value: str, c
 
 
 def schedule_agenttask_control(row: dict[str, Any]) -> dict[str, Any]:
-    work_order = row.get("work_order") if isinstance(row.get("work_order"), dict) else {}
-    routing = row.get("routing") if isinstance(row.get("routing"), dict) else {}
+    execution = row.get("execution") if isinstance(row.get("execution"), dict) else {}
+    work_order = execution.get("work_order") if isinstance(execution.get("work_order"), dict) else {}
+    routing = execution.get("routing") if isinstance(execution.get("routing"), dict) else {}
     routing = dict(routing)
     target = str(row.get("target") or "").strip()
     if target and not routing.get("selected_agent"):
@@ -6120,9 +6197,9 @@ def schedule_agenttask_control(row: dict[str, Any]) -> dict[str, Any]:
         "parent_task_id": str(row.get("parent_task_id") or row.get("task_id") or ""),
         "routing": routing,
         "work_order": work_order,
-        "capability_contract": row.get("capability_contract") if isinstance(row.get("capability_contract"), dict) else {},
-        "context_contract": row.get("context_contract") if isinstance(row.get("context_contract"), dict) else {},
-        "output_contract": row.get("output_contract") if isinstance(row.get("output_contract"), dict) else {},
+        "capability_contract": execution.get("capability_contract") if isinstance(execution.get("capability_contract"), dict) else {},
+        "context_contract": execution.get("context_contract") if isinstance(execution.get("context_contract"), dict) else {},
+        "output_contract": execution.get("output_contract") if isinstance(execution.get("output_contract"), dict) else {},
         "task_title": str(row.get("name") or row.get("title") or row.get("schedule_id") or "Scheduled task"),
         "schedule_id": str(row.get("schedule_id") or ""),
         "provider_id": str(row.get("provider_id") or ""),
@@ -6193,11 +6270,11 @@ def emit_tui_beep() -> str:
         return f"beep failed: {type(exc).__name__}: {exc}"
 
 
-def dispatch_schedule_local_action(row: dict[str, Any], started: dict[str, Any]) -> Optional[dict[str, Any]]:
-    local_action = row.get("local_action") if isinstance(row.get("local_action"), dict) else {}
-    if not local_action:
+def dispatch_schedule_tui_action(row: dict[str, Any], started: dict[str, Any]) -> Optional[dict[str, Any]]:
+    execution = row.get("execution") if isinstance(row.get("execution"), dict) else {}
+    if str(execution.get("mode") or "").strip().lower() != "tui_action":
         return None
-    action_type = str(local_action.get("type") or "").strip().lower().replace("-", "_")
+    action_type = str(execution.get("action") or "").strip().lower().replace("-", "_")
     if action_type == "beep":
         result = emit_tui_beep()
         status = "completed" if "failed" not in result.lower() else "failed"
@@ -6205,7 +6282,7 @@ def dispatch_schedule_local_action(row: dict[str, Any], started: dict[str, Any])
         finished.update({
             "status": status,
             "finished_at": now_iso(),
-            "local_action": tui_query_json_safe(local_action),
+            "execution": tui_query_json_safe(execution),
             "result": result,
         })
         if status == "failed":
@@ -6217,8 +6294,8 @@ def dispatch_schedule_local_action(row: dict[str, Any], started: dict[str, Any])
     finished.update({
         "status": "failed",
         "finished_at": now_iso(),
-        "local_action": tui_query_json_safe(local_action),
-        "error": f"unsupported local action: {action_type or '-'}",
+        "execution": tui_query_json_safe(execution),
+        "error": f"unsupported schedule execution action: {action_type or '-'}",
     })
     append_schedule_run(finished)
     update_schedule_last_run(row, finished)
@@ -6247,9 +6324,17 @@ def dispatch_schedule_run(state: State, row: dict[str, Any], info: dict[str, Any
         "dispatch_contract": row.get("dispatch_contract") or "agenttask.v2",
         "source": source,
     })
-    local_run = dispatch_schedule_local_action(row, started)
-    if local_run is not None:
-        return local_run
+    tui_action_run = dispatch_schedule_tui_action(row, started)
+    if tui_action_run is not None:
+        return tui_action_run
+    execution = row.get("execution") if isinstance(row.get("execution"), dict) else {}
+    execution_error = schedule_execution_error(execution)
+    if execution_error:
+        finished = dict(started)
+        finished.update({"status": "failed", "finished_at": now_iso(), "error": execution_error})
+        append_schedule_run(finished)
+        update_schedule_last_run(row, finished)
+        return finished
     control = schedule_agenttask_control(row)
     work_order = control.get("work_order") if isinstance(control.get("work_order"), dict) else {}
     if not str(work_order.get("objective") or "").strip():

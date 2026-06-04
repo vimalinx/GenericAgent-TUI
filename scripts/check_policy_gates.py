@@ -1689,11 +1689,14 @@ def assert_tui_query_tools_expose_dashboard_state() -> None:
             "schedule_id": "sched_tool_digest",
             "name": "Tool Digest",
             "interval": "1m",
-            "routing": {"selected_agent": researcher.name},
-            "work_order": {"objective": "Produce a short tool-created digest."},
-            "capability_contract": {"tools_allowed": ["read"], "write_policy": "none"},
-            "context_contract": {"history_mode": "summary", "artifact_reference_only": True},
-            "output_contract": {"format": "structured_markdown", "required_sections": ["summary"]},
+            "execution": {
+                "mode": "agent_task",
+                "routing": {"selected_agent": researcher.name},
+                "work_order": {"objective": "Produce a short tool-created digest."},
+                "capability_contract": {"tools_allowed": ["read"], "write_policy": "none"},
+                "context_contract": {"history_mode": "summary", "artifact_reference_only": True},
+                "output_contract": {"format": "structured_markdown", "required_sections": ["summary"]},
+            },
         },
     )
     assert schedule_tool["schema_version"] == "ga-tui.tool.v1", schedule_tool
@@ -1701,6 +1704,11 @@ def assert_tui_query_tools_expose_dashboard_state() -> None:
     assert schedule_tool["schedule"]["schedule_id"] == "sched_tool_digest", schedule_tool
     assert schedule_tool["schedule"]["source"] == "tool:schedule_create", schedule_tool
     assert schedule_tool["schedule"]["dispatch_contract"] == "agenttask.v2", schedule_tool
+    assert schedule_tool["schedule"]["execution"]["mode"] == "agent_task", schedule_tool
+    schema = next(tool for tool in a.TUI_SCHEDULE_TOOL_SCHEMAS if tool["function"]["name"] == "schedule_create")
+    execution_schema = schema["function"]["parameters"]["properties"]["execution"]
+    assert execution_schema["required"] == ["mode"], execution_schema
+    assert set(execution_schema["properties"]["mode"]["enum"]) == {"tui_action", "agent_task"}, execution_schema
     schedule_list = a.tui_tool_schedule_list(state, {})
     assert schedule_list["status"] == "ok", schedule_list
     assert any(job["schedule_id"] == "sched_tool_digest" for job in schedule_list["registry"]["jobs"]), schedule_list
@@ -2989,30 +2997,46 @@ def run_checks() -> None:
     assert_artifact_schema(direct_artifact, artifact_type="debug-loop")
     inventory = [item for item in a.artifact_inventory() if item.key == direct_ref]
     assert inventory and "Hash:" in inventory[-1].detail and "Provenance:" in inventory[-1].detail, inventory
+    daily_worker = a.create_subagent(state, "Daily Digest Worker", role="researcher")
     schedule_control = ga_control({
         "action": "schedule.create",
         "schedule_id": "sched_daily_digest",
         "name": "Daily Digest",
         "cron": "0 8 * * *",
         "provider_id": "genericagent",
-        "work_order": {"objective": "Generate a daily digest."},
+        "execution": {
+            "mode": "agent_task",
+            "routing": {"selected_agent": daily_worker.name},
+            "work_order": {"objective": "Generate a daily digest."},
+            "capability_contract": {"tools_allowed": ["read"], "write_policy": "none"},
+            "context_contract": {"history_mode": "summary", "artifact_reference_only": True},
+            "output_contract": {"format": "structured_markdown", "required_sections": ["summary"]},
+        },
     })
     a.apply_tui_controls_from_text(state, schedule_control, source="agent")
     schedule_records = a.latest_schedule_records()
     assert schedule_records["sched_daily_digest"]["dispatch_contract"] == "agenttask.v2", schedule_records
     assert schedule_records["sched_daily_digest"]["provider_id"] == "genericagent", schedule_records
     assert schedule_records["sched_daily_digest"]["cron"] == "0 8 * * *", schedule_records
+    a.apply_tui_controls_from_text(state, ga_control({"action": "schedule.update", "target": "sched_daily_digest", "interval": "10m"}), source="agent")
+    updated_daily = a.latest_schedule_records()["sched_daily_digest"]
+    assert updated_daily["dispatch_contract"] == "agenttask.v2", updated_daily
+    assert updated_daily["execution"]["mode"] == "agent_task", updated_daily
+    assert updated_daily["interval"] == "10m", updated_daily
+    assert not str(updated_daily.get("cron") or "").strip(), updated_daily
+    assert a.split_schedule_trigger(updated_daily) == ("interval", "10m"), updated_daily
     a.apply_tui_controls_from_text(state, ga_control({"action": "schedule.disable", "target": "sched_daily_digest"}), source="agent")
     assert a.latest_schedule_records()["sched_daily_digest"]["status"] == "disabled"
     assert "用户只需要表达自然意图" in a.TUI_AGENT_CONTROL_HINT
     assert "ScheduleCreate" in a.TUI_AGENT_CONTROL_HINT
     assert "schedule_create" in a.TUI_AGENT_CONTROL_HINT
-    assert "local_action" in a.TUI_AGENT_CONTROL_HINT
+    assert "execution" in a.TUI_AGENT_CONTROL_HINT
+    assert "tui_action" in a.TUI_AGENT_CONTROL_HINT
+    assert "agent_task" in a.TUI_AGENT_CONTROL_HINT
     assert "不要读取、修改或启动外部 scheduler" in a.TUI_AGENT_CONTROL_HINT
     assert "schema 外字段由通用边界处理" in a.TUI_AGENT_CONTROL_HINT
     assert 'cron:"0 8 * * *"' in a.TUI_AGENT_CONTROL_HINT
     assert 'interval:"1m"' in a.TUI_AGENT_CONTROL_HINT
-    assert "rrule" not in a.TUI_AGENT_CONTROL_HINT.lower()
     assert a.split_schedule_trigger({"cron": "0 8 * * *"}) == ("cron", "0 8 * * *")
     assert a.split_schedule_trigger({"interval": "1m"}) == ("interval", "1m")
     assert a.split_schedule_trigger({"at": "2026-01-01T00:00:00+0800"}) == ("at", "2026-01-01T00:00:00+0800")
@@ -3053,23 +3077,30 @@ def run_checks() -> None:
     old_emit_beep = a.emit_tui_beep
     try:
         a.emit_tui_beep = lambda: beep_calls.append("beep") or "beep emitted"
-        local_beep_control = ga_control({
+        tui_beep_control = ga_control({
             "action": "schedule.create",
-            "schedule_id": "sched_local_beep",
-            "name": "Local Beep",
+            "schedule_id": "sched_tui_beep",
+            "name": "TUI Beep",
             "at": "2026-01-01T00:00:00+0800",
-            "local_action": {"type": "beep", "message": "test beep"},
+            "execution": {"mode": "tui_action", "action": "beep", "message": "test beep"},
         })
-        a.apply_tui_controls_from_text(state, local_beep_control, source="agent")
-        local_record = a.latest_schedule_records()["sched_local_beep"]
-        assert local_record["dispatch_contract"] == "tui.local_action.v1", local_record
-        assert local_record["local_action"]["type"] == "beep", local_record
-        local_tick = a.scheduler_tick(state, now_epoch=1780000000.0, source="test:scheduler_local_beep", target_schedule_id="sched_local_beep")
-        assert local_tick["due"] == 1 and local_tick["dispatched"] == 1 and local_tick["failed"] == 0, local_tick
+        a.apply_tui_controls_from_text(state, tui_beep_control, source="agent")
+        tui_record = a.latest_schedule_records()["sched_tui_beep"]
+        assert tui_record["dispatch_contract"] == "tui_action.v1", tui_record
+        assert tui_record["execution"]["mode"] == "tui_action", tui_record
+        assert tui_record["execution"]["action"] == "beep", tui_record
+        a.apply_tui_controls_from_text(state, ga_control({"action": "schedule.update", "target": "sched_tui_beep", "name": "Renamed TUI Beep"}), source="agent")
+        tui_record = a.latest_schedule_records()["sched_tui_beep"]
+        assert tui_record["name"] == "Renamed TUI Beep", tui_record
+        assert tui_record["dispatch_contract"] == "tui_action.v1", tui_record
+        assert tui_record["execution"]["mode"] == "tui_action", tui_record
+        tui_tick = a.scheduler_tick(state, now_epoch=1780000000.0, source="test:scheduler_tui_beep", target_schedule_id="sched_tui_beep")
+        assert tui_tick["due"] == 1 and tui_tick["dispatched"] == 1 and tui_tick["failed"] == 0, tui_tick
         assert beep_calls == ["beep"], beep_calls
-        local_runs = [row for row in a.read_jsonl(a.AGENT_SCHEDULE_RUNS_PATH) if row.get("schedule_id") == "sched_local_beep"]
-        assert any(row.get("status") == "starting" for row in local_runs), local_runs
-        assert any(row.get("status") == "completed" and row.get("result") == "beep emitted" for row in local_runs), local_runs
+        tui_runs = [row for row in a.read_jsonl(a.AGENT_SCHEDULE_RUNS_PATH) if row.get("schedule_id") == "sched_tui_beep"]
+        assert any(row.get("status") == "starting" for row in tui_runs), tui_runs
+        assert any(row.get("status") == "completed" and row.get("result") == "beep emitted" for row in tui_runs), tui_runs
+        assert all("task_id" not in row for row in tui_runs if row.get("status") == "completed"), tui_runs
     finally:
         a.emit_tui_beep = old_emit_beep
     scheduler_worker = a.create_subagent(state, "Scheduler Worker", role="researcher")
@@ -3079,18 +3110,21 @@ def run_checks() -> None:
         "name": "Due Once",
         "at": "2026-01-01T00:00:00+0800",
         "provider_id": "genericagent",
-        "routing": {
-            "selected_agent": scheduler_worker.name,
-            "target_selector": {"role": "researcher", "reuse_policy": "prefer_existing"},
+        "execution": {
+            "mode": "agent_task",
+            "routing": {
+                "selected_agent": scheduler_worker.name,
+                "target_selector": {"role": "researcher", "reuse_policy": "prefer_existing"},
+            },
+            "work_order": {
+                "objective": "Read local docs and produce a short scheduled digest.",
+                "success_criteria": ["return a concise digest"],
+                "stop_condition": "return scheduled digest and stop",
+            },
+            "capability_contract": {"tools_allowed": ["read"], "tools_forbidden": ["repo.write"], "write_policy": "none"},
+            "context_contract": {"history_mode": "summary", "artifact_reference_only": True},
+            "output_contract": {"format": "structured_markdown", "required_sections": ["summary", "artifact_refs"]},
         },
-        "work_order": {
-            "objective": "Read local docs and produce a short scheduled digest.",
-            "success_criteria": ["return a concise digest"],
-            "stop_condition": "return scheduled digest and stop",
-        },
-        "capability_contract": {"tools_allowed": ["read"], "tools_forbidden": ["repo.write"], "write_policy": "none"},
-        "context_contract": {"history_mode": "summary", "artifact_reference_only": True},
-        "output_contract": {"format": "structured_markdown", "required_sections": ["summary", "artifact_refs"]},
     })
     a.apply_tui_controls_from_text(state, due_schedule_control, source="agent")
     assert a.latest_schedule_records()["sched_due_once"]["at"] == "2026-01-01T00:00:00+0800"
