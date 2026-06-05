@@ -35,7 +35,6 @@ import urllib.request
 import unicodedata
 import zipfile
 from dataclasses import dataclass, field
-from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Optional
 
@@ -83,6 +82,7 @@ try:
         strip_tui_controls,
         tui_control_parse_errors,
     )
+    from . import scheduler as scheduler_runtime
     from .runtime import RuntimeAdapter, RuntimeRegistry, genericagent_provider_spec
 except Exception:
     from integration import find_genericagent_root as _find_genericagent_root  # type: ignore
@@ -122,7 +122,45 @@ except Exception:
         strip_tui_controls,
         tui_control_parse_errors,
     )
+    import scheduler as scheduler_runtime  # type: ignore
     from runtime import RuntimeAdapter, RuntimeRegistry, genericagent_provider_spec  # type: ignore
+
+
+SCHEDULE_RUN_ATTEMPT_STATUSES = scheduler_runtime.SCHEDULE_RUN_ATTEMPT_STATUSES
+SCHEDULER_TICK_SECONDS = scheduler_runtime.SCHEDULER_TICK_SECONDS
+SchedulerDispatchResult = scheduler_runtime.SchedulerDispatchResult
+append_schedule_record = scheduler_runtime.append_schedule_record
+append_schedule_run = scheduler_runtime.append_schedule_run
+append_schedule_skip_run = scheduler_runtime.append_schedule_skip_run
+apply_schedule_control = scheduler_runtime.apply_schedule_control
+configure_scheduler_runtime = scheduler_runtime.configure_scheduler_runtime
+cron_field_matches = scheduler_runtime.cron_field_matches
+cron_matches_now = scheduler_runtime.cron_matches_now
+dispatch_schedule_run = scheduler_runtime.dispatch_schedule_run
+dispatch_schedule_tui_action = scheduler_runtime.dispatch_schedule_tui_action
+format_scheduled_task_registry = scheduler_runtime.format_scheduled_task_registry
+format_scheduler_tick_result = scheduler_runtime.format_scheduler_tick_result
+latest_schedule_attempt_runs_by_schedule_id = scheduler_runtime.latest_schedule_attempt_runs_by_schedule_id
+latest_schedule_records = scheduler_runtime.latest_schedule_records
+latest_schedule_run_records = scheduler_runtime.latest_schedule_run_records
+latest_schedule_runs_by_schedule_id = scheduler_runtime.latest_schedule_runs_by_schedule_id
+parse_schedule_interval_seconds = scheduler_runtime.parse_schedule_interval_seconds
+parse_schedule_timestamp = scheduler_runtime.parse_schedule_timestamp
+schedule_active = scheduler_runtime.schedule_active
+schedule_agenttask_control = scheduler_runtime.schedule_agenttask_control
+schedule_due_info = scheduler_runtime.schedule_due_info
+schedule_execution_error = scheduler_runtime.schedule_execution_error
+schedule_execution_from_control = scheduler_runtime.schedule_execution_from_control
+schedule_execution_target = scheduler_runtime.schedule_execution_target
+schedule_record_from_control = scheduler_runtime.schedule_record_from_control
+schedule_record_trigger = scheduler_runtime.schedule_record_trigger
+schedule_record_updates_from_control = scheduler_runtime.schedule_record_updates_from_control
+schedule_run_idempotency_keys = scheduler_runtime.schedule_run_idempotency_keys
+schedule_trigger_from_control = scheduler_runtime.schedule_trigger_from_control
+scheduled_task_registry = scheduler_runtime.scheduled_task_registry
+scheduler_tick = scheduler_runtime.scheduler_tick
+split_schedule_trigger = scheduler_runtime.split_schedule_trigger
+update_schedule_last_run = scheduler_runtime.update_schedule_last_run
 
 
 def find_genericagent_root() -> str:
@@ -174,11 +212,6 @@ AGENT_GATEWAY_DAEMON_STATUS_PATH = os.path.join(AGENT_HARNESS_DIR, "gateway_daem
 AGENT_GATEWAY_DAEMON_LOG_PATH = os.path.join(AGENT_HARNESS_DIR, "gateway_daemon.log")
 AGENT_BRIDGE_REGISTRY_PATH = os.path.join(AGENT_HARNESS_DIR, "bridge_registry.json")
 LLM_RECENT_MODELS_PATH = os.path.join(AGENT_HARNESS_DIR, "recent_models.json")
-SCHEDULE_RUN_ATTEMPT_STATUSES = {"starting", "dispatched", "queued", "approval_required", "failed", "rejected"}
-try:
-    SCHEDULER_TICK_SECONDS = max(5.0, float(os.environ.get("GA_TUI_SCHEDULER_TICK_SECONDS", "30") or "30"))
-except ValueError:
-    SCHEDULER_TICK_SECONDS = 30.0
 SECRET_VAULT_DIR = os.path.abspath(os.path.expanduser(os.environ.get("GA_TUI_SECRET_VAULT_DIR") or os.path.join(ROOT_DIR, "memory", "secret_vault")))
 SECRET_VAULT_META_PATH = os.path.join(SECRET_VAULT_DIR, "vault.json")
 SECRET_VAULT_DATA_DIR = os.path.join(SECRET_VAULT_DIR, "data")
@@ -5814,563 +5847,6 @@ def model_orchestration_registry(state: Optional[State] = None) -> dict[str, Any
     }
 
 
-def scheduled_task_registry(state: Optional[State] = None) -> dict[str, Any]:
-    del state
-    run_rows = latest_schedule_run_records()
-    last_runs = latest_schedule_runs_by_schedule_id()
-    last_attempts = latest_schedule_attempt_runs_by_schedule_id()
-    seen_keys = {str(row.get("idempotency_key") or "").strip() for row in run_rows if row.get("idempotency_key")}
-    jobs = []
-    for row in latest_schedule_records().values():
-        job = dict(row)
-        schedule_id = str(job.get("schedule_id") or "")
-        due = schedule_due_info(job, last_run=last_attempts.get(schedule_id), seen_keys=seen_keys)
-        job["scheduler"] = {
-            "due": bool(due.get("due")),
-            "status": due.get("status", ""),
-            "reason": due.get("reason", ""),
-            "trigger_kind": due.get("trigger_kind", ""),
-            "due_at": due.get("due_at", ""),
-            "idempotency_key": due.get("idempotency_key", ""),
-            "last_run": last_runs.get(schedule_id) or {},
-            "last_attempt": last_attempts.get(schedule_id) or {},
-        }
-        jobs.append(job)
-    jobs.sort(key=lambda row: str(row.get("updated_at") or row.get("created_at") or ""))
-    active_jobs = [
-        row for row in jobs
-        if str(row.get("status") or "enabled").lower() not in {"disabled", "deleted", "cancelled", "canceled"}
-    ]
-    return {
-        "schema_version": "scheduledtask.registry.v1",
-        "owner": "ga-tui.control_plane",
-        "status": "registry_ready",
-        "schedules_path": AGENT_SCHEDULES_PATH,
-        "runs_path": AGENT_SCHEDULE_RUNS_PATH,
-        "job_count": len(jobs),
-        "active_job_count": len(active_jobs),
-        "run_count": len(run_rows),
-        "jobs": jobs[-50:],
-        "dispatch": {
-            "contract": "agenttask.v2",
-            "runtime_provider_selection": "explicit provider_id or registry default",
-            "task_ledger": AGENT_TASK_LEDGER_PATH,
-            "agent_mail": AGENT_MAIL_PATH,
-            "artifact_policy": "artifact_refs_required",
-        },
-        "capabilities": {
-            "register_recurring_jobs": True,
-            "dispatch_to_runtime_provider": True,
-            "audit_each_run": True,
-            "approval_gates_before_risky_runs": True,
-        },
-    }
-
-
-def latest_schedule_records() -> dict[str, dict[str, Any]]:
-    records: dict[str, dict[str, Any]] = {}
-    for row in read_jsonl(AGENT_SCHEDULES_PATH, limit=500):
-        schedule_id = str(row.get("schedule_id") or row.get("id") or "").strip()
-        if not schedule_id:
-            continue
-        records[schedule_id] = row
-    return records
-
-
-def append_schedule_record(row: dict[str, Any]) -> dict[str, Any]:
-    payload = dict(row)
-    payload.setdefault("schema_version", "scheduledtask.v1")
-    payload.setdefault("updated_at", now_iso())
-    append_jsonl(AGENT_SCHEDULES_PATH, payload)
-    return payload
-
-
-def latest_schedule_run_records(limit: int = 1000) -> list[dict[str, Any]]:
-    return read_jsonl(AGENT_SCHEDULE_RUNS_PATH, limit=limit)
-
-
-def latest_schedule_runs_by_schedule_id(limit: int = 1000, statuses: Optional[set[str]] = None) -> dict[str, dict[str, Any]]:
-    latest: dict[str, dict[str, Any]] = {}
-    allowed = {str(item).strip().lower() for item in statuses} if statuses is not None else None
-    for row in latest_schedule_run_records(limit=limit):
-        status = str(row.get("status") or "").strip().lower()
-        if allowed is not None and status not in allowed:
-            continue
-        schedule_id = str(row.get("schedule_id") or "").strip()
-        if schedule_id:
-            latest[schedule_id] = row
-    return latest
-
-
-def latest_schedule_attempt_runs_by_schedule_id(limit: int = 1000) -> dict[str, dict[str, Any]]:
-    return latest_schedule_runs_by_schedule_id(limit=limit, statuses=SCHEDULE_RUN_ATTEMPT_STATUSES)
-
-
-def schedule_run_idempotency_keys(limit: int = 2000) -> set[str]:
-    keys: set[str] = set()
-    for row in latest_schedule_run_records(limit=limit):
-        key = str(row.get("idempotency_key") or "").strip()
-        if key:
-            keys.add(key)
-    return keys
-
-
-def append_schedule_run(row: dict[str, Any]) -> dict[str, Any]:
-    payload = dict(row)
-    payload.setdefault("schema_version", "scheduledtask.run.v1")
-    payload.setdefault("run_id", short_uid("schedrun"))
-    payload.setdefault("timestamp", now_iso())
-    append_jsonl(AGENT_SCHEDULE_RUNS_PATH, payload)
-    return payload
-
-
-def schedule_record_trigger(row: dict[str, Any]) -> str:
-    for key in ("cron", "interval", "at", "trigger"):
-        value = str(row.get(key) or "").strip()
-        if value:
-            return value
-    return ""
-
-
-def parse_schedule_timestamp(value: Any) -> Optional[float]:
-    text = str(value or "").strip()
-    if not text:
-        return None
-    if re.fullmatch(r"\d+(?:\.\d+)?", text):
-        try:
-            return float(text)
-        except ValueError:
-            return None
-    normalized = text.replace("Z", "+00:00")
-    if re.search(r"[+-]\d{4}$", normalized):
-        normalized = normalized[:-5] + normalized[-5:-2] + ":" + normalized[-2:]
-    for candidate in (normalized, normalized.replace(" ", "T", 1)):
-        try:
-            return datetime.fromisoformat(candidate).timestamp()
-        except ValueError:
-            pass
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
-        try:
-            return time.mktime(time.strptime(text, fmt))
-        except ValueError:
-            pass
-    return None
-
-
-def parse_schedule_interval_seconds(value: Any) -> Optional[float]:
-    text = str(value or "").strip().lower()
-    if not text:
-        return None
-    text = re.sub(r"^(interval|every)\s*[:=]?\s*", "", text).strip()
-    match = re.fullmatch(
-        r"(\d+(?:\.\d+)?)\s*(s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)?",
-        text,
-    )
-    if not match:
-        return None
-    amount = float(match.group(1))
-    unit = match.group(2) or "s"
-    factor = 1.0
-    if unit.startswith("m"):
-        factor = 60.0
-    elif unit.startswith("h") or unit in {"hr", "hrs"}:
-        factor = 3600.0
-    elif unit.startswith("d"):
-        factor = 86400.0
-    seconds = amount * factor
-    return seconds if seconds > 0 else None
-
-
-def split_schedule_trigger(row: dict[str, Any]) -> tuple[str, str]:
-    trigger = schedule_record_trigger(row)
-    lowered = trigger.lower().strip()
-    for prefix in ("interval", "cron", "at"):
-        for sep in (":", "="):
-            marker = prefix + sep
-            if lowered.startswith(marker):
-                return prefix, trigger[len(marker):].strip()
-        if lowered.startswith(prefix + " "):
-            return prefix, trigger[len(prefix):].strip()
-    if row.get("interval"):
-        return "interval", str(row.get("interval") or "").strip()
-    if row.get("cron"):
-        return "cron", str(row.get("cron") or "").strip()
-    if row.get("at"):
-        return "at", str(row.get("at") or "").strip()
-    return "unknown", trigger
-
-
-def cron_field_matches(expr: str, value: int, minimum: int, maximum: int, *, weekday: bool = False) -> bool:
-    expr = (expr or "").strip()
-    if not expr:
-        return False
-    for part in expr.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        step = 1
-        if "/" in part:
-            part, step_text = part.split("/", 1)
-            if not step_text.isdigit() or int(step_text) <= 0:
-                return False
-            step = int(step_text)
-        if part in {"", "*"}:
-            start, end = minimum, maximum
-        elif "-" in part:
-            start_text, end_text = part.split("-", 1)
-            if not start_text.isdigit() or not end_text.isdigit():
-                return False
-            start, end = int(start_text), int(end_text)
-        elif part.isdigit():
-            start = end = int(part)
-        else:
-            return False
-        if weekday:
-            if start == 7:
-                start = 0
-            if end == 7:
-                end = 0
-            if start > end:
-                values = list(range(start, maximum + 1)) + list(range(minimum, end + 1))
-            else:
-                values = list(range(start, end + 1))
-            if value in values and ((value - values[0]) % step == 0):
-                return True
-            continue
-        if start < minimum or end > maximum or start > end:
-            return False
-        if start <= value <= end and ((value - start) % step == 0):
-            return True
-    return False
-
-
-def cron_matches_now(expr: str, now_epoch: float) -> tuple[bool, str]:
-    fields = (expr or "").split()
-    if len(fields) != 5:
-        return False, "cron must contain five fields"
-    current = time.localtime(now_epoch)
-    cron_weekday = (current.tm_wday + 1) % 7
-    checks = [
-        cron_field_matches(fields[0], current.tm_min, 0, 59),
-        cron_field_matches(fields[1], current.tm_hour, 0, 23),
-        cron_field_matches(fields[2], current.tm_mday, 1, 31),
-        cron_field_matches(fields[3], current.tm_mon, 1, 12),
-        cron_field_matches(fields[4], cron_weekday, 0, 7, weekday=True),
-    ]
-    return all(checks), ""
-
-
-def schedule_active(row: dict[str, Any]) -> bool:
-    status = str(row.get("status") or "enabled").strip().lower()
-    return status not in {"disabled", "deleted", "cancelled", "canceled"}
-
-
-def schedule_due_info(
-    row: dict[str, Any],
-    *,
-    now_epoch: Optional[float] = None,
-    last_run: Optional[dict[str, Any]] = None,
-    seen_keys: Optional[set[str]] = None,
-) -> dict[str, Any]:
-    now_epoch = time.time() if now_epoch is None else float(now_epoch)
-    schedule_id = str(row.get("schedule_id") or row.get("id") or "").strip()
-    status = str(row.get("status") or "enabled").strip().lower()
-    trigger_kind, trigger_value = split_schedule_trigger(row)
-    info: dict[str, Any] = {
-        "schedule_id": schedule_id,
-        "status": "pending",
-        "due": False,
-        "trigger_kind": trigger_kind,
-        "trigger": trigger_value,
-        "reason": "",
-        "due_at_epoch": None,
-        "due_at": "",
-        "idempotency_key": "",
-    }
-    if not schedule_id:
-        info.update(status="invalid", reason="missing schedule_id")
-        return info
-    if not schedule_active(row):
-        info.update(status="skipped", reason=f"schedule status is {status or 'inactive'}")
-        return info
-    keys = seen_keys if seen_keys is not None else schedule_run_idempotency_keys()
-    if trigger_kind == "at":
-        due_epoch = parse_schedule_timestamp(trigger_value)
-        if due_epoch is None:
-            info.update(status="invalid", reason=f"invalid at trigger: {trigger_value}")
-            return info
-        key = f"{schedule_id}:at:{int(due_epoch)}"
-        info.update(due_at_epoch=due_epoch, due_at=time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(due_epoch)), idempotency_key=key)
-        if key in keys:
-            info.update(status="duplicate", reason="one-shot schedule already ran")
-            return info
-        if now_epoch >= due_epoch:
-            info.update(status="due", due=True, reason="at trigger reached")
-        else:
-            info.update(status="pending", reason="at trigger not reached")
-        return info
-    if trigger_kind == "interval":
-        seconds = parse_schedule_interval_seconds(trigger_value)
-        if seconds is None:
-            info.update(status="invalid", reason=f"invalid interval trigger: {trigger_value}")
-            return info
-        last_epoch = parse_schedule_timestamp((last_run or {}).get("timestamp") or (last_run or {}).get("started_at"))
-        anchor_epoch = last_epoch or parse_schedule_timestamp(row.get("created_at")) or parse_schedule_timestamp(row.get("updated_at")) or now_epoch
-        due_epoch = anchor_epoch + seconds
-        key = f"{schedule_id}:interval:{int(due_epoch)}"
-        info.update(due_at_epoch=due_epoch, due_at=time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(due_epoch)), idempotency_key=key)
-        if key in keys:
-            info.update(status="duplicate", reason="interval slot already ran")
-            return info
-        if now_epoch >= due_epoch:
-            info.update(status="due", due=True, reason="interval elapsed")
-        else:
-            info.update(status="pending", reason="interval not elapsed")
-        return info
-    if trigger_kind == "cron":
-        matched, error = cron_matches_now(trigger_value, now_epoch)
-        if error:
-            info.update(status="invalid", reason=error)
-            return info
-        due_epoch = int(now_epoch // 60) * 60
-        key = f"{schedule_id}:cron:{time.strftime('%Y%m%d%H%M', time.localtime(due_epoch))}"
-        info.update(due_at_epoch=due_epoch, due_at=time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(due_epoch)), idempotency_key=key)
-        if key in keys:
-            info.update(status="duplicate", reason="cron minute already ran")
-            return info
-        if matched:
-            info.update(status="due", due=True, reason="cron matched current minute")
-        else:
-            info.update(status="pending", reason="cron does not match current minute")
-        return info
-    info.update(status="invalid", reason=f"unsupported trigger: {schedule_record_trigger(row) or '-'}")
-    return info
-
-
-def schedule_trigger_from_control(control: dict[str, Any]) -> str:
-    for key in ("cron", "interval", "trigger", "at"):
-        value = str(control.get(key) or "").strip()
-        if value:
-            return value
-    return ""
-
-
-def schedule_execution_from_control(control: dict[str, Any]) -> dict[str, Any]:
-    raw = control.get("execution") if isinstance(control.get("execution"), dict) else {}
-    mode = str(raw.get("mode") or "").strip().lower().replace("-", "_")
-    if mode == "tui_action":
-        action = str(raw.get("action") or "").strip().lower().replace("-", "_")
-        execution: dict[str, Any] = {"mode": "tui_action", "action": action}
-        message = str(raw.get("message") or "").strip()
-        if message:
-            execution["message"] = message
-        payload = raw.get("payload") if isinstance(raw.get("payload"), dict) else {}
-        if payload:
-            execution["payload"] = tui_query_json_safe(payload)
-        return execution
-    if mode == "agent_task":
-        return {
-            "mode": "agent_task",
-            "routing": raw.get("routing") if isinstance(raw.get("routing"), dict) else {},
-            "work_order": raw.get("work_order") if isinstance(raw.get("work_order"), dict) else {},
-            "capability_contract": raw.get("capability_contract") if isinstance(raw.get("capability_contract"), dict) else {},
-            "context_contract": raw.get("context_contract") if isinstance(raw.get("context_contract"), dict) else {},
-            "output_contract": raw.get("output_contract") if isinstance(raw.get("output_contract"), dict) else {},
-        }
-    return {}
-
-
-def schedule_execution_target(execution: dict[str, Any]) -> str:
-    routing = execution.get("routing") if isinstance(execution.get("routing"), dict) else {}
-    selector = routing.get("target_selector") if isinstance(routing.get("target_selector"), dict) else {}
-    return str(
-        routing.get("selected_agent")
-        or selector.get("agent_id")
-        or selector.get("target")
-        or selector.get("name")
-        or ""
-    ).strip()
-
-
-def schedule_execution_error(execution: dict[str, Any]) -> str:
-    mode = str(execution.get("mode") or "").strip().lower()
-    if mode == "tui_action":
-        action = str(execution.get("action") or "").strip().lower()
-        if action == "beep":
-            return ""
-        return "schedule execution action is unsupported."
-    if mode == "agent_task":
-        work_order = execution.get("work_order") if isinstance(execution.get("work_order"), dict) else {}
-        if not str(work_order.get("objective") or "").strip():
-            return "schedule execution missing work_order.objective."
-        if not schedule_execution_target(execution):
-            return "schedule execution missing routing.selected_agent."
-        return ""
-    return "schedule execution mode is required."
-
-
-def schedule_record_from_control(control: dict[str, Any], *, schedule_id: str, status: str, source: str) -> dict[str, Any]:
-    provider_id = str(control.get("provider_id") or control.get("runtime_provider_id") or "").strip()
-    execution = schedule_execution_from_control(control)
-    target = schedule_execution_target(execution)
-    mode = str(execution.get("mode") or "").strip().lower()
-    dispatch_contract = "tui_action.v1" if mode == "tui_action" else "agenttask.v2"
-    record = {
-        "schema_version": "scheduledtask.v1",
-        "schedule_id": schedule_id,
-        "name": str(control.get("name") or control.get("title") or schedule_id).strip(),
-        "status": status,
-        "trigger": schedule_trigger_from_control(control),
-        "timezone": str(control.get("timezone") or control.get("tz") or "").strip(),
-        "provider_id": provider_id or agent_runtime_registry().to_record()["default_provider_id"],
-        "dispatch_contract": dispatch_contract,
-        "execution": tui_query_json_safe(execution),
-        "target": target,
-        "created_at": str(control.get("created_at") or now_iso()),
-        "updated_at": now_iso(),
-        "source": source,
-    }
-    for key in ("cron", "interval", "at"):
-        value = str(control.get(key) or "").strip()
-        if value:
-            record[key] = value
-    return record
-
-
-def schedule_record_updates_from_control(control: dict[str, Any], *, source: str) -> dict[str, Any]:
-    updates: dict[str, Any] = {"updated_at": now_iso(), "source": source}
-    name = str(control.get("name") or control.get("title") or "").strip()
-    if name:
-        updates["name"] = name
-    status = str(control.get("status") or "").strip()
-    if status:
-        updates["status"] = status
-    if "timezone" in control or "tz" in control:
-        updates["timezone"] = str(control.get("timezone") or control.get("tz") or "").strip()
-    if "provider_id" in control or "runtime_provider_id" in control:
-        provider_id = str(control.get("provider_id") or control.get("runtime_provider_id") or "").strip()
-        if provider_id:
-            updates["provider_id"] = provider_id
-    if schedule_trigger_from_control(control):
-        for key in ("cron", "interval", "at", "trigger"):
-            updates[key] = ""
-        updates["trigger"] = schedule_trigger_from_control(control)
-        for key in ("cron", "interval", "at"):
-            value = str(control.get(key) or "").strip()
-            if value:
-                updates[key] = value
-    if isinstance(control.get("execution"), dict):
-        execution = schedule_execution_from_control(control)
-        mode = str(execution.get("mode") or "").strip().lower()
-        updates["execution"] = tui_query_json_safe(execution)
-        updates["target"] = schedule_execution_target(execution)
-        updates["dispatch_contract"] = "tui_action.v1" if mode == "tui_action" else "agenttask.v2"
-    return updates
-
-
-def apply_schedule_control(state: State, action: str, target: str, value: str, control: dict[str, Any], source: str = "agent") -> Optional[str]:
-    del state, value
-    action = (action or "").strip().lower().replace("-", "_")
-    if action not in {"schedule_create", "schedule_update", "schedule_enable", "schedule_disable", "schedule_delete"}:
-        return None
-    records = latest_schedule_records()
-    if action == "schedule_create":
-        schedule_id = str(control.get("schedule_id") or control.get("id") or short_uid("sched")).strip()
-        trigger = schedule_trigger_from_control(control)
-        if not trigger:
-            return "缺少 schedule 触发器：需要 cron、interval、trigger 或 at。"
-        row = schedule_record_from_control(control, schedule_id=schedule_id, status=str(control.get("status") or "enabled"), source=source)
-        execution_error = schedule_execution_error(row.get("execution") if isinstance(row.get("execution"), dict) else {})
-        if execution_error:
-            return execution_error
-        append_schedule_record(row)
-        return f"已登记定时任务：{row['name']} ({schedule_id}) · {trigger}"
-    schedule_id = str(target or control.get("schedule_id") or control.get("id") or "").strip()
-    if not schedule_id:
-        return "缺少 schedule target。"
-    existing = records.get(schedule_id)
-    if existing is None:
-        return f"找不到定时任务：{schedule_id}"
-    if action == "schedule_update":
-        row = dict(existing)
-        row.update(schedule_record_updates_from_control(control, source=source))
-        row["created_at"] = existing.get("created_at") or row.get("created_at") or now_iso()
-        row["updated_at"] = now_iso()
-        execution_error = schedule_execution_error(row.get("execution") if isinstance(row.get("execution"), dict) else {})
-        if execution_error:
-            return execution_error
-        append_schedule_record(row)
-        return f"已更新定时任务：{row.get('name') or schedule_id}"
-    status = {
-        "schedule_enable": "enabled",
-        "schedule_disable": "disabled",
-        "schedule_delete": "deleted",
-    }[action]
-    row = dict(existing)
-    row["status"] = status
-    row["updated_at"] = now_iso()
-    row["source"] = source
-    append_schedule_record(row)
-    label = {"enabled": "启用", "disabled": "停用", "deleted": "删除"}[status]
-    return f"已{label}定时任务：{row.get('name') or schedule_id}"
-
-
-def schedule_agenttask_control(row: dict[str, Any]) -> dict[str, Any]:
-    execution = row.get("execution") if isinstance(row.get("execution"), dict) else {}
-    work_order = execution.get("work_order") if isinstance(execution.get("work_order"), dict) else {}
-    routing = execution.get("routing") if isinstance(execution.get("routing"), dict) else {}
-    routing = dict(routing)
-    target = str(row.get("target") or "").strip()
-    if target and not routing.get("selected_agent"):
-        routing["selected_agent"] = target
-    return {
-        "schema_version": AGENT_TASK_SCHEMA,
-        "action": "delegate.create",
-        "parent_task_id": str(row.get("parent_task_id") or row.get("task_id") or ""),
-        "routing": routing,
-        "work_order": work_order,
-        "capability_contract": execution.get("capability_contract") if isinstance(execution.get("capability_contract"), dict) else {},
-        "context_contract": execution.get("context_contract") if isinstance(execution.get("context_contract"), dict) else {},
-        "output_contract": execution.get("output_contract") if isinstance(execution.get("output_contract"), dict) else {},
-        "task_title": str(row.get("name") or row.get("title") or row.get("schedule_id") or "Scheduled task"),
-        "schedule_id": str(row.get("schedule_id") or ""),
-        "provider_id": str(row.get("provider_id") or ""),
-    }
-
-
-def update_schedule_last_run(row: dict[str, Any], run: dict[str, Any]) -> None:
-    schedule = dict(row)
-    schedule.pop("scheduler", None)
-    schedule["last_run_id"] = run.get("run_id", "")
-    schedule["last_run_status"] = run.get("status", "")
-    schedule["last_run_at"] = run.get("timestamp") or now_iso()
-    schedule["last_idempotency_key"] = run.get("idempotency_key", "")
-    schedule["updated_at"] = now_iso()
-    append_schedule_record(schedule)
-
-
-def append_schedule_skip_run(row: dict[str, Any], info: dict[str, Any], *, status: str, reason: str) -> dict[str, Any]:
-    schedule_id = str(row.get("schedule_id") or row.get("id") or "").strip()
-    trigger = schedule_record_trigger(row)
-    base_key = info.get("idempotency_key") or f"{schedule_id}:{status}:{hashlib.sha1((trigger + reason).encode('utf-8')).hexdigest()[:16]}"
-    key = f"{base_key}:{status}"
-    if key in schedule_run_idempotency_keys():
-        return {}
-    run = append_schedule_run({
-        "schedule_id": schedule_id,
-        "schedule_name": row.get("name") or schedule_id,
-        "status": status,
-        "reason": reason,
-        "trigger": trigger,
-        "trigger_kind": info.get("trigger_kind", ""),
-        "due_at": info.get("due_at", ""),
-        "idempotency_key": key,
-        "provider_id": row.get("provider_id", ""),
-        "dispatch_contract": row.get("dispatch_contract") or "agenttask.v2",
-    })
-    update_schedule_last_run(row, run)
-    return run
-
 
 def emit_tui_beep() -> str:
     try:
@@ -6387,219 +5863,6 @@ def emit_tui_beep() -> str:
         return f"beep failed: {type(exc).__name__}: {exc}"
 
 
-def dispatch_schedule_tui_action(row: dict[str, Any], started: dict[str, Any]) -> Optional[dict[str, Any]]:
-    execution = row.get("execution") if isinstance(row.get("execution"), dict) else {}
-    if str(execution.get("mode") or "").strip().lower() != "tui_action":
-        return None
-    action_type = str(execution.get("action") or "").strip().lower().replace("-", "_")
-    if action_type == "beep":
-        result = emit_tui_beep()
-        status = "completed" if "failed" not in result.lower() else "failed"
-        finished = dict(started)
-        finished.update({
-            "status": status,
-            "finished_at": now_iso(),
-            "execution": tui_query_json_safe(execution),
-            "result": result,
-        })
-        if status == "failed":
-            finished["error"] = result
-        append_schedule_run(finished)
-        update_schedule_last_run(row, finished)
-        return finished
-    finished = dict(started)
-    finished.update({
-        "status": "failed",
-        "finished_at": now_iso(),
-        "execution": tui_query_json_safe(execution),
-        "error": f"unsupported schedule execution action: {action_type or '-'}",
-    })
-    append_schedule_run(finished)
-    update_schedule_last_run(row, finished)
-    return finished
-
-
-def dispatch_schedule_run(state: State, row: dict[str, Any], info: dict[str, Any], *, source: str = "scheduler") -> dict[str, Any]:
-    schedule_id = str(row.get("schedule_id") or row.get("id") or "").strip()
-    idempotency_key = str(info.get("idempotency_key") or "").strip()
-    if not schedule_id:
-        return append_schedule_run({"status": "failed", "reason": "missing schedule_id", "idempotency_key": idempotency_key})
-    if idempotency_key and idempotency_key in schedule_run_idempotency_keys():
-        return append_schedule_skip_run(row, info, status="duplicate", reason="idempotency key already exists")
-    run_id = short_uid("schedrun")
-    started = append_schedule_run({
-        "run_id": run_id,
-        "schedule_id": schedule_id,
-        "schedule_name": row.get("name") or schedule_id,
-        "status": "starting",
-        "reason": info.get("reason", ""),
-        "trigger": schedule_record_trigger(row),
-        "trigger_kind": info.get("trigger_kind", ""),
-        "due_at": info.get("due_at", ""),
-        "idempotency_key": idempotency_key,
-        "provider_id": row.get("provider_id", ""),
-        "dispatch_contract": row.get("dispatch_contract") or "agenttask.v2",
-        "source": source,
-    })
-    tui_action_run = dispatch_schedule_tui_action(row, started)
-    if tui_action_run is not None:
-        return tui_action_run
-    execution = row.get("execution") if isinstance(row.get("execution"), dict) else {}
-    execution_error = schedule_execution_error(execution)
-    if execution_error:
-        finished = dict(started)
-        finished.update({"status": "failed", "finished_at": now_iso(), "error": execution_error})
-        append_schedule_run(finished)
-        update_schedule_last_run(row, finished)
-        return finished
-    control = schedule_agenttask_control(row)
-    work_order = control.get("work_order") if isinstance(control.get("work_order"), dict) else {}
-    if not str(work_order.get("objective") or "").strip():
-        finished = dict(started)
-        finished.update({"status": "failed", "finished_at": now_iso(), "error": "missing work_order.objective"})
-        append_schedule_run(finished)
-        update_schedule_last_run(row, finished)
-        return finished
-    mapped = execution_control_from_v2(control)
-    if not mapped:
-        finished = dict(started)
-        finished.update({"status": "failed", "finished_at": now_iso(), "error": "could not map schedule to agenttask.v2 delegate.create"})
-        append_schedule_run(finished)
-        update_schedule_last_run(row, finished)
-        return finished
-    target = str(mapped.get("target") or "").strip()
-    if not target:
-        finished = dict(started)
-        finished.update({"status": "failed", "finished_at": now_iso(), "error": "missing routing.selected_agent or schedule target"})
-        append_schedule_run(finished)
-        update_schedule_last_run(row, finished)
-        return finished
-    sub = resolve_subagent(state, target)
-    if sub is None:
-        finished = dict(started)
-        finished.update({"status": "failed", "finished_at": now_iso(), "target": target, "error": f"subagent not found: {target}"})
-        append_schedule_run(finished)
-        update_schedule_last_run(row, finished)
-        return finished
-    try:
-        dispatch = start_subagent_task_structured(
-            state,
-            sub,
-            str(mapped.get("prompt") or ""),
-            source=f"{source}:{schedule_id}",
-            parent_task_id=str(mapped.get("parent_task_id") or ""),
-            task_title=str(mapped.get("task_title") or row.get("name") or schedule_id),
-        )
-    except Exception as exc:
-        dispatch = SubagentDispatchResult(status="failed", message=f"{type(exc).__name__}: {exc}", error=f"{type(exc).__name__}: {exc}")
-    finished = dict(started)
-    finished.update({
-        "status": dispatch.status,
-        "finished_at": now_iso(),
-        "target": sub.agent_id,
-        "target_name": sub.name,
-        "result": dispatch.message,
-        "task_id": dispatch.task_id,
-    })
-    if dispatch.approval_id:
-        finished["approval_id"] = dispatch.approval_id
-    if dispatch.status in {"failed", "rejected"}:
-        finished["error"] = dispatch.error or dispatch.message
-    append_schedule_run(finished)
-    update_schedule_last_run(row, finished)
-    return finished
-
-
-def scheduler_tick(
-    state: State,
-    *,
-    now_epoch: Optional[float] = None,
-    source: str = "scheduler",
-    target_schedule_id: str = "",
-    force: bool = False,
-    record_skips: bool = False,
-) -> dict[str, Any]:
-    now_epoch = time.time() if now_epoch is None else float(now_epoch)
-    records = latest_schedule_records()
-    last_runs = latest_schedule_attempt_runs_by_schedule_id()
-    seen_keys = schedule_run_idempotency_keys()
-    result = {
-        "schema_version": "scheduledtask.tick.v1",
-        "timestamp": now_iso(),
-        "source": source,
-        "checked": 0,
-        "due": 0,
-        "dispatched": 0,
-        "failed": 0,
-        "skipped": 0,
-        "invalid": 0,
-        "duplicates": 0,
-        "runs": [],
-    }
-    for schedule_id, row in sorted(records.items(), key=lambda item: str(item[1].get("updated_at") or item[1].get("created_at") or "")):
-        if target_schedule_id and schedule_id != target_schedule_id:
-            continue
-        result["checked"] += 1
-        info = schedule_due_info(row, now_epoch=now_epoch, last_run=last_runs.get(schedule_id), seen_keys=seen_keys)
-        if force and schedule_active(row):
-            info.update(
-                status="due",
-                due=True,
-                reason="manual scheduler run",
-                due_at_epoch=now_epoch,
-                due_at=time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(now_epoch)),
-                idempotency_key=f"{schedule_id}:manual:{int(now_epoch)}:{time.time_ns()}",
-            )
-        status = str(info.get("status") or "")
-        if info.get("due"):
-            result["due"] += 1
-            run = dispatch_schedule_run(state, row, info, source=source)
-            if run:
-                result["runs"].append(run)
-                seen_keys.add(str(run.get("idempotency_key") or ""))
-            if str(run.get("status") or "") in {"failed", "rejected"}:
-                result["failed"] += 1
-            else:
-                result["dispatched"] += 1
-            continue
-        if status == "invalid":
-            result["invalid"] += 1
-            trigger_hash = hashlib.sha1(schedule_record_trigger(row).encode("utf-8")).hexdigest()[:16]
-            invalid_key = f"{schedule_id}:invalid:{trigger_hash}"
-            if invalid_key not in seen_keys:
-                run = append_schedule_skip_run(row, {**info, "idempotency_key": invalid_key}, status="invalid", reason=str(info.get("reason") or "invalid schedule"))
-                if run:
-                    result["runs"].append(run)
-                    seen_keys.add(str(run.get("idempotency_key") or ""))
-            continue
-        if status == "duplicate":
-            result["duplicates"] += 1
-            if record_skips:
-                run = append_schedule_skip_run(row, info, status="duplicate", reason=str(info.get("reason") or "duplicate schedule slot"))
-                if run:
-                    result["runs"].append(run)
-            continue
-        result["skipped"] += 1
-        if record_skips and (target_schedule_id or force):
-            run = append_schedule_skip_run(row, info, status="skipped", reason=str(info.get("reason") or status or "not due"))
-            if run:
-                result["runs"].append(run)
-    return result
-
-
-def format_scheduler_tick_result(result: dict[str, Any]) -> str:
-    lines = [
-        "Scheduler",
-        f"checked: {result.get('checked', 0)} · due: {result.get('due', 0)} · dispatched: {result.get('dispatched', 0)} · failed: {result.get('failed', 0)}",
-        f"skipped: {result.get('skipped', 0)} · invalid: {result.get('invalid', 0)} · duplicate: {result.get('duplicates', 0)}",
-    ]
-    for run in (result.get("runs") or [])[-12:]:
-        lines.append(
-            f"- {run.get('schedule_id') or '-'} · {run.get('status') or '-'} · "
-            f"{truncate_cells(str(run.get('result') or run.get('error') or run.get('reason') or ''), 180)}"
-        )
-    return "\n".join(lines).rstrip()
-
 
 def format_runtime_registry(data: dict[str, Any]) -> str:
     lines = [
@@ -6615,35 +5878,6 @@ def format_runtime_registry(data: dict[str, Any]) -> str:
         lines.append(f"  models: {(provider.get('model_routing') or {}).get('selection_contract', '-')}")
         lines.append(f"  scheduler: {(provider.get('scheduler') or {}).get('dispatch_contract', '-')}")
         lines.append(f"  capabilities: {truncate_cells(enabled, 180) if enabled else '-'}")
-    return "\n".join(lines).rstrip()
-
-
-def format_scheduled_task_registry(data: dict[str, Any]) -> str:
-    lines = [
-        "Scheduled Tasks",
-        f"status: {data.get('status')}",
-        f"jobs: {data.get('active_job_count', 0)} active / {data.get('job_count', 0)} total",
-        f"store: {data.get('schedules_path') or AGENT_SCHEDULES_PATH}",
-        f"runs: {data.get('run_count', 0)} · {data.get('runs_path') or AGENT_SCHEDULE_RUNS_PATH}",
-        f"dispatch: {(data.get('dispatch') or {}).get('contract', '-')}",
-        "",
-    ]
-    jobs = data.get("jobs") or []
-    if not jobs:
-        lines.append("No scheduled jobs registered yet. Future jobs should dispatch via agenttask.v2 and audit each run into the task ledger.")
-    for row in jobs[-20:]:
-        scheduler = row.get("scheduler") if isinstance(row.get("scheduler"), dict) else {}
-        work_order = row.get("work_order") if isinstance(row.get("work_order"), dict) else {}
-        last_run = scheduler.get("last_run") if isinstance(scheduler.get("last_run"), dict) else {}
-        objective = str(work_order.get("objective") or row.get("objective") or row.get("task") or "")
-        run_suffix = f" · last:{last_run.get('status')}" if last_run else ""
-        due_suffix = f" · {scheduler.get('status') or '-'}"
-        if scheduler.get("due_at"):
-            due_suffix += f" @{scheduler.get('due_at')}"
-        lines.append(
-            f"- {row.get('schedule_id') or row.get('id') or '-'} · {row.get('status', 'enabled')} · "
-            f"{schedule_record_trigger(row) or '-'}{due_suffix}{run_suffix} · {truncate_cells(objective, 140)}"
-        )
     return "\n".join(lines).rstrip()
 
 
@@ -19773,6 +19007,56 @@ def start_subagent_task_structured(
     if len(sub.task_queue) > before_queue_len:
         return SubagentDispatchResult(status="queued", message=message)
     return SubagentDispatchResult(status="failed", message=message, error=message)
+
+
+def _scheduler_default_provider_id() -> str:
+    return str(agent_runtime_registry().to_record().get("default_provider_id") or "genericagent")
+
+
+def _scheduler_emit_tui_beep() -> str:
+    return emit_tui_beep()
+
+
+def _scheduler_dispatch_subagent_task(
+    state: State,
+    sub: SubAgentRuntime,
+    mapped: dict[str, Any],
+    source: str,
+    schedule_id: str,
+    row: dict[str, Any],
+) -> SchedulerDispatchResult:
+    dispatch = start_subagent_task_structured(
+        state,
+        sub,
+        str(mapped.get("prompt") or ""),
+        source=f"{source}:{schedule_id}",
+        parent_task_id=str(mapped.get("parent_task_id") or ""),
+        task_title=str(mapped.get("task_title") or row.get("name") or schedule_id),
+    )
+    return SchedulerDispatchResult(
+        status=dispatch.status,
+        message=dispatch.message,
+        task_id=dispatch.task_id,
+        approval_id=dispatch.approval_id,
+        error=dispatch.error,
+    )
+
+
+configure_scheduler_runtime(
+    schedules_path=AGENT_SCHEDULES_PATH,
+    runs_path=AGENT_SCHEDULE_RUNS_PATH,
+    task_ledger_path=AGENT_TASK_LEDGER_PATH,
+    agent_mail_path=AGENT_MAIL_PATH,
+    read_jsonl=read_jsonl,
+    append_jsonl=append_jsonl,
+    now_iso=now_iso,
+    json_safe=tui_query_json_safe,
+    default_provider_id=_scheduler_default_provider_id,
+    truncate_cells=truncate_cells,
+    emit_tui_beep=_scheduler_emit_tui_beep,
+    resolve_subagent=resolve_subagent,
+    dispatch_subagent_task=_scheduler_dispatch_subagent_task,
+)
 
 
 def maybe_start_next_subagent_task(state: State, sub: SubAgentRuntime) -> Optional[str]:

@@ -342,6 +342,8 @@ agent.create includes continue_after:true -> Agent 控制结果 shows success ->
 
 - Schedule registry path: `AGENT_SCHEDULES_PATH`, JSONL rows with `schema_version:"scheduledtask.v1"`.
 - Schedule run audit path: `AGENT_SCHEDULE_RUNS_PATH`, JSONL rows with `schema_version:"scheduledtask.run.v1"`.
+- Implementation module: `src/ga_tui/scheduler.py` owns schedule registry helpers, trigger parsing, due calculation, run audit shaping, tick aggregation, and scheduler text formatting.
+- Composition module: `src/ga_tui/app.py` may re-export scheduler helpers for compatibility, but it supplies mutable TUI dependencies through `configure_scheduler_runtime()` instead of being imported by `scheduler.py`.
 - TUI commands:
   - `/schedules` shows registry, due state, run count, and last-run state.
   - `/scheduler status` shows scheduler state.
@@ -365,6 +367,9 @@ agent.create includes continue_after:true -> Agent 控制结果 shows success ->
 - Due calculation for interval schedules must use the latest real dispatch attempt (`starting`, `dispatched`, `queued`, `approval_required`, `failed`, or `rejected`) as its anchor. Observation-only rows such as `duplicate`, `skipped`, and `invalid` may be displayed as the latest run, but must not move the next interval due time.
 - Disabled, deleted, cancelled, and canceled schedules are not dispatched.
 - Schedule execution must enter `start_subagent_task()` so policy gates, single-writer locks, task ledger, agent mail, checkpoints, traces, and artifacts remain active.
+- `src/ga_tui/scheduler.py` must not import curses, GenericAgent runtime classes, `StepOutcome`, mutable TUI `State`, or `ga_tui.app`.
+- App-layer dependencies required by scheduler execution must be injected through scheduler runtime configuration: JSONL readers/writers, paths, `now_iso`, JSON-safe conversion, default provider lookup, text truncation, TUI beep callback, subagent resolver, and structured subagent dispatch callback.
+- TUI beep emission stays in `app.py` or another UI composition layer; scheduler dispatch calls it through an injected callback so the scheduler module remains UI-free.
 
 ### 4. Validation & Error Matrix
 
@@ -408,6 +413,8 @@ agent.create includes continue_after:true -> Agent 控制结果 shows success ->
 - Tests must assert the control hint tells the main model to translate natural user intent into new `cron` / `interval` / `at` fields.
 - Tests must assert disabled schedules skip and invalid schedules write audit records without dispatching.
 - Tests must assert MCP/gateway registries include both schedule registry and schedule-run audit paths.
+- Tests must assert `app.py` re-exports key scheduler helpers from `ga_tui.scheduler` and that `src/ga_tui/scheduler.py` does not import curses, GenericAgent runtime classes, `StepOutcome`, mutable TUI `State`, or `ga_tui.app`.
+- Tests that retarget harness paths must reconfigure scheduler runtime paths in the same step, otherwise scheduler JSONL helpers can silently write to the previous harness directory.
 - `python3 -m py_compile src/ga_tui/app.py src/ga_tui/runtime.py scripts/check_policy_gates.py`, `python3 scripts/check_policy_gates.py`, `python3 -m compileall -q src scripts`, `git diff --check`, and `ga-tui-check --root /home/vimalinx/Programs/GenericAgent` must pass.
 
 ### 7. Wrong vs Correct

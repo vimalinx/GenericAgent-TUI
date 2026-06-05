@@ -22,6 +22,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from ga_tui import app as a  # noqa: E402
 from ga_tui import control_protocol as cp  # noqa: E402
+from ga_tui import scheduler as sched  # noqa: E402
 
 
 def retarget_harness(root: str) -> None:
@@ -70,6 +71,30 @@ def retarget_harness(root: str) -> None:
     os.makedirs(a.AGENT_HARNESS_DIR, exist_ok=True)
     os.makedirs(a.SUBAGENTS_DIR, exist_ok=True)
     os.makedirs(a.TEMP_SUBAGENTS_DIR, exist_ok=True)
+    a.configure_scheduler_runtime(
+        schedules_path=a.AGENT_SCHEDULES_PATH,
+        runs_path=a.AGENT_SCHEDULE_RUNS_PATH,
+        task_ledger_path=a.AGENT_TASK_LEDGER_PATH,
+        agent_mail_path=a.AGENT_MAIL_PATH,
+        read_jsonl=a.read_jsonl,
+        append_jsonl=a.append_jsonl,
+        now_iso=a.now_iso,
+        json_safe=a.tui_query_json_safe,
+        default_provider_id=lambda: str(a.agent_runtime_registry().to_record().get("default_provider_id") or "genericagent"),
+        truncate_cells=a.truncate_cells,
+        emit_tui_beep=lambda: a.emit_tui_beep(),
+        resolve_subagent=a.resolve_subagent,
+        dispatch_subagent_task=lambda state, sub, mapped, source, schedule_id, row: sched.SchedulerDispatchResult(
+            **a.start_subagent_task_structured(
+                state,
+                sub,
+                str(mapped.get("prompt") or ""),
+                source=f"{source}:{schedule_id}",
+                parent_task_id=str(mapped.get("parent_task_id") or ""),
+                task_title=str(mapped.get("task_title") or row.get("name") or schedule_id),
+            ).__dict__
+        ),
+    )
 
 
 class FakeAgent:
@@ -119,6 +144,60 @@ class SequencedFakeAgent:
 
 class ContextFakeAgent:
     log_path = ""
+
+
+def assert_scheduler_module_boundary() -> None:
+    scheduler_names = (
+        "scheduled_task_registry",
+        "latest_schedule_records",
+        "append_schedule_record",
+        "latest_schedule_run_records",
+        "latest_schedule_runs_by_schedule_id",
+        "latest_schedule_attempt_runs_by_schedule_id",
+        "schedule_run_idempotency_keys",
+        "append_schedule_run",
+        "schedule_record_trigger",
+        "parse_schedule_timestamp",
+        "parse_schedule_interval_seconds",
+        "split_schedule_trigger",
+        "cron_field_matches",
+        "cron_matches_now",
+        "schedule_active",
+        "schedule_due_info",
+        "schedule_trigger_from_control",
+        "schedule_execution_from_control",
+        "schedule_execution_target",
+        "schedule_execution_error",
+        "schedule_record_from_control",
+        "schedule_record_updates_from_control",
+        "apply_schedule_control",
+        "schedule_agenttask_control",
+        "update_schedule_last_run",
+        "append_schedule_skip_run",
+        "dispatch_schedule_tui_action",
+        "dispatch_schedule_run",
+        "scheduler_tick",
+        "format_scheduler_tick_result",
+        "format_scheduled_task_registry",
+    )
+    for name in scheduler_names:
+        assert getattr(a, name) is getattr(sched, name), name
+        assert getattr(sched, name).__module__ == "ga_tui.scheduler", name
+    assert a.SCHEDULER_TICK_SECONDS == sched.SCHEDULER_TICK_SECONDS
+    assert a.SCHEDULE_RUN_ATTEMPT_STATUSES is sched.SCHEDULE_RUN_ATTEMPT_STATUSES
+    source = Path(sched.__file__).read_text(encoding="utf-8")
+    for forbidden in (
+        "import curses",
+        "from curses",
+        "ga_tui.app",
+        "from .app",
+        "import app",
+        "GenericAgent",
+        "GenericAgentHandler",
+        "StepOutcome",
+        "State",
+    ):
+        assert forbidden not in source, forbidden
 
 
 def ga_control(*actions: dict) -> str:
@@ -2195,6 +2274,7 @@ def assert_temp_session_is_non_persistent() -> None:
 
 
 def run_checks() -> None:
+    assert_scheduler_module_boundary()
     assert_top_bar_header_requested_fields()
     assert_long_secret_render_reuses_stable_message_blocks()
     assert_secret_native_restore_hydrates_backend_context_blocks()
