@@ -170,3 +170,36 @@ Moved current ga-control.v2 and agenttask.v2 parsing/coercion helpers from app.p
 ### Next Steps
 
 - None - task complete
+
+
+## Session 6: Extract scheduler module
+
+**Date**: 2026-06-05
+**Task**: Extract scheduler module
+**Branch**: `main`
+
+### Summary
+
+Extracted TUI scheduler helpers into src/ga_tui/scheduler.py, kept app.py as the runtime composition layer, added scheduler module boundary regression checks, updated the agent-control protocol spec, and verified py_compile, compileall, policy gates, diff check, and ga-tui-check.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `8421811` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
