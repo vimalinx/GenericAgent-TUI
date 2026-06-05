@@ -22,6 +22,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from ga_tui import app as a  # noqa: E402
 from ga_tui import control_protocol as cp  # noqa: E402
+from ga_tui import genericagent_provider as gap  # noqa: E402
 from ga_tui import scheduler as sched  # noqa: E402
 
 
@@ -198,6 +199,67 @@ def assert_scheduler_module_boundary() -> None:
         "State",
     ):
         assert forbidden not in source, forbidden
+
+
+def assert_genericagent_provider_module_boundary() -> None:
+    provider_names = (
+        "TUI_AGENT_CONTROL_HINT",
+        "TUI_CONTROL_HINT_MARKER",
+        "LEGACY_TUI_CONTROL_HINT_BLOCK_RE",
+        "TUI_QUERY_TOOL_SCHEMAS",
+        "TUI_SCHEDULE_TOOL_SCHEMAS",
+        "TUI_TOOL_SCHEMAS",
+        "TUI_QUERY_TOOL_NAMES",
+        "TUI_SCHEDULE_TOOL_NAMES",
+        "TUI_TOOL_NAMES",
+        "configure_genericagent_provider_runtime",
+        "genericagent_provider_config",
+        "install_tui_query_tool_schema",
+        "wrap_agentmain_tool_schema_loader",
+        "tui_query_state_for_handler",
+        "tui_query_tool_outcome",
+        "install_tui_query_handler_methods",
+        "install_tui_query_runtime",
+        "install_tui_control_hint",
+        "GenericAgentRuntimeAdapter",
+    )
+    for name in provider_names:
+        assert getattr(a, name) is getattr(gap, name), name
+    for name in (
+        "install_tui_query_tool_schema",
+        "wrap_agentmain_tool_schema_loader",
+        "tui_query_state_for_handler",
+        "tui_query_tool_outcome",
+        "install_tui_query_handler_methods",
+        "install_tui_query_runtime",
+        "install_tui_control_hint",
+    ):
+        assert getattr(gap, name).__module__ == "ga_tui.genericagent_provider", name
+    assert gap.GenericAgentRuntimeAdapter.__module__ == "ga_tui.genericagent_provider"
+    provider_source = Path(gap.__file__).read_text(encoding="utf-8")
+    for forbidden in (
+        "import curses",
+        "from curses",
+        "ga_tui.app",
+        "from .app",
+        "import app",
+        "from app import State",
+        "from .app import State",
+    ):
+        assert forbidden not in provider_source, forbidden
+    app_source = Path(a.__file__).read_text(encoding="utf-8")
+    for forbidden in (
+        "def install_tui_query_tool_schema",
+        "def wrap_agentmain_tool_schema_loader",
+        "def tui_query_state_for_handler",
+        "def tui_query_tool_outcome",
+        "def install_tui_query_handler_methods",
+        "def install_tui_query_runtime",
+        "def install_tui_control_hint",
+        "class GenericAgentRuntimeAdapter",
+    ):
+        assert forbidden not in app_source, forbidden
+    assert "configure_genericagent_provider_runtime(" in app_source
 
 
 def ga_control(*actions: dict) -> str:
@@ -2275,6 +2337,7 @@ def assert_temp_session_is_non_persistent() -> None:
 
 def run_checks() -> None:
     assert_scheduler_module_boundary()
+    assert_genericagent_provider_module_boundary()
     assert_top_bar_header_requested_fields()
     assert_long_secret_render_reuses_stable_message_blocks()
     assert_secret_native_restore_hydrates_backend_context_blocks()

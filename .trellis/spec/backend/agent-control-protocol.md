@@ -218,6 +218,81 @@ If the recommendation is reuse_existing, emit delegate.create targeting that age
 If the recommendation is create_new and the user asked for execution, create a bounded agent and delegate with full agenttask.v2 contracts.
 ```
 
+## Scenario: GenericAgent Provider Adapter Boundary
+
+### 1. Scope / Trigger
+
+- Trigger: GenericAgent-specific runtime integration code is needed for tool schema injection, `GenericAgentHandler` method patching, TUI state binding, control-hint installation, or agent lifecycle startup.
+- Applies to: `src/ga_tui/genericagent_provider.py`, compatibility re-exports from `src/ga_tui/app.py`, runtime provider registration, model switching, subagent runtime preparation, query tools, and schedule tools.
+- Non-goal: The provider module must not own TUI state mutation, curses rendering, ledgers, scheduler registries, Secret Vault storage, or subagent query implementation details.
+
+### 2. Signatures
+
+- Provider module: `src/ga_tui/genericagent_provider.py`.
+- Runtime configuration entrypoint: `configure_genericagent_provider_runtime(agentmain, generic_agent_cls, step_outcome_cls, is_state, tool_handlers, thread_factory=...)`.
+- Compatibility re-exports from `app.py`: `TUI_AGENT_CONTROL_HINT`, `TUI_QUERY_TOOL_SCHEMAS`, `TUI_SCHEDULE_TOOL_SCHEMAS`, `install_tui_query_runtime()`, `install_tui_control_hint()`, and `GenericAgentRuntimeAdapter`.
+- Handler methods installed on `agentmain.GenericAgentHandler`: `do_agent_list`, `do_agent_get`, `do_agent_match`, `do_task_list`, `do_task_get`, `do_approval_list`, `do_artifact_list`, `do_capability_list`, `do_schedule_create`, and `do_schedule_list`.
+
+### 3. Contracts
+
+- `genericagent_provider.py` owns the active GenericAgent-facing control hint, query tool schemas, schedule tool schemas, tool schema injection, `agentmain.load_tool_schema()` wrapping, `GenericAgentHandler` patching, `_ga_tui_state` binding, `install_tui_control_hint()`, and `GenericAgentRuntimeAdapter`.
+- `app.py` may re-export provider names for compatibility, but must not locally redefine the moved installers, handler patch functions, control-hint installer, or `GenericAgentRuntimeAdapter`.
+- The provider module must not import `ga_tui.app`, curses, or mutable TUI `State`. App-layer behavior is injected through `configure_genericagent_provider_runtime()`.
+- Tool handlers remain app-layer callbacks because they read TUI state, subagent registries, ledgers, approvals, artifacts, Secret Vault state, gateway capabilities, and scheduler registries.
+- Repeated `install_tui_query_runtime()` calls must append each query/schedule schema at most once and must not add duplicate handler side effects.
+- A GenericAgent tool schema reload must re-append TUI tool schemas exactly once.
+- Handler methods must return the configured `StepOutcome` class with `next_prompt:"\n"`.
+- `GenericAgentRuntimeAdapter.create_agent()` creates the configured GenericAgent class, installs the tool runtime, and sets `inc_out:true`; `prepare_agent()` installs tools and the current control hint; `start_agent()` starts `agent.run()` in a daemon thread.
+
+### 4. Validation & Error Matrix
+
+- Provider module imported before configuration -> runtime installation and adapter creation fail explicitly with a configuration error.
+- Missing bound TUI state on a handler call -> injected app-layer tool callback returns the standard TUI tool/query error response.
+- Unknown tool kind -> provider returns a JSON-safe `ga-tui.query.v1` error response instead of mutating state.
+- Repeated provider configuration -> subsequent handler calls use the latest injected callback map because handler methods dispatch through provider runtime state.
+- Provider source imports `ga_tui.app`, curses, or TUI `State` -> boundary violation.
+- `app.py` locally defines moved GenericAgent glue after the extraction -> boundary violation.
+
+### 5. Good/Base/Bad Cases
+
+- Good: `app.py` configures the provider with `agentmain`, `GenericAgent`, `StepOutcome`, `isinstance(value, State)`, and a map of `tui_tool_*` callbacks; the provider installs schemas and handler methods.
+- Good: Model switching calls the provider's compatibility re-exported `install_tui_query_runtime()` and `install_tui_control_hint()` after selecting the backend model.
+- Base: A future runtime provider adds its own adapter without importing curses or TUI state classes.
+- Bad: `app.py` defines a second local `GenericAgentRuntimeAdapter` or local `do_agent_list` patch method.
+- Bad: `genericagent_provider.py` imports `ga_tui.app` to call `tui_tool_agent_list()` directly, creating a reverse dependency from provider to composition.
+
+### 6. Tests Required
+
+- `scripts/check_policy_gates.py` must assert app compatibility re-exports are identical to `ga_tui.genericagent_provider` names.
+- Tests must assert moved functions and `GenericAgentRuntimeAdapter` have `__module__ == "ga_tui.genericagent_provider"`.
+- Tests must assert `genericagent_provider.py` has no reverse import into `app.py` and no curses import.
+- Tests must assert `app.py` no longer locally defines the moved GenericAgent glue functions or adapter class.
+- Tests must preserve query/schedule schema idempotency, handler method presence, `StepOutcome(next_prompt:"\n")`, state-bound tool dispatch, and control-hint de-duplication checks.
+- `python3 -m py_compile src/ga_tui/app.py src/ga_tui/genericagent_provider.py scripts/check_policy_gates.py`, `python3 scripts/check_policy_gates.py`, `python3 -m compileall -q src scripts`, `git diff --check`, and `ga-tui-check --root /home/vimalinx/Programs/GenericAgent` must pass.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```python
+# app.py
+def install_tui_query_handler_methods():
+    setattr(agentmain.GenericAgentHandler, "do_agent_list", ...)
+```
+
+#### Correct
+
+```python
+# app.py
+configure_genericagent_provider_runtime(
+    agentmain=agentmain,
+    generic_agent_cls=GenericAgent,
+    step_outcome_cls=StepOutcome,
+    is_state=lambda value: isinstance(value, State),
+    tool_handlers={"agent_list": tui_tool_agent_list},
+)
+```
+
 ## Scenario: TUI Governed Schedule Tools
 
 ### 1. Scope / Trigger
