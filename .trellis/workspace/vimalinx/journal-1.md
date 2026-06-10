@@ -269,3 +269,36 @@ Merged model command surfaces into a single visible /model command, kept /llm an
 ### Next Steps
 
 - None - task complete
+
+
+## Session 9: Group model panel by provider
+
+**Date**: 2026-06-10
+**Task**: Group model panel by provider
+**Branch**: `main`
+
+### Summary
+
+Changed the /model panel from broad protocol tabs to concrete provider tabs, using provider template apibase/name matching plus stable custom endpoint fallback; added common provider tabs, updated command contract spec, and expanded policy-gate coverage.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `7175942` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
