@@ -143,6 +143,79 @@
 }
 ```
 
+## Scenario: Unified Model Command Surface
+
+### 1. Scope / Trigger
+
+- Trigger: The TUI model command surface must expose one visible command while preserving compatibility for older muscle-memory commands.
+- Applies to: command help, command completion, direct command execution, model-manager rendering, model config persistence, model probing, model health checks, current-session switching, and default-model selection.
+- Non-goal: This does not change `mykey.py` storage shape, provider API probing endpoints, or GenericAgent runtime model semantics.
+
+### 2. Signatures
+
+- Visible TUI command: `/model`
+- Hidden compatible execution aliases: `/llm`, `/models`
+- Main entrypoint: `open_model_manager(stdscr, state, manage_configs=True)`
+- Rendering entrypoint: `draw_model_manager(..., active_category="<provider-category>")`
+- Category helpers: `model_entry_category(entry)`, `model_entry_categories(entries)`, `model_entry_indices_for_category(entries, category)`
+
+### 3. Contracts
+
+- `COMMANDS` must include `/model` exactly once for the model surface.
+- `COMMANDS` must not include `/llm` or `/models`; hidden aliases execute only through explicit command handling.
+- `command_matches("/mo", state)` may return `/model`; `command_matches("/ll", state)` and `command_matches("/models", state)` must return no model alias rows.
+- `/model`, `/llm`, and `/models` all open the unified model manager with config-management actions enabled.
+- The unified manager must keep current-session switching, default selection, recent-model jumping, add/edit/delete, model extraction, single-model test, batch health check, and reload actions.
+- Model rows are grouped by provider category tabs. Current categories are `Anthropic`, `OpenAI`, and `Other`; empty config lists may derive tabs from provider templates.
+- Generated `mykey.py` comments and user-facing empty-state errors must point users to `/model`, not `/llm`.
+
+### 4. Validation & Error Matrix
+
+- User types `/llm` or `/models` -> open unified `/model` manager as a hidden compatibility alias.
+- User requests command completion for `/ll` or `/models` -> do not show hidden aliases.
+- No configured models -> `/model` manager displays an empty-state message that says to add a provider/API with `/model`.
+- Selected row belongs to a different active tab after reload/edit/delete -> normalize selection to the first visible row in the active category.
+- Active tab has no visible rows -> display a no-models-in-category message and keep navigation safe.
+- Runtime cannot find a named model -> error tells the user to reload from `/model`.
+
+### 5. Good/Base/Bad Cases
+
+- Good: `/model` opens one panel where the user can switch the current dialogue model, set the default, add a provider, extract provider models, test a model, and batch validate all models.
+- Base: `/llm` and `/models` still work for users who type them directly, but they are absent from `/help`, README command tables, and command completion.
+- Bad: `/llm` appears as a normal command row, because that splits the visible command ontology again.
+- Bad: `/model` opens a switch-only panel that cannot add/edit/delete or probe provider models.
+
+### 6. Tests Required
+
+- `scripts/check_policy_gates.py` must assert `/model` is present in `COMMANDS` and `/llm` / `/models` are absent.
+- `scripts/check_policy_gates.py` must assert `/mo` completes to `/model` and hidden aliases do not complete.
+- `scripts/check_policy_gates.py` must assert `/llm`, `/model`, and `/models` help text describes the unified manager and compatibility aliases.
+- `scripts/check_policy_gates.py` must assert model category helpers classify Anthropic and OpenAI entries and return category-filtered row indices.
+- README command tables must document `/model` as the single visible model command.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```python
+COMMANDS = [
+    ("/llm", "", "manage model configs", True),
+    ("/model", "", "switch current model", True),
+    ("/models", "", "alias for /model", True),
+]
+```
+
+#### Correct
+
+```python
+COMMANDS = [
+    ("/model", "", "manage/switch/extract/test/default", True),
+]
+
+if text.strip().lower() in {"/llm", "/models", "/model"}:
+    open_model_manager(stdscr, state, manage_configs=True)
+```
+
 ## Scenario: TUI Read-Only Query Tools
 
 ### 1. Scope / Trigger

@@ -286,9 +286,7 @@ ga-tui-integration install-core-shim --root /path/to/GenericAgent --target tuiap
 ### 模型
 
 ```text
-/llm                 管理模型配置、提取模型、验活、设置默认
-/model               切换当前对话模型
-/models              /model 的别名
+/model               管理模型配置、切换当前对话模型、提取模型、验活、设置默认
 ```
 
 ### 子 Agent

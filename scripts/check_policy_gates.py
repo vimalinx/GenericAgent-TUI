@@ -2460,12 +2460,47 @@ def run_checks() -> None:
         assert [entry.cfg["model"] for entry in added_models] == ["model-gamma"], added_models
     finally:
         a.probe_models_for_config = old_probe_models
+    claude_entry = a.LLMConfigEntry("native_claude_config", "native_claude", {"name": "claude", "apikey": "k", "apibase": "https://claude.invalid", "model": "claude-sonnet"})
+    mixed_entries = [llm_entries[0], claude_entry, llm_entries[1]]
+    assert a.model_entry_category(llm_entries[0]) == "OpenAI"
+    assert a.model_entry_category(claude_entry) == "Anthropic"
+    assert a.model_entry_categories(mixed_entries) == ["Anthropic", "OpenAI"]
+    assert a.model_entry_indices_for_category(mixed_entries, "OpenAI") == [0, 2]
+    assert a.model_entry_indices_for_category(mixed_entries, "Anthropic") == [1]
+    visible_commands = [cmd for cmd, _args, _desc, _sendable in a.COMMANDS]
+    assert "/model" in visible_commands
+    assert "/llm" not in visible_commands
+    assert "/models" not in visible_commands
+    assert [cmd for cmd, _args, _desc, _sendable in a.command_matches("/mo", state)] == ["/model"]
+    assert a.command_matches("/ll", state) == []
+    assert a.command_matches("/models", state) == []
     help_state = a.State(agent=ContextFakeAgent())
     a.submit(help_state, "/LlM")
     assert "管理模型配置" in help_state.messages[-1].content
+    assert "/model" in help_state.messages[-1].content
+    assert "兼容别名" in help_state.messages[-1].content
     a.submit(help_state, "/MODEL")
-    assert "当前对话模型" in help_state.messages[-1].content
+    assert "Provider" in help_state.messages[-1].content
     assert "默认新对话模型" in help_state.messages[-1].content
+    a.submit(help_state, "/models")
+    assert "兼容别名" in help_state.messages[-1].content
+    old_open_model_manager = a.open_model_manager
+    try:
+        routed_manage_flags: list[bool] = []
+
+        def fake_open_model_manager(_stdscr, _state: a.State, *, manage_configs: bool = False) -> None:
+            routed_manage_flags.append(manage_configs)
+
+        a.open_model_manager = fake_open_model_manager
+        for command in ("/llm", "/model", "/models"):
+            route_state = a.State(agent=ContextFakeAgent())
+            route_state.input_text = command
+            route_state.input_cursor = len(command)
+            a.handle_key(object(), route_state, "\n")
+            assert route_state.input_text == ""
+        assert routed_manage_flags == [True, True, True]
+    finally:
+        a.open_model_manager = old_open_model_manager
 
     old_choose_exit_mode = a.choose_exit_mode
     try:

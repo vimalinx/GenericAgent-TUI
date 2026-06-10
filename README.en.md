@@ -286,9 +286,7 @@ Type `/help` inside the TUI for the full command list.
 ### Models
 
 ```text
-/llm                 Manage model configs, model extraction, health checks, defaults
-/model               Switch current dialogue model
-/models              Alias for /model
+/model               Manage model configs, switch current dialogue model, extract models, health check, set defaults
 ```
 
 ### Subagents
