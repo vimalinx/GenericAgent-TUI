@@ -203,3 +203,36 @@ Extracted TUI scheduler helpers into src/ga_tui/scheduler.py, kept app.py as the
 ### Next Steps
 
 - None - task complete
+
+
+## Session 7: AI slop cleanup
+
+**Date**: 2026-06-10
+**Task**: AI slop cleanup
+**Branch**: `main`
+
+### Summary
+
+Cleaned up GenericAgent-TUI model manager save/reload flow by centralizing persistence-plus-reload behavior and adding regression coverage.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `cd1abdd` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete

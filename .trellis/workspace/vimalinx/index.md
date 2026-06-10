@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 6
-- **Last Active**: 2026-06-05
+- **Total Sessions**: 7
+- **Last Active**: 2026-06-10
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~205 | Active |
+| `journal-1.md` | ~238 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 7 | 2026-06-10 | AI slop cleanup | `cd1abdd` | `main` |
 | 6 | 2026-06-05 | Extract scheduler module | `8421811` | `main` |
 | 5 | 2026-06-04 | Extract control protocol helpers | `02d8eb0` | `main` |
 | 4 | 2026-06-04 | Track Trellis workflow metadata | `5168f64` | `main` |
