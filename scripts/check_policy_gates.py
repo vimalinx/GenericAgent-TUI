@@ -2391,6 +2391,40 @@ def run_checks() -> None:
         assert load_error == "", load_error
         assert [a.config_display_name(entry) for entry in loaded_entries] == ["alpha", "beta"]
         assert loaded_mixin["llm_nos"] == ["beta"], loaded_mixin
+        old_save_llm_config_entries = a.save_llm_config_entries
+        old_reload_agent_llms = a.reload_agent_llms
+        try:
+            calls: list[str] = []
+
+            def fake_save_llm_config_entries(_entries, _mixin, _preserved):
+                calls.append("save")
+                return True, "saved"
+
+            def fake_reload_agent_llms(_state, *, preserve_current: bool = False):
+                calls.append(f"reload:{preserve_current}")
+                return True, "reloaded"
+
+            a.save_llm_config_entries = fake_save_llm_config_entries
+            a.reload_agent_llms = fake_reload_agent_llms
+            ok_manager_save, manager_save_msg = a.save_model_manager_entries(llm_state, llm_entries, mixin, [])
+            assert ok_manager_save, manager_save_msg
+            assert manager_save_msg == "reloaded"
+            assert calls == ["save", "reload:True"], calls
+
+            calls = []
+
+            def fake_failed_save_llm_config_entries(_entries, _mixin, _preserved):
+                calls.append("save")
+                return False, "save failed"
+
+            a.save_llm_config_entries = fake_failed_save_llm_config_entries
+            ok_manager_save, manager_save_msg = a.save_model_manager_entries(llm_state, llm_entries, mixin, [])
+            assert not ok_manager_save
+            assert manager_save_msg == "save failed"
+            assert calls == ["save"], calls
+        finally:
+            a.save_llm_config_entries = old_save_llm_config_entries
+            a.reload_agent_llms = old_reload_agent_llms
         ok_recent, recent_msg = a.remember_recent_model_entry(llm_entries[1], llm_entries)
         assert ok_recent, recent_msg
         ok_recent, recent_msg = a.remember_recent_model_entry(llm_entries[0], llm_entries)

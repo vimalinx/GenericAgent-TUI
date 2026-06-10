@@ -17192,6 +17192,19 @@ def save_default_model(entries: list[LLMConfigEntry], mixin: dict[str, Any], pre
     return save_llm_config_entries(entries, mixin, preserved)
 
 
+def save_model_manager_entries(
+    state: State,
+    entries: list[LLMConfigEntry],
+    mixin: dict[str, Any],
+    preserved: list[tuple[str, Any]],
+) -> tuple[bool, str]:
+    ok_save, save_msg = save_llm_config_entries(entries, mixin, preserved)
+    if not ok_save:
+        return False, save_msg
+    _ok_reload, reload_msg = reload_agent_llms(state, preserve_current=True)
+    return True, reload_msg or save_msg
+
+
 def probe_and_merge_models(base_entry: LLMConfigEntry, entries: list[LLMConfigEntry]) -> tuple[bool, list[LLMConfigEntry], str]:
     ok, models, probe_msg = probe_models_for_config(base_entry.cfg_type, base_entry.cfg)
     if not ok:
@@ -17278,18 +17291,15 @@ def open_model_manager(stdscr, state: State, *, manage_configs: bool = False) ->
                     continue
                 if added:
                     entries.extend(added)
-                    recent_names = load_recent_model_names(entries)
                     selected = len(entries) - len(added)
-                    ok_save, save_msg = save_llm_config_entries(entries, mixin, preserved)
-                    _ok_reload, reload_msg = reload_agent_llms(state, preserve_current=True) if ok_save else (False, "")
-                    message = f"{probe_msg} 已新增 {len(added)} 个模型配置。{reload_msg or save_msg}"
+                    change_msg = f"{probe_msg} 已新增 {len(added)} 个模型配置。"
                 else:
                     entries.append(new_entry)
-                    recent_names = load_recent_model_names(entries)
                     selected = len(entries) - 1
-                    ok_save, save_msg = save_llm_config_entries(entries, mixin, preserved)
-                    _ok_reload, reload_msg = reload_agent_llms(state, preserve_current=True) if ok_save else (False, "")
-                    message = f"{probe_msg} 已保存供应商配置。{reload_msg or save_msg}"
+                    change_msg = f"{probe_msg} 已保存供应商配置。"
+                recent_names = load_recent_model_names(entries)
+                _ok_save, persist_msg = save_model_manager_entries(state, entries, mixin, preserved)
+                message = f"{change_msg}{persist_msg}"
                 continue
             if manage_configs and entries and key in ("e", "E"):
                 old_name = config_display_name(entries[selected])
@@ -17300,19 +17310,16 @@ def open_model_manager(stdscr, state: State, *, manage_configs: bool = False) ->
                 entries[selected] = edited
                 if (mixin.get("llm_nos") or [""])[0] == old_name:
                     mixin["llm_nos"] = [config_display_name(edited)]
-                ok_save, save_msg = save_llm_config_entries(entries, mixin, preserved)
-                _ok_reload, reload_msg = reload_agent_llms(state, preserve_current=True) if ok_save else (False, "")
                 recent_names = load_recent_model_names(entries)
-                message = reload_msg or save_msg
+                _ok_save, message = save_model_manager_entries(state, entries, mixin, preserved)
                 continue
             if manage_configs and entries and key in ("x", "X", curses.KEY_DC):
                 removed = entries.pop(selected)
                 health.pop(model_health_key(removed), None)
                 selected = max(0, min(selected, len(entries) - 1))
-                ok_save, save_msg = save_llm_config_entries(entries, mixin, preserved)
-                _ok_reload, reload_msg = reload_agent_llms(state, preserve_current=True) if ok_save else (False, "")
                 recent_names = load_recent_model_names(entries)
-                message = f"已删除 {config_display_name(removed)}。{reload_msg or save_msg}"
+                _ok_save, persist_msg = save_model_manager_entries(state, entries, mixin, preserved)
+                message = f"已删除 {config_display_name(removed)}。{persist_msg}"
                 continue
             if manage_configs and entries and key in ("p", "P"):
                 selected_key = model_health_key(entries[selected])
@@ -17339,10 +17346,9 @@ def open_model_manager(stdscr, state: State, *, manage_configs: bool = False) ->
                     continue
                 entries.extend(added)
                 recent_names = load_recent_model_names(entries)
-                ok_save, save_msg = save_llm_config_entries(entries, mixin, preserved)
-                _ok_reload, reload_msg = reload_agent_llms(state, preserve_current=True) if ok_save else (False, "")
                 selected = next((idx for idx, entry in enumerate(entries) if model_health_key(entry) == selected_key), selected)
-                message = f"{probe_msg} 已新增 {len(added)} 个模型配置。{reload_msg or save_msg}"
+                _ok_save, persist_msg = save_model_manager_entries(state, entries, mixin, preserved)
+                message = f"{probe_msg} 已新增 {len(added)} 个模型配置。{persist_msg}"
                 continue
             if entries and key in ("t", "T"):
                 selected_key = model_health_key(entries[selected])
