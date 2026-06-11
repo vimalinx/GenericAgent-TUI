@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 12
+- **Total Sessions**: 13
 - **Last Active**: 2026-06-11
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~403 | Active |
+| `journal-1.md` | ~437 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 13 | 2026-06-11 | Oh My Pi runtime provider | `38f257a`, `5bd8ca1` | `main` |
 | 12 | 2026-06-11 | Speed up model provider rail | `8826211` | `main` |
 | 11 | 2026-06-11 | Color model provider rail statuses | `d95475e` | `main` |
 | 10 | 2026-06-11 | Make model providers vertical | `dc67966` | `main` |

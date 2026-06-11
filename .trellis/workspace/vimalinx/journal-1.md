@@ -401,3 +401,37 @@ Fixed /model provider rail lag by precomputing category indices, status colors, 
 ### Next Steps
 
 - None - task complete
+
+
+## Session 13: Oh My Pi runtime provider
+
+**Date**: 2026-06-11
+**Task**: Oh My Pi runtime provider
+**Branch**: `main`
+
+### Summary
+
+Researched Oh My Pi RPC integration and added an optional GA_TUI_RUNTIME_PROVIDER=ohmypi runtime provider with policy-gate coverage and backend spec documentation.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `38f257a` | (see git log) |
+| `5bd8ca1` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
