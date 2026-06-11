@@ -302,3 +302,36 @@ Changed the /model panel from broad protocol tabs to concrete provider tabs, usi
 ### Next Steps
 
 - None - task complete
+
+
+## Session 10: Make model providers vertical
+
+**Date**: 2026-06-11
+**Task**: Make model providers vertical
+**Branch**: `main`
+
+### Summary
+
+Changed the /model provider selector from one horizontal supplier tab line into a left-side vertical provider rail with the model list rendered beside it; updated the command contract spec and added a drawing regression for the vertical rail.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `dc67966` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
