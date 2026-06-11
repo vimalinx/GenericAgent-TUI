@@ -158,7 +158,7 @@
 - Main entrypoint: `open_model_manager(stdscr, state, manage_configs=True)`
 - Rendering entrypoint: `draw_model_manager(..., active_category="<provider-tab-label>")`
 - Category helpers: `model_entry_category(entry)`, `model_entry_categories(entries)`, `model_entry_indices_for_category(entries, category)`
-- Model-manager virtual category helpers: `model_manager_categories(entries, recent_names)`, `model_manager_entry_indices_for_category(entries, category, recent_names)`, `model_manager_category_status(entries, category, health, recent_names)`
+- Model-manager virtual category helpers: `model_manager_category_index(entries, recent_names, health)`, `model_manager_categories(entries, recent_names)`, `model_manager_entry_indices_for_category(entries, category, recent_names)`, `model_manager_category_status(entries, category, health, recent_names)`
 
 ### 3. Contracts
 
@@ -171,6 +171,7 @@
 - Provider labels must render as a vertical provider rail inside the model manager, with model rows rendered beside the rail. Do not collapse providers back into one horizontal `供应商 Tabs: A / B / C` line.
 - Recent/frequently used models must render as a `常用` virtual rail category parallel to provider categories when matching configured models exist.
 - Provider rail colors must summarize category state: configured/no-known-failure is blue, no configured model is grey, and any known failed health/test result is yellow.
+- Hot rendering/navigation paths must use a precomputed model-manager category index instead of recalculating provider category membership once per rail row.
 - Provider tabs must include configured providers plus the common-provider set derived from template order: `Anthropic`, `OpenAI`, `DeepSeek`, `Kimi`, `Qwen`, and `Zhipu` when those provider templates exist.
 - Known provider identity should prefer normalized provider-template `apibase` matches, then provider/template name matches. Unknown/custom providers should fall back to a stable endpoint host label or config display name.
 - Non-common template providers must not appear as empty tabs; they appear only after the user configures a model/API for that provider.
@@ -208,6 +209,7 @@
 - `scripts/check_policy_gates.py` must assert model category helpers group OpenAI, DeepSeek, custom endpoint, common-provider, and non-common configured providers correctly.
 - `scripts/check_policy_gates.py` must assert the model manager renders a vertical provider rail and does not render the old horizontal `供应商 Tabs:` line.
 - `scripts/check_policy_gates.py` must assert the model manager exposes `常用` as a virtual category and renders provider rail status colors for configured, empty, and failed categories.
+- `scripts/check_policy_gates.py` must assert `draw_model_manager(...)` can render from a supplied precomputed category index without recalculating provider categories.
 - README command tables must document `/model` as the single visible model command.
 
 ### 7. Wrong vs Correct

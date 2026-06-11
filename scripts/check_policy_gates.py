@@ -2501,6 +2501,9 @@ def run_checks() -> None:
         assert a.model_manager_category_status(mixed_entries, "OpenAI", health, recent_names) == "configured"
         assert a.model_manager_category_status(mixed_entries, "DeepSeek", health, recent_names) == "warning"
         assert a.model_manager_category_status(mixed_entries, "常用", health, recent_names) == "warning"
+        manager_index = a.model_manager_category_index(mixed_entries, recent_names, health)
+        assert manager_index.indices_by_category["常用"] == [1, 0]
+        assert manager_index.status_by_category["DeepSeek"] == "warning"
         model_draw_screen = FakeDrawScreen()
         model_draw_state = a.State(agent=FakeLLMAgent())
         a.draw_model_manager(
@@ -2513,6 +2516,7 @@ def run_checks() -> None:
             health,
             recent_names=recent_names,
             active_category="OpenAI",
+            category_index=manager_index,
         )
         draw_texts = [text for _y, _x, text, _attr in model_draw_screen.calls]
         assert any(text == "供应商" for text in draw_texts), draw_texts
@@ -2528,6 +2532,27 @@ def run_checks() -> None:
         assert row_attrs["  Anthropic"] == a.model_manager_category_attr(mixed_entries, "Anthropic", health, recent_names), row_attrs
         assert row_attrs["  DeepSeek (1)"] == a.model_manager_category_attr(mixed_entries, "DeepSeek", health, recent_names), row_attrs
         assert row_attrs["  常用 (2)"] == a.model_manager_category_attr(mixed_entries, "常用", health, recent_names), row_attrs
+        old_model_entry_category = a.model_entry_category
+        try:
+            def fail_model_entry_category(_entry):
+                raise AssertionError("draw_model_manager recalculated provider categories despite a supplied index")
+
+            a.model_entry_category = fail_model_entry_category
+            indexed_screen = FakeDrawScreen()
+            a.draw_model_manager(
+                indexed_screen,
+                model_draw_state,
+                mixed_entries,
+                {"llm_nos": ["deepseek"]},
+                2,
+                "",
+                health,
+                recent_names=recent_names,
+                active_category="OpenAI",
+                category_index=manager_index,
+            )
+        finally:
+            a.model_entry_category = old_model_entry_category
     finally:
         a.CONFIG_PROVIDERS = old_config_providers
     visible_commands = [cmd for cmd, _args, _desc, _sendable in a.COMMANDS]

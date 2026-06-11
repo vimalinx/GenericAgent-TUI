@@ -522,6 +522,14 @@ class LLMConfigEntry:
 
 
 @dataclass
+class ModelManagerCategoryIndex:
+    categories: list[str]
+    indices_by_category: dict[str, list[int]]
+    preferred_category_by_index: dict[int, str]
+    status_by_category: dict[str, str]
+
+
+@dataclass
 class StreamTarget:
     key: str = "active"
 
@@ -10322,14 +10330,97 @@ def model_entry_indices_for_category(entries: list[LLMConfigEntry], category: st
     return [idx for idx, entry in enumerate(entries) if model_entry_category(entry) == category]
 
 
-def model_manager_categories(entries: list[LLMConfigEntry], recent_names: Optional[list[str]] = None) -> list[str]:
+def model_entry_category_from_provider_profiles(
+    entry: LLMConfigEntry,
+    provider_profiles: list[tuple[set[str], set[str], str]],
+) -> str:
+    base = endpoint_base(str(entry.cfg.get("apibase") or ""))
+    if base:
+        for bases, _tokens, label in provider_profiles:
+            if base in bases:
+                return label
+    entry_tokens = {
+        normalized_provider_token(entry.cfg.get("name")),
+        normalized_provider_token(entry.var_name),
+    }
+    entry_tokens.discard("")
+    for _bases, tokens, label in provider_profiles:
+        if entry_tokens & tokens:
+            return label
+    host_label = provider_host_label(str(entry.cfg.get("apibase") or ""))
+    return host_label or config_display_name(entry) or "Custom"
+
+
+def model_manager_category_index(
+    entries: list[LLMConfigEntry],
+    recent_names: Optional[list[str]] = None,
+    health: Optional[dict[str, tuple[bool, str]]] = None,
+) -> ModelManagerCategoryIndex:
+    recent_names = recent_names or []
+    name_to_index = {config_display_name(entry): idx for idx, entry in enumerate(entries)}
+    recent_indices: list[int] = []
+    seen_recent: set[int] = set()
+    for name in recent_names:
+        idx = name_to_index.get(str(name or "").strip(), -1)
+        if idx >= 0 and idx not in seen_recent:
+            recent_indices.append(idx)
+            seen_recent.add(idx)
+
+    providers = llm_template_providers()
+    provider_profiles = [
+        (provider_template_bases(provider), provider_match_tokens(provider), provider_tab_label(provider))
+        for provider in providers
+    ]
+    providers_by_id = {str(provider.get("id") or ""): provider for provider in providers}
     categories: list[str] = []
-    if recent_model_entry_indices(entries, recent_names or []):
-        categories.append(MODEL_FAVORITES_CATEGORY)
-    for category in model_entry_categories(entries):
-        if category not in categories:
+    for provider_id in COMMON_MODEL_PROVIDER_IDS:
+        provider = providers_by_id.get(provider_id)
+        if provider is None:
+            continue
+        label = provider_tab_label(provider)
+        if label not in categories:
+            categories.append(label)
+    indices_by_category: dict[str, list[int]] = {category: [] for category in categories}
+    entry_categories: list[str] = []
+    for idx, entry in enumerate(entries):
+        category = model_entry_category_from_provider_profiles(entry, provider_profiles)
+        entry_categories.append(category)
+        if category not in indices_by_category:
             categories.append(category)
-    return categories or ["Custom"]
+            indices_by_category[category] = []
+        indices_by_category[category].append(idx)
+
+    if recent_indices and MODEL_FAVORITES_CATEGORY not in indices_by_category:
+        categories = [MODEL_FAVORITES_CATEGORY, *categories]
+        indices_by_category[MODEL_FAVORITES_CATEGORY] = recent_indices
+    if not categories:
+        categories = ["Custom"]
+        indices_by_category["Custom"] = []
+
+    recent_set = set(recent_indices)
+    preferred_category_by_index = {
+        idx: MODEL_FAVORITES_CATEGORY if idx in recent_set else category
+        for idx, category in enumerate(entry_categories)
+    }
+    status_by_category: dict[str, str] = {}
+    for category in categories:
+        indices = indices_by_category.get(category, [])
+        if not indices:
+            status_by_category[category] = "empty"
+            continue
+        status = "configured"
+        if health:
+            for idx in indices:
+                result = health.get(model_health_key(entries[idx]))
+                if result is not None and not result[0]:
+                    status = "warning"
+                    break
+        status_by_category[category] = status
+    return ModelManagerCategoryIndex(categories, indices_by_category, preferred_category_by_index, status_by_category)
+
+
+def model_manager_categories(entries: list[LLMConfigEntry], recent_names: Optional[list[str]] = None) -> list[str]:
+    return model_manager_category_index(entries, recent_names).categories
 
 
 def model_manager_entry_indices_for_category(
@@ -10337,9 +10428,7 @@ def model_manager_entry_indices_for_category(
     category: str,
     recent_names: Optional[list[str]] = None,
 ) -> list[int]:
-    if category == MODEL_FAVORITES_CATEGORY:
-        return recent_model_entry_indices(entries, recent_names or [])
-    return model_entry_indices_for_category(entries, category)
+    return model_manager_category_index(entries, recent_names).indices_by_category.get(category, [])
 
 
 def model_manager_category_for_index(
@@ -10347,11 +10436,11 @@ def model_manager_category_for_index(
     selected: int,
     recent_names: Optional[list[str]] = None,
 ) -> str:
+    index = model_manager_category_index(entries, recent_names)
     if 0 <= selected < len(entries):
-        if selected in recent_model_entry_indices(entries, recent_names or []):
-            return MODEL_FAVORITES_CATEGORY
-        return model_entry_category(entries[selected])
-    return model_manager_categories(entries, recent_names)[0]
+        preferred = index.preferred_category_by_index.get(selected)
+        return preferred if preferred is not None else model_entry_category(entries[selected])
+    return index.categories[0]
 
 
 def model_manager_category_status(
@@ -10360,14 +10449,15 @@ def model_manager_category_status(
     health: Optional[dict[str, tuple[bool, str]]] = None,
     recent_names: Optional[list[str]] = None,
 ) -> str:
-    indices = model_manager_entry_indices_for_category(entries, category, recent_names)
-    if not indices:
-        return "empty"
-    for idx in indices:
-        result = health.get(model_health_key(entries[idx])) if health else None
-        if result is not None and not result[0]:
-            return "warning"
-    return "configured"
+    return model_manager_category_index(entries, recent_names, health).status_by_category.get(category, "empty")
+
+
+def model_manager_status_attr(status: str) -> int:
+    if status == "empty":
+        return cp(12)
+    if status == "warning":
+        return cp(7)
+    return cp(4)
 
 
 def model_manager_category_attr(
@@ -10376,12 +10466,7 @@ def model_manager_category_attr(
     health: Optional[dict[str, tuple[bool, str]]] = None,
     recent_names: Optional[list[str]] = None,
 ) -> int:
-    status = model_manager_category_status(entries, category, health, recent_names)
-    if status == "empty":
-        return cp(12)
-    if status == "warning":
-        return cp(7)
-    return cp(4)
+    return model_manager_status_attr(model_manager_category_status(entries, category, health, recent_names))
 
 
 def apply_provider_template(provider: dict[str, Any], old_cfg: dict[str, Any]) -> tuple[str, dict[str, Any]]:
@@ -15998,6 +16083,7 @@ def draw_model_manager(
     title: str = "当前对话模型",
     manage_configs: bool = False,
     active_category: str = "",
+    category_index: Optional[ModelManagerCategoryIndex] = None,
 ) -> None:
     height, width = stdscr.getmaxyx()
     y0, x0, h, w = popup_geometry(height, width, min_w=82)
@@ -16017,7 +16103,8 @@ def draw_model_manager(
     else:
         help_text = "Tab/←→ 切供应商  Enter 当前对话  d 默认  u 最近  t 测试  v 验活  r 重载  Esc 返回"
     safe_add(stdscr, y0 + 3, x0 + 2, help_text, inner_w, cp(1))
-    categories = model_manager_categories(entries, recent_names)
+    category_index = category_index or model_manager_category_index(entries, recent_names, health)
+    categories = category_index.categories
     if active_category not in categories:
         active_category = categories[0]
     provider_w = min(24, max(16, inner_w // 4))
@@ -16027,7 +16114,7 @@ def draw_model_manager(
     safe_add(stdscr, y0 + 4, model_x, "模型", model_w, cp(7) | curses.A_BOLD)
     start_y = y0 + 6
     list_h = max(1, h - 9)
-    visible_indices = model_manager_entry_indices_for_category(entries, active_category, recent_names)
+    visible_indices = category_index.indices_by_category.get(active_category, [])
     if entries and selected not in visible_indices and visible_indices:
         selected = visible_indices[0]
     try:
@@ -16039,12 +16126,12 @@ def draw_model_manager(
     for y in range(y0 + 4, y0 + h - 2):
         safe_add(stdscr, y, separator_x, "│", 1, cp(10))
     for row, category in enumerate(categories[provider_start:provider_start + list_h]):
-        provider_indices = model_manager_entry_indices_for_category(entries, category, recent_names)
+        provider_indices = category_index.indices_by_category.get(category, [])
         marker = "›" if category == active_category else " "
         line = f"{marker} {category}"
         if provider_indices:
             line += f" ({len(provider_indices)})"
-        attr = model_manager_category_attr(entries, category, health, recent_names)
+        attr = model_manager_status_attr(category_index.status_by_category.get(category, "empty"))
         if category == active_category:
             attr |= curses.A_BOLD | curses.A_REVERSE
         safe_add(stdscr, start_y + row, x0 + 2, " " * provider_w, provider_w, attr)
@@ -17457,15 +17544,17 @@ def open_model_manager(stdscr, state: State, *, manage_configs: bool = True) -> 
         recent_names = load_recent_model_names(entries)
         health: dict[str, tuple[bool, str]] = {}
         selected = model_manager_initial_index(state, entries, mixin, recent_names)
-        active_category = model_manager_category_for_index(entries, selected, recent_names) if entries else model_manager_categories(entries, recent_names)[0]
+        category_index = model_manager_category_index(entries, recent_names, health)
+        active_category = category_index.preferred_category_by_index.get(selected, category_index.categories[0]) if entries else category_index.categories[0]
         message = error or ("还没有已配置模型；用 /model 添加供应商/API。" if not entries else "")
         title = "模型 / Provider 管理" if manage_configs else "当前对话模型切换"
         while True:
             selected = max(0, min(selected, max(0, len(entries) - 1)))
-            categories = model_manager_categories(entries, recent_names)
+            category_index = model_manager_category_index(entries, recent_names, health)
+            categories = category_index.categories
             if active_category not in categories:
-                active_category = model_manager_category_for_index(entries, selected, recent_names) if entries else categories[0]
-            visible_indices = model_manager_entry_indices_for_category(entries, active_category, recent_names)
+                active_category = category_index.preferred_category_by_index.get(selected, categories[0]) if entries else categories[0]
+            visible_indices = category_index.indices_by_category.get(active_category, [])
             if entries and visible_indices and selected not in visible_indices:
                 selected = visible_indices[0]
             draw_model_manager(
@@ -17480,6 +17569,7 @@ def open_model_manager(stdscr, state: State, *, manage_configs: bool = True) -> 
                 title=title,
                 manage_configs=manage_configs,
                 active_category=active_category,
+                category_index=category_index,
             )
             message = ""
             try:
@@ -17501,7 +17591,7 @@ def open_model_manager(stdscr, state: State, *, manage_configs: bool = True) -> 
                 except ValueError:
                     category_pos = 0
                 active_category = categories[(category_pos + direction) % len(categories)]
-                visible_indices = model_manager_entry_indices_for_category(entries, active_category, recent_names)
+                visible_indices = category_index.indices_by_category.get(active_category, [])
                 selected = visible_indices[0] if visible_indices else 0
                 message = f"已切到 {active_category}。"
                 continue
@@ -17524,7 +17614,8 @@ def open_model_manager(stdscr, state: State, *, manage_configs: bool = True) -> 
                 recent_names = load_recent_model_names(entries)
                 health = {}
                 selected = model_manager_initial_index(state, entries, mixin, recent_names)
-                active_category = model_manager_category_for_index(entries, selected, recent_names) if entries else model_manager_categories(entries, recent_names)[0]
+                category_index = model_manager_category_index(entries, recent_names, health)
+                active_category = category_index.preferred_category_by_index.get(selected, category_index.categories[0]) if entries else category_index.categories[0]
                 ok, message = reload_agent_llms(state, preserve_current=True)
                 if error:
                     message = error
@@ -17535,7 +17626,8 @@ def open_model_manager(stdscr, state: State, *, manage_configs: bool = True) -> 
                     message = "还没有最近模型；选择一次当前对话模型后会记录。"
                 else:
                     selected = next_recent_entry_index(entries, recent_names, selected)
-                    active_category = MODEL_FAVORITES_CATEGORY if MODEL_FAVORITES_CATEGORY in model_manager_categories(entries, recent_names) else model_entry_category(entries[selected])
+                    category_index = model_manager_category_index(entries, recent_names, health)
+                    active_category = MODEL_FAVORITES_CATEGORY if MODEL_FAVORITES_CATEGORY in category_index.categories else model_entry_category(entries[selected])
                     message = f"已跳到最近模型：{config_display_name(entries[selected])}"
                 continue
             if manage_configs and key in ("a", "A", "+"):
@@ -17591,8 +17683,9 @@ def open_model_manager(stdscr, state: State, *, manage_configs: bool = True) -> 
                 removed = entries.pop(selected)
                 health.pop(model_health_key(removed), None)
                 selected = max(0, min(selected, len(entries) - 1))
-                active_category = model_manager_category_for_index(entries, selected, recent_names) if entries else model_manager_categories(entries, recent_names)[0]
                 recent_names = load_recent_model_names(entries)
+                category_index = model_manager_category_index(entries, recent_names, health)
+                active_category = category_index.preferred_category_by_index.get(selected, category_index.categories[0]) if entries else category_index.categories[0]
                 _ok_save, persist_msg = save_model_manager_entries(state, entries, mixin, preserved)
                 message = f"已删除 {config_display_name(removed)}。{persist_msg}"
                 continue
@@ -17724,7 +17817,8 @@ def open_model_manager(stdscr, state: State, *, manage_configs: bool = True) -> 
                     if model_health_key(entry) == selected_key:
                         selected = idx
                         break
-                active_category = model_manager_category_for_index(entries, selected, recent_names)
+                category_index = model_manager_category_index(entries, recent_names, health)
+                active_category = category_index.preferred_category_by_index.get(selected, category_index.categories[0])
                 message = f"验活完成：{alive} 个可用，{dead} 个不可用；已按 OK/BAD 分组。"
                 continue
             if not entries:
