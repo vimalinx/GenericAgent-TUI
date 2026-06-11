@@ -368,3 +368,36 @@ Added a peer 常用 category to the /model provider rail, colored configured pro
 ### Next Steps
 
 - None - task complete
+
+
+## Session 12: Speed up model provider rail
+
+**Date**: 2026-06-11
+**Task**: Speed up model provider rail
+**Branch**: `main`
+
+### Summary
+
+Fixed /model provider rail lag by precomputing category indices, status colors, and provider-template match profiles for the hot draw/navigation path; verified the current 84-model config dropped from about 127.77ms to 1.56ms per draw and 1000 synthetic entries dropped to about 8.14ms per draw.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `8826211` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
