@@ -23,6 +23,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from ga_tui import app as a  # noqa: E402
 from ga_tui import control_protocol as cp  # noqa: E402
 from ga_tui import genericagent_provider as gap  # noqa: E402
+from ga_tui import ohmypi_provider as omp  # noqa: E402
 from ga_tui import scheduler as sched  # noqa: E402
 
 
@@ -260,6 +261,183 @@ def assert_genericagent_provider_module_boundary() -> None:
     ):
         assert forbidden not in app_source, forbidden
     assert "configure_genericagent_provider_runtime(" in app_source
+
+
+class FakeRpcStdout:
+    def __init__(self) -> None:
+        self.frames: queue.Queue[str] = queue.Queue()
+
+    def push(self, obj: dict) -> None:
+        self.frames.put(json.dumps(obj, ensure_ascii=False) + "\n")
+
+    def __iter__(self):
+        return self
+
+    def __next__(self) -> str:
+        return self.frames.get()
+
+
+class FakeRpcStderr:
+    def __iter__(self):
+        return self
+
+    def __next__(self) -> str:
+        raise StopIteration
+
+
+class FakeRpcStdin:
+    def __init__(self, stdout: FakeRpcStdout, *, auto_finish: bool = True) -> None:
+        self.stdout = stdout
+        self.auto_finish = auto_finish
+        self.writes: list[dict] = []
+
+    def write(self, payload: str) -> int:
+        for line in payload.splitlines():
+            if not line.strip():
+                continue
+            frame = json.loads(line)
+            self.writes.append(frame)
+            if frame.get("type") == "prompt":
+                self.stdout.push({"id": frame.get("id"), "type": "response", "command": "prompt", "success": True})
+                if self.auto_finish:
+                    self.stdout.push({
+                        "type": "message_update",
+                        "assistantMessageEvent": {"type": "text_delta", "delta": "hi "},
+                    })
+                    self.stdout.push({
+                        "type": "message_update",
+                        "assistantMessageEvent": {"type": "text_delta", "delta": "there"},
+                    })
+                    self.stdout.push({"type": "agent_end"})
+            elif frame.get("type") == "abort":
+                self.stdout.push({"id": frame.get("id"), "type": "response", "command": "abort", "success": True})
+        return len(payload)
+
+    def flush(self) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
+
+
+class FakeRpcProcess:
+    def __init__(self, *, auto_finish: bool = True) -> None:
+        self.stdout = FakeRpcStdout()
+        self.stderr = FakeRpcStderr()
+        self.stdin = FakeRpcStdin(self.stdout, auto_finish=auto_finish)
+        self.returncode = None
+        self.stdout.push({"type": "ready"})
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self) -> None:
+        self.returncode = 0
+
+    def kill(self) -> None:
+        self.returncode = -9
+
+    def wait(self, timeout: float | None = None):
+        del timeout
+        self.returncode = 0
+        return self.returncode
+
+
+def assert_ohmypi_provider_module_boundary() -> None:
+    assert omp.OhMyPiRuntimeAdapter.__module__ == "ga_tui.ohmypi_provider"
+    provider_source = Path(omp.__file__).read_text(encoding="utf-8")
+    for forbidden in (
+        "import curses",
+        "from curses",
+        "ga_tui.app",
+        "from .app",
+        "import app",
+        "from app import State",
+        "from .app import State",
+    ):
+        assert forbidden not in provider_source, forbidden
+
+
+def assert_ohmypi_runtime_registry() -> None:
+    old = os.environ.pop("GA_TUI_RUNTIME_PROVIDER", None)
+    try:
+        registry = a.agent_runtime_registry()
+        data = registry.to_record()
+        assert data["default_provider_id"] == "genericagent", data
+        assert {"genericagent", "ohmypi"} <= set(data["provider_ids"]), data
+        providers = {item["provider_id"]: item for item in data["providers"]}
+        ohmypi = providers["ohmypi"]
+        assert ohmypi["schema_version"] == "agentruntime.provider.v1", ohmypi
+        assert ohmypi["transport"] == "jsonl_stdio_rpc", ohmypi
+        assert ohmypi["capabilities"]["streaming"] is True, ohmypi
+        assert ohmypi["policy"]["approval_gate_owner"] == "ga-tui.policy", ohmypi
+        os.environ["GA_TUI_RUNTIME_PROVIDER"] = "ohmypi"
+        assert a.agent_runtime_registry().default().provider_id == "ohmypi"
+    finally:
+        if old is None:
+            os.environ.pop("GA_TUI_RUNTIME_PROVIDER", None)
+        else:
+            os.environ["GA_TUI_RUNTIME_PROVIDER"] = old
+
+
+def assert_ohmypi_rpc_queue_mapping() -> None:
+    processes: list[FakeRpcProcess] = []
+
+    def process_factory(*_args, **_kwargs):
+        process = FakeRpcProcess()
+        processes.append(process)
+        return process
+
+    agent = omp.OhMyPiRpcAgent(
+        command=["/fake/omp", "--mode", "rpc"],
+        cwd=str(ROOT),
+        process_factory=process_factory,
+        startup_timeout=1,
+    )
+    dq = agent.put_task("hello", source="test")
+    first = dq.get(timeout=2)
+    second = dq.get(timeout=2)
+    done = dq.get(timeout=2)
+    assert first["next"] == "hi ", first
+    assert second["next"] == "there", second
+    assert done["done"] == "hi there", done
+    assert agent.is_running is False
+    assert agent.task_queue.unfinished_tasks == 0
+    assert any(item.get("type") == "prompt" and item.get("message") == "hello" for item in processes[0].stdin.writes)
+    agent.close()
+
+
+def assert_ohmypi_missing_binary_and_abort() -> None:
+    missing_agent = omp.OhMyPiRpcAgent(command=["ga-tui-definitely-missing-omp"], startup_timeout=0.1)
+    missing_q = missing_agent.put_task("hello", source="test")
+    missing = missing_q.get(timeout=2)
+    assert "not found" in missing["done"], missing
+    assert missing_agent.is_running is False
+    assert missing_agent.task_queue.unfinished_tasks == 0
+
+    processes: list[FakeRpcProcess] = []
+
+    def process_factory(*_args, **_kwargs):
+        process = FakeRpcProcess(auto_finish=False)
+        processes.append(process)
+        return process
+
+    agent = omp.OhMyPiRpcAgent(
+        command=["/fake/omp", "--mode", "rpc"],
+        cwd=str(ROOT),
+        process_factory=process_factory,
+        startup_timeout=1,
+    )
+    dq = agent.put_task("long", source="test")
+    deadline = time.time() + 2
+    while time.time() < deadline and not any(item.get("type") == "prompt" for item in processes[0].stdin.writes):
+        time.sleep(0.01)
+    agent.abort()
+    done = dq.get(timeout=2)
+    assert "中止" in done["done"], done
+    assert any(item.get("type") == "abort" for item in processes[0].stdin.writes), processes[0].stdin.writes
+    assert agent.task_queue.unfinished_tasks == 0
+    agent.close()
 
 
 def ga_control(*actions: dict) -> str:
@@ -814,16 +992,22 @@ def assert_gateway_schema(registry: dict) -> None:
     assert "researcher" in capabilities["roles"], capabilities
     assert capabilities["roles"]["researcher"]["permissions"]["write_policy"] == "none", capabilities
     assert capabilities["runtime_registry_ref"] == a.AGENT_RUNTIME_REGISTRY_PATH, capabilities
-    assert capabilities["runtime_providers"][0]["provider_id"] == "genericagent", capabilities
+    capability_provider_ids = {item["provider_id"] for item in capabilities["runtime_providers"]}
+    assert {"genericagent", "ohmypi"} <= capability_provider_ids, capabilities
     runtime_registry = registry["runtime_registry"]
     assert runtime_registry["schema_version"] == "agentruntime.registry.v1", runtime_registry
     assert runtime_registry["default_provider_id"] == "genericagent", runtime_registry
     assert "genericagent" in runtime_registry["provider_ids"], runtime_registry
-    runtime_provider = runtime_registry["providers"][0]
+    assert "ohmypi" in runtime_registry["provider_ids"], runtime_registry
+    providers_by_id = {item["provider_id"]: item for item in runtime_registry["providers"]}
+    runtime_provider = providers_by_id["genericagent"]
     assert runtime_provider["schema_version"] == "agentruntime.provider.v1", runtime_provider
     assert runtime_provider["capabilities"]["streaming"] is True, runtime_provider
     assert runtime_provider["model_routing"]["owner"] == "ga-tui.control_plane", runtime_provider
     assert runtime_provider["scheduler"]["dispatch_contract"] == "agenttask.v2", runtime_provider
+    ohmypi_provider = providers_by_id["ohmypi"]
+    assert ohmypi_provider["transport"] == "jsonl_stdio_rpc", ohmypi_provider
+    assert ohmypi_provider["capabilities"]["streaming"] is True, ohmypi_provider
     assert os.path.exists(a.AGENT_RUNTIME_REGISTRY_PATH), a.AGENT_RUNTIME_REGISTRY_PATH
     model_orchestration = registry["model_orchestration"]
     assert model_orchestration["schema_version"] == "model_orchestration.v1", model_orchestration
@@ -2344,6 +2528,10 @@ def assert_temp_session_is_non_persistent() -> None:
 def run_checks() -> None:
     assert_scheduler_module_boundary()
     assert_genericagent_provider_module_boundary()
+    assert_ohmypi_provider_module_boundary()
+    assert_ohmypi_runtime_registry()
+    assert_ohmypi_rpc_queue_mapping()
+    assert_ohmypi_missing_binary_and_abort()
     assert_top_bar_header_requested_fields()
     assert_long_secret_render_reuses_stable_message_blocks()
     assert_secret_native_restore_hydrates_backend_context_blocks()

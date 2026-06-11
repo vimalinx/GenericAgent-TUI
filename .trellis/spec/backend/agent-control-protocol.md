@@ -385,6 +385,90 @@ configure_genericagent_provider_runtime(
 )
 ```
 
+## Scenario: Oh My Pi Runtime Provider
+
+### 1. Scope / Trigger
+
+- Trigger: GenericAgent-TUI integrates Oh My Pi as an additional local runtime provider.
+- Applies to: `src/ga_tui/ohmypi_provider.py`, runtime provider registration in `src/ga_tui/app.py`, runtime registry records, opt-in provider selection, and RPC queue/event mapping.
+- Non-goal: This provider must not own curses rendering, mutable TUI `State`, GenericAgent tool schema injection, TUI approval storage, scheduler registries, or first-class TUI subagent ledger mutation.
+
+### 2. Signatures
+
+- Provider module: `src/ga_tui/ohmypi_provider.py`.
+- Provider id: `ohmypi`.
+- Runtime adapter: `OhMyPiRuntimeAdapter(RuntimeAdapter)`.
+- Queue-compatible wrapper: `OhMyPiRpcAgent`.
+- Provider metadata helper: `ohmypi_provider_spec(root_dir, harness_dir, recent_models_path, schedules_path, binary=None)`.
+- RPC command helper: `ohmypi_rpc_command(binary=None, extra_args=None)`.
+- Environment keys:
+  - `GA_TUI_RUNTIME_PROVIDER=ohmypi` selects the provider.
+  - `GA_TUI_OHMYPI_BIN` overrides the executable, default `omp`.
+  - `GA_TUI_OHMYPI_ARGS` appends shell-split extra CLI arguments.
+- Default RPC command shape: `omp --mode rpc --no-title --approval-mode always-ask`.
+
+### 3. Contracts
+
+- `OhMyPiRpcAgent.put_task(prompt, source="", images=None)` must return a `queue.Queue` immediately.
+- Oh My Pi RPC `message_update` frames with `assistantMessageEvent.type:"text_delta"` map to queue items shaped as `{"next": <delta>, "source": "ohmypi"}`.
+- Oh My Pi RPC terminal frames `agent_end` or `turn_end` map to one queue item shaped as `{"done": <buffer>, "source": "ohmypi"}`.
+- Startup, prompt, or missing-binary failures must map to a queue `done` item instead of raising into the TUI caller after `put_task()` returns.
+- The wrapper must expose the current GenericAgent-shaped compatibility surface used by existing TUI hot paths: `put_task()`, `abort()`, `get_llm_name()`, `list_llms()`, `load_llm_sessions()`, `next_llm()`, `is_running`, `task_queue.unfinished_tasks`, `log_path`, `llmclient.backend`, and `llmclients`.
+- `OhMyPiRuntimeAdapter.start_agent()` must not block on model or network startup. RPC process startup is lazy and happens on first prompt.
+- The provider module must not import `ga_tui.app`, curses, or mutable TUI `State`.
+- Oh My Pi host tools, host URI schemes, and TUI approval mapping are disabled until explicitly implemented; the provider is a bounded runtime worker, not a bypass around TUI policy gates.
+- GenericAgent remains the default runtime provider when `GA_TUI_RUNTIME_PROVIDER` is unset.
+
+### 4. Validation & Error Matrix
+
+- `omp` executable missing -> provider spec status is `missing`; prompt queue receives a user-visible startup failure.
+- RPC process does not emit `{"type":"ready"}` before timeout -> prompt queue receives an RPC ready timeout failure and the process is terminated.
+- Prompt command receives `success:false` -> active prompt queue receives `RPC prompt failed: ...`.
+- Concurrent `put_task()` while one prompt is active -> second queue receives a user-visible concurrency error.
+- RPC stdout emits non-JSON -> line is recorded in provider stderr tail and ignored.
+- RPC extension UI request `confirm` -> provider replies `confirmed:false`.
+- RPC extension UI request `select`, `input`, or `editor` -> provider replies `cancelled:true`.
+- `abort()` called during a prompt -> provider sends RPC `abort`, emits a queue `done` item, clears `is_running`, and decrements `task_queue.unfinished_tasks`.
+
+### 5. Good/Base/Bad Cases
+
+- Good: `GA_TUI_RUNTIME_PROVIDER=ohmypi` selects `OhMyPiRuntimeAdapter`, starts `omp --mode rpc` lazily, streams text deltas into the existing TUI message renderer, and keeps GenericAgent untouched.
+- Good: Missing `omp` produces an assistant-visible error message instead of crashing startup.
+- Base: `/runtimes` shows both `genericagent` and `ohmypi`, while default remains `genericagent`.
+- Base: Oh My Pi internal task/subagent events are provider-owned details until a future ledger-mapping feature is implemented.
+- Bad: The provider imports `app.py` to read TUI state or mutate ledgers directly.
+- Bad: The adapter enables host tools or auto-approval before TUI policy gates can audit and approve those operations.
+- Bad: `app.py` contains Oh My Pi RPC parsing logic instead of provider-local parsing.
+
+### 6. Tests Required
+
+- `scripts/check_policy_gates.py` must assert `ohmypi` appears in the runtime registry while `genericagent` remains the default.
+- Tests must assert `GA_TUI_RUNTIME_PROVIDER=ohmypi` selects the Oh My Pi adapter.
+- Tests must assert `ohmypi_provider.py` has no reverse import into `app.py` and no curses import.
+- Tests must assert a fake RPC process maps `ready`, `prompt` ack, `message_update` deltas, and `agent_end` into queue `next`/`done` items.
+- Tests must assert missing binary failure and `abort()` cleanup decrement unfinished task state.
+- `python3 -m py_compile src/ga_tui/app.py src/ga_tui/ohmypi_provider.py scripts/check_policy_gates.py`, `python3 scripts/check_policy_gates.py`, `python3 -m compileall -q src scripts`, `git diff --check`, and `ga-tui-check --root /home/vimalinx/Programs/GenericAgent` must pass.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```python
+# app.py
+if provider_id == "ohmypi":
+    line = process.stdout.readline()
+    frame = json.loads(line)
+```
+
+#### Correct
+
+```python
+# ohmypi_provider.py
+class OhMyPiRuntimeAdapter(RuntimeAdapter):
+    def create_agent(self) -> OhMyPiRpcAgent:
+        return OhMyPiRpcAgent()
+```
+
 ## Scenario: TUI Governed Schedule Tools
 
 ### 1. Scope / Trigger

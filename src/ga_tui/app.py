@@ -104,6 +104,7 @@ try:
         tui_query_tool_outcome,
         wrap_agentmain_tool_schema_loader,
     )
+    from .ohmypi_provider import OhMyPiRuntimeAdapter, ohmypi_provider_spec
     from .runtime import RuntimeRegistry, genericagent_provider_spec
 except Exception:
     from integration import find_genericagent_root as _find_genericagent_root  # type: ignore
@@ -165,6 +166,7 @@ except Exception:
         tui_query_tool_outcome,
         wrap_agentmain_tool_schema_loader,
     )
+    from ohmypi_provider import OhMyPiRuntimeAdapter, ohmypi_provider_spec  # type: ignore
     from runtime import RuntimeRegistry, genericagent_provider_spec  # type: ignore
 
 
@@ -10910,6 +10912,12 @@ def agent_runtime_registry() -> RuntimeRegistry:
         recent_models_path=LLM_RECENT_MODELS_PATH,
         schedules_path=AGENT_SCHEDULES_PATH,
     )))
+    registry.register(OhMyPiRuntimeAdapter(ohmypi_provider_spec(
+        root_dir=ROOT_DIR,
+        harness_dir=AGENT_HARNESS_DIR,
+        recent_models_path=LLM_RECENT_MODELS_PATH,
+        schedules_path=AGENT_SCHEDULES_PATH,
+    ), cwd=ROOT_DIR))
     return registry
 
 
