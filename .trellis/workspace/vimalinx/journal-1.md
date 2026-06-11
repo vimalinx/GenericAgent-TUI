@@ -335,3 +335,36 @@ Changed the /model provider selector from one horizontal supplier tab line into 
 ### Next Steps
 
 - None - task complete
+
+
+## Session 11: Color model provider rail statuses
+
+**Date**: 2026-06-11
+**Task**: Color model provider rail statuses
+**Branch**: `main`
+
+### Summary
+
+Added a peer 常用 category to the /model provider rail, colored configured providers blue, empty providers grey, and categories with known failed model health yellow; updated the model command contract and policy gate regressions.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `d95475e` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
