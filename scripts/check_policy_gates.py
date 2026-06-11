@@ -2436,6 +2436,7 @@ def run_checks() -> None:
         ok_recent, recent_msg = a.remember_recent_model_entry(llm_entries[0], llm_entries)
         assert ok_recent, recent_msg
         assert a.load_recent_model_names(llm_entries)[:2] == ["alpha", "beta"]
+        assert a.recent_model_entry_indices(llm_entries, ["alpha", "beta"]) == [0, 1]
         assert a.next_recent_entry_index(llm_entries, ["alpha", "beta"], 0) == 1
         sub_state = a.State(agent=FakeLLMAgent())
         sub = a.create_subagent(sub_state, "Persistent Model Agent", role="researcher", persistent=True)
@@ -2490,6 +2491,16 @@ def run_checks() -> None:
         assert a.model_entry_indices_for_category(mixed_entries, "DeepSeek") == [0]
         assert a.model_entry_indices_for_category(mixed_entries, "example.invalid") == [1]
         assert a.model_entry_indices_for_category(mixed_entries, "OpenAI") == [2]
+        recent_names = ["alpha", "deepseek"]
+        manager_tabs = a.model_manager_categories(mixed_entries, recent_names)
+        assert manager_tabs == ["常用", "Anthropic", "OpenAI", "DeepSeek", "Qwen", "example.invalid"], manager_tabs
+        assert a.model_manager_entry_indices_for_category(mixed_entries, "常用", recent_names) == [1, 0]
+        assert a.model_manager_category_for_index(mixed_entries, 1, recent_names) == "常用"
+        health = {a.model_health_key(deepseek_entry): (False, "offline")}
+        assert a.model_manager_category_status(mixed_entries, "Anthropic", health, recent_names) == "empty"
+        assert a.model_manager_category_status(mixed_entries, "OpenAI", health, recent_names) == "configured"
+        assert a.model_manager_category_status(mixed_entries, "DeepSeek", health, recent_names) == "warning"
+        assert a.model_manager_category_status(mixed_entries, "常用", health, recent_names) == "warning"
         model_draw_screen = FakeDrawScreen()
         model_draw_state = a.State(agent=FakeLLMAgent())
         a.draw_model_manager(
@@ -2497,19 +2508,26 @@ def run_checks() -> None:
             model_draw_state,
             mixed_entries,
             {"llm_nos": ["deepseek"]},
-            0,
+            2,
             "",
-            recent_names=[],
-            active_category="DeepSeek",
+            health,
+            recent_names=recent_names,
+            active_category="OpenAI",
         )
         draw_texts = [text for _y, _x, text, _attr in model_draw_screen.calls]
         assert any(text == "供应商" for text in draw_texts), draw_texts
         assert not any("供应商 Tabs:" in text for text in draw_texts), draw_texts
-        assert any("› DeepSeek (1)" in text for text in draw_texts), draw_texts
-        provider_rows = [(y, x, text) for y, x, text, _attr in model_draw_screen.calls if text in {"  OpenAI (1)", "› DeepSeek (1)"}]
-        assert len(provider_rows) == 2, provider_rows
+        assert any("  常用 (2)" in text for text in draw_texts), draw_texts
+        assert any("  DeepSeek (1)" in text for text in draw_texts), draw_texts
+        assert any("› OpenAI (1)" in text for text in draw_texts), draw_texts
+        provider_rows = [(y, x, text) for y, x, text, _attr in model_draw_screen.calls if text in {"  常用 (2)", "› OpenAI (1)", "  DeepSeek (1)"}]
+        row_attrs = {text: attr for _y, _x, text, attr in model_draw_screen.calls if text in {"  常用 (2)", "  Anthropic", "  DeepSeek (1)"}}
+        assert len(provider_rows) == 3, provider_rows
         assert len({x for _y, x, _text in provider_rows}) == 1, provider_rows
-        assert len({y for y, _x, _text in provider_rows}) == 2, provider_rows
+        assert len({y for y, _x, _text in provider_rows}) == 3, provider_rows
+        assert row_attrs["  Anthropic"] == a.model_manager_category_attr(mixed_entries, "Anthropic", health, recent_names), row_attrs
+        assert row_attrs["  DeepSeek (1)"] == a.model_manager_category_attr(mixed_entries, "DeepSeek", health, recent_names), row_attrs
+        assert row_attrs["  常用 (2)"] == a.model_manager_category_attr(mixed_entries, "常用", health, recent_names), row_attrs
     finally:
         a.CONFIG_PROVIDERS = old_config_providers
     visible_commands = [cmd for cmd, _args, _desc, _sendable in a.COMMANDS]
