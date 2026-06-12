@@ -435,3 +435,36 @@ Researched Oh My Pi RPC integration and added an optional GA_TUI_RUNTIME_PROVIDE
 ### Next Steps
 
 - None - task complete
+
+
+## Session 14: Extract GenericAgent provider adapter glue
+
+**Date**: 2026-06-12
+**Task**: Extract GenericAgent provider adapter glue
+**Branch**: `main`
+
+### Summary
+
+Moved GenericAgent-specific tool schema injection, handler patching, control hint installation, and runtime adapter glue from app.py into genericagent_provider.py with app-layer callback injection, provider-boundary policy checks, and updated Trellis spec.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `fe45387` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
