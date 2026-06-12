@@ -28,9 +28,11 @@ except Exception:
 ProcessFactory = Callable[..., Any]
 ThreadFactory = Callable[..., Any]
 MemoryCandidateSink = Callable[[dict[str, Any]], None]
+HostToolHandler = Callable[[str, dict[str, Any]], dict[str, Any]]
 
 GA_TUI_MEMORY_PROMPT_FILENAME = "ohmypi-ga-tui-memory.md"
 GA_TUI_MEMORY_PROMPT_HEADER = "GA/TUI Memory Guidance"
+MAX_HOST_TOOL_RESULT_CHARS = 12000
 _SECRET_PATTERNS = (
     re.compile(r"\bsk-[A-Za-z0-9_\-]{16,}\b"),
     re.compile(r"\b(api[_-]?key|secret|token|password|passwd|密码|密钥)\s*[:=]\s*\S+", re.IGNORECASE),
@@ -89,6 +91,57 @@ class _ActivePrompt:
     finished: bool = False
 
 
+@dataclass(frozen=True)
+class RpcHostToolDefinition:
+    name: str
+    description: str
+    parameters: dict[str, Any]
+    label: str = ""
+    hidden: bool = False
+
+    def to_rpc(self) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "name": self.name,
+            "description": self.description,
+            "parameters": self.parameters,
+        }
+        if self.label:
+            data["label"] = self.label
+        if self.hidden:
+            data["hidden"] = True
+        return data
+
+
+def _host_tool_definition_to_rpc(definition: RpcHostToolDefinition | dict[str, Any]) -> dict[str, Any]:
+    if isinstance(definition, RpcHostToolDefinition):
+        return definition.to_rpc()
+    if isinstance(definition, dict):
+        return dict(definition)
+    return {}
+
+
+def _bounded_host_tool_text(value: Any, *, max_chars: int = MAX_HOST_TOOL_RESULT_CHARS) -> str:
+    try:
+        text = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    except Exception:
+        text = json.dumps(str(value), ensure_ascii=False)
+    text = _redact_memory_text(text)
+    if len(text) > max_chars:
+        text = text[:max_chars].rstrip() + "\n...[truncated]"
+    return text
+
+
+def _host_tool_agent_result(value: Any) -> dict[str, Any]:
+    return {
+        "content": [
+            {
+                "type": "text",
+                "text": _bounded_host_tool_text(value),
+            }
+        ]
+    }
+
+
 class OhMyPiRpcAgent:
     """Small queue-compatible wrapper around `omp --mode rpc`."""
 
@@ -100,6 +153,8 @@ class OhMyPiRpcAgent:
         process_factory: ProcessFactory | None = None,
         thread_factory: ThreadFactory = threading.Thread,
         memory_candidate_sink: MemoryCandidateSink | None = None,
+        host_tool_definitions: list[RpcHostToolDefinition | dict[str, Any]] | None = None,
+        host_tool_handler: HostToolHandler | None = None,
         startup_timeout: float = 10.0,
         stop_timeout: float = 3.0,
     ) -> None:
@@ -108,6 +163,12 @@ class OhMyPiRpcAgent:
         self.process_factory = process_factory or subprocess.Popen
         self.thread_factory = thread_factory
         self.memory_candidate_sink = memory_candidate_sink
+        self.host_tool_definitions = [
+            item
+            for item in (_host_tool_definition_to_rpc(definition) for definition in (host_tool_definitions or []))
+            if item.get("name")
+        ]
+        self.host_tool_handler = host_tool_handler
         self.startup_timeout = startup_timeout
         self.stop_timeout = stop_timeout
         self.task_queue = _TaskCounter()
@@ -126,6 +187,25 @@ class OhMyPiRpcAgent:
         self._request_no = 0
         self._stderr_tail: list[str] = []
         self._closed = False
+        self._host_tools_registered = False
+
+    def configure_host_tools(
+        self,
+        *,
+        host_tool_definitions: list[RpcHostToolDefinition | dict[str, Any]] | None = None,
+        host_tool_handler: HostToolHandler | None = None,
+    ) -> None:
+        if host_tool_definitions is not None:
+            self.host_tool_definitions = [
+                item
+                for item in (_host_tool_definition_to_rpc(definition) for definition in host_tool_definitions)
+                if item.get("name")
+            ]
+            self._host_tools_registered = False
+        if host_tool_handler is not None:
+            self.host_tool_handler = host_tool_handler
+        if self._process is not None and self._process.poll() is None and self._ready.is_set():
+            self._register_host_tools()
 
     def run(self) -> None:
         return None
@@ -204,6 +284,7 @@ class OhMyPiRpcAgent:
         if os.path.sep not in binary and shutil.which(binary) is None:
             raise FileNotFoundError(f"`{binary}` executable not found")
         self._ready.clear()
+        self._host_tools_registered = False
         self._process = self.process_factory(
             self.command,
             cwd=self.cwd,
@@ -260,10 +341,17 @@ class OhMyPiRpcAgent:
     def _handle_frame(self, frame: dict[str, Any]) -> None:
         frame_type = str(frame.get("type") or "")
         if frame_type == "ready":
+            self._register_host_tools()
             self._ready.set()
             return
         if frame_type == "response":
             self._handle_response(frame)
+            return
+        if frame_type == "host_tool_call":
+            self._handle_host_tool_call(frame)
+            return
+        if frame_type == "host_tool_cancel":
+            self._handle_host_tool_cancel(frame)
             return
         if frame_type == "message_update":
             event = frame.get("assistantMessageEvent")
@@ -357,6 +445,85 @@ class OhMyPiRpcAgent:
         elif method in {"select", "input", "editor"}:
             self._send({"type": "extension_ui_response", "id": request_id, "cancelled": True})
 
+    def _register_host_tools(self) -> None:
+        if self._host_tools_registered or not self.host_tool_definitions:
+            return
+        try:
+            self._send({
+                "id": self._next_request_id("host-tools"),
+                "type": "set_host_tools",
+                "tools": list(self.host_tool_definitions),
+            })
+            self._host_tools_registered = True
+        except Exception as exc:
+            self._remember_stderr(f"host tool registration failed: {type(exc).__name__}: {exc}")
+
+    def _handle_host_tool_call(self, frame: dict[str, Any]) -> None:
+        request_id = str(frame.get("id") or "")
+        tool_name = str(frame.get("toolName") or "")
+        args = frame.get("arguments")
+        arguments = args if isinstance(args, dict) else {}
+        if not request_id:
+            self._remember_stderr("host tool call missing id")
+            return
+        allowed_names = {str(tool.get("name") or "") for tool in self.host_tool_definitions}
+        if not tool_name or tool_name not in allowed_names:
+            self._send_host_tool_result(
+                request_id,
+                {
+                    "schema_version": "ga-tui.host_tool.v1",
+                    "status": "error",
+                    "error": f"Unknown or unregistered host tool: {tool_name or '<missing>'}",
+                },
+                is_error=True,
+            )
+            return
+        if self.host_tool_handler is None:
+            self._send_host_tool_result(
+                request_id,
+                {
+                    "schema_version": "ga-tui.host_tool.v1",
+                    "status": "error",
+                    "tool_name": tool_name,
+                    "error": "No host tool handler is configured.",
+                },
+                is_error=True,
+            )
+            return
+        try:
+            result = self.host_tool_handler(tool_name, dict(arguments))
+        except Exception as exc:
+            self._send_host_tool_result(
+                request_id,
+                {
+                    "schema_version": "ga-tui.host_tool.v1",
+                    "status": "error",
+                    "tool_name": tool_name,
+                    "error": f"{type(exc).__name__}: {exc}",
+                },
+                is_error=True,
+            )
+            return
+        self._send_host_tool_result(request_id, result)
+
+    def _handle_host_tool_cancel(self, frame: dict[str, Any]) -> None:
+        target_id = str(frame.get("targetId") or "")
+        if target_id:
+            self._remember_stderr(f"host tool cancel requested: {target_id}")
+
+    def _send_host_tool_result(self, request_id: str, result: Any, *, is_error: bool = False) -> None:
+        frame: dict[str, Any] = {
+            "type": "host_tool_result",
+            "id": request_id,
+            "result": _host_tool_agent_result(result),
+        }
+        if is_error:
+            frame["isError"] = True
+        try:
+            self._send(frame)
+        except Exception as exc:
+            self._remember_stderr(f"host tool result failed: {type(exc).__name__}: {exc}")
+
     def _send(self, obj: dict[str, Any]) -> None:
         process = self._process
         if process is None or process.poll() is not None:
@@ -400,6 +567,8 @@ class OhMyPiRuntimeAdapter(RuntimeAdapter):
         process_factory: ProcessFactory | None = None,
         thread_factory: ThreadFactory = threading.Thread,
         memory_candidate_sink: MemoryCandidateSink | None = None,
+        host_tool_definitions: list[RpcHostToolDefinition | dict[str, Any]] | None = None,
+        host_tool_handler: HostToolHandler | None = None,
     ) -> None:
         super().__init__(spec)
         self.command = command
@@ -407,6 +576,8 @@ class OhMyPiRuntimeAdapter(RuntimeAdapter):
         self.process_factory = process_factory
         self.thread_factory = thread_factory
         self.memory_candidate_sink = memory_candidate_sink
+        self.host_tool_definitions = list(host_tool_definitions or [])
+        self.host_tool_handler = host_tool_handler
 
     def create_agent(self) -> OhMyPiRpcAgent:
         return OhMyPiRpcAgent(
@@ -415,6 +586,8 @@ class OhMyPiRuntimeAdapter(RuntimeAdapter):
             process_factory=self.process_factory,
             thread_factory=self.thread_factory,
             memory_candidate_sink=self.memory_candidate_sink,
+            host_tool_definitions=self.host_tool_definitions,
+            host_tool_handler=self.host_tool_handler,
         )
 
     def prepare_agent(self, agent: Any, *, state: Any = None) -> None:
@@ -568,6 +741,7 @@ def ohmypi_provider_spec(
             "session_restore": True,
             "tool_calling": True,
             "host_tools": False,
+            "tui_readonly_host_tools": True,
             "artifact_refs": True,
             "memory_candidates": True,
             "memory_candidate_signals": True,
@@ -592,7 +766,7 @@ def ohmypi_provider_spec(
         },
         policy={
             "approval_gate_owner": "ga-tui.policy",
-            "tool_permissions": "ohmypi_internal_until_host_tools_are_mapped",
+            "tool_permissions": "tui_readonly_host_tools_only",
             "memory_write": "candidate_signal_only",
             "risky_actions": ["deploy", "external_send", "delete_file", "spend_money", "access_secret"],
         },
@@ -610,7 +784,7 @@ def ohmypi_provider_spec(
             "Oh My Pi runs out-of-process through JSONL stdio RPC.",
             "GenericAgent/TUI memory is injected through --append-system-prompt.",
             "Oh My Pi completion text can emit memory candidate signals; TUI remains the approval owner.",
-            "Host tools, host URI schemes, and TUI approval mapping are intentionally disabled in the MVP.",
+            "Only app-injected read-only TUI query host tools are enabled; unrestricted host tools, host URI schemes, and TUI approval mapping stay disabled.",
             f"runtime_root={root_dir}",
             f"harness_dir={harness_dir}",
             f"command={' '.join(command)}",

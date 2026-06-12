@@ -106,6 +106,8 @@ try:
     )
     from .ohmypi_provider import (
         OhMyPiRuntimeAdapter,
+        RpcHostToolDefinition,
+        ohmypi_memory_prompt_path,
         ohmypi_provider_spec,
         ohmypi_rpc_command,
         write_ohmypi_memory_prompt,
@@ -173,6 +175,8 @@ except Exception:
     )
     from ohmypi_provider import (  # type: ignore
         OhMyPiRuntimeAdapter,
+        RpcHostToolDefinition,
+        ohmypi_memory_prompt_path,
         ohmypi_provider_spec,
         ohmypi_rpc_command,
         write_ohmypi_memory_prompt,
@@ -5564,8 +5568,8 @@ def a2a_artifact_object(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def gateway_capability_registry(state: Optional[State] = None) -> dict[str, Any]:
-    runtime_registry = agent_runtime_registry().to_record()
+def gateway_capability_registry(state: Optional[State] = None, *, write_runtime_artifacts: bool = True) -> dict[str, Any]:
+    runtime_registry = agent_runtime_registry(write_memory_prompt_file=write_runtime_artifacts).to_record()
     role_capabilities = {
         role: {
             "role": role,
@@ -10966,7 +10970,112 @@ def append_ohmypi_memory_candidate_signal(signal: dict[str, Any]) -> dict[str, A
     return row
 
 
-def agent_runtime_registry() -> RuntimeRegistry:
+OHMYPI_TUI_QUERY_TOOL_NAME = "ga_tui_query"
+OHMYPI_TUI_QUERY_ENDPOINTS = (
+    "runtime_registry",
+    "model_orchestration",
+    "capability_registry",
+    "agent_list",
+    "agent_get",
+    "agent_match",
+    "task_list",
+    "task_get",
+    "approval_list",
+    "artifact_list",
+)
+
+
+def ohmypi_tui_readonly_host_tool_definitions() -> list[RpcHostToolDefinition]:
+    return [
+        RpcHostToolDefinition(
+            name=OHMYPI_TUI_QUERY_TOOL_NAME,
+            label="GA/TUI Query",
+            description=(
+                "Read-only GenericAgent-TUI governance query. Use it to inspect runtime providers, "
+                "capabilities, agents, tasks, approval metadata, and artifact refs. It never approves, "
+                "writes memory, edits artifacts, or mutates ledgers."
+            ),
+            parameters={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "endpoint": {
+                        "type": "string",
+                        "enum": list(OHMYPI_TUI_QUERY_ENDPOINTS),
+                        "description": "Read-only governance endpoint to query.",
+                    },
+                    "args": {
+                        "type": "object",
+                        "description": "Endpoint-specific filters such as target, task_id, status, include_completed, or limit.",
+                        "additionalProperties": True,
+                    },
+                },
+                "required": ["endpoint"],
+            },
+        )
+    ]
+
+
+def ohmypi_runtime_registry_snapshot() -> dict[str, Any]:
+    data = agent_runtime_registry(write_memory_prompt_file=False).to_record()
+    data["updated_at"] = now_iso()
+    data["registry_path"] = AGENT_RUNTIME_REGISTRY_PATH
+    return data
+
+
+def ohmypi_tui_query_host_tool_handler(state: Optional[State] = None):
+    def _handler(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
+        if tool_name != OHMYPI_TUI_QUERY_TOOL_NAME:
+            return tui_query_error("Unsupported host tool.", tool_name=tool_name)
+        if not isinstance(args, dict):
+            return tui_query_error("Host tool arguments must be an object.")
+        endpoint = str(args.get("endpoint") or "").strip()
+        raw_endpoint_args = args.get("args")
+        if raw_endpoint_args is None:
+            endpoint_args = {str(key): value for key, value in args.items() if key != "endpoint"}
+        elif isinstance(raw_endpoint_args, dict):
+            endpoint_args = raw_endpoint_args
+        else:
+            return tui_query_error("args must be an object.", endpoint=endpoint)
+        if endpoint == "runtime_registry":
+            return tui_query_ok(
+                "runtime.registry",
+                runtime_registry=tui_query_json_safe(ohmypi_runtime_registry_snapshot()),
+            )
+        if endpoint == "model_orchestration":
+            return tui_query_ok(
+                "model.orchestration",
+                model_orchestration=tui_query_json_safe(model_orchestration_registry(state)),
+            )
+        if endpoint == "capability_registry":
+            return tui_query_ok(
+                "capability.registry",
+                capabilities=tui_query_json_safe(gateway_capability_registry(state, write_runtime_artifacts=False)),
+            )
+        if endpoint == "agent_list":
+            return tui_tool_agent_list(state, endpoint_args)
+        if endpoint == "agent_get":
+            return tui_tool_agent_get(state, endpoint_args)
+        if endpoint == "agent_match":
+            return tui_tool_agent_match(state, endpoint_args)
+        if endpoint == "task_list":
+            return tui_tool_task_list(state, endpoint_args)
+        if endpoint == "task_get":
+            return tui_tool_task_get(state, endpoint_args)
+        if endpoint == "approval_list":
+            return tui_tool_approval_list(state, endpoint_args)
+        if endpoint == "artifact_list":
+            return tui_tool_artifact_list(state, endpoint_args)
+        return tui_query_error(
+            "Unsupported endpoint.",
+            endpoint=endpoint,
+            supported_endpoints=list(OHMYPI_TUI_QUERY_ENDPOINTS),
+        )
+
+    return _handler
+
+
+def agent_runtime_registry(*, write_memory_prompt_file: bool = True) -> RuntimeRegistry:
     requested = os.environ.get("GA_TUI_RUNTIME_PROVIDER", "ohmypi").strip() or "ohmypi"
     registry = RuntimeRegistry(default_provider_id=requested)
     registry.register(GenericAgentRuntimeAdapter(genericagent_provider_spec(
@@ -10975,15 +11084,25 @@ def agent_runtime_registry() -> RuntimeRegistry:
         recent_models_path=LLM_RECENT_MODELS_PATH,
         schedules_path=AGENT_SCHEDULES_PATH,
     )))
-    ohmypi_memory_prompt_path = write_ohmypi_memory_prompt(root_dir=ROOT_DIR, harness_dir=AGENT_HARNESS_DIR)
-    ohmypi_command = ohmypi_rpc_command(append_system_prompt=ohmypi_memory_prompt_path)
+    ohmypi_append_prompt_path = (
+        write_ohmypi_memory_prompt(root_dir=ROOT_DIR, harness_dir=AGENT_HARNESS_DIR)
+        if write_memory_prompt_file
+        else ohmypi_memory_prompt_path(AGENT_HARNESS_DIR)
+    )
+    ohmypi_command = ohmypi_rpc_command(append_system_prompt=ohmypi_append_prompt_path)
     registry.register(OhMyPiRuntimeAdapter(ohmypi_provider_spec(
         root_dir=ROOT_DIR,
         harness_dir=AGENT_HARNESS_DIR,
         recent_models_path=LLM_RECENT_MODELS_PATH,
         schedules_path=AGENT_SCHEDULES_PATH,
         command=ohmypi_command,
-    ), command=ohmypi_command, cwd=ROOT_DIR, memory_candidate_sink=append_ohmypi_memory_candidate_signal))
+    ),
+        command=ohmypi_command,
+        cwd=ROOT_DIR,
+        memory_candidate_sink=append_ohmypi_memory_candidate_signal,
+        host_tool_definitions=ohmypi_tui_readonly_host_tool_definitions(),
+        host_tool_handler=ohmypi_tui_query_host_tool_handler(None),
+    ))
     return registry
 
 
@@ -11036,6 +11155,14 @@ def install_interaction_hook(state: State, agent: Any) -> None:
     if agent is None:
         return
     install_tui_query_runtime(agent, state)
+    if hasattr(agent, "configure_host_tools"):
+        try:
+            agent.configure_host_tools(
+                host_tool_definitions=ohmypi_tui_readonly_host_tool_definitions(),
+                host_tool_handler=ohmypi_tui_query_host_tool_handler(state),
+            )
+        except Exception:
+            pass
     try:
         hooks = getattr(agent, "_turn_end_hooks", None)
         if hooks is None:

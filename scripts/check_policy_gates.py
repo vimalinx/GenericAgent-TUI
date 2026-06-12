@@ -315,6 +315,15 @@ class FakeRpcStdin:
                         },
                     })
                     self.stdout.push({"type": "agent_end"})
+            elif frame.get("type") == "set_host_tools":
+                tools = frame.get("tools") if isinstance(frame.get("tools"), list) else []
+                self.stdout.push({
+                    "id": frame.get("id"),
+                    "type": "response",
+                    "command": "set_host_tools",
+                    "success": True,
+                    "data": {"toolNames": [str(tool.get("name") or "") for tool in tools if isinstance(tool, dict)]},
+                })
             elif frame.get("type") == "abort":
                 self.stdout.push({"id": frame.get("id"), "type": "response", "command": "abort", "success": True})
         return len(payload)
@@ -349,6 +358,25 @@ class FakeRpcProcess:
         return self.returncode
 
 
+def wait_for_rpc_write(process: FakeRpcProcess, predicate, *, timeout: float = 2.0) -> dict:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        for frame in process.stdin.writes:
+            if predicate(frame):
+                return frame
+        time.sleep(0.01)
+    raise AssertionError(process.stdin.writes)
+
+
+def wait_for_process(processes: list[FakeRpcProcess], *, timeout: float = 2.0) -> FakeRpcProcess:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if processes:
+            return processes[0]
+        time.sleep(0.01)
+    raise AssertionError("fake RPC process was not started")
+
+
 def assert_ohmypi_provider_module_boundary() -> None:
     assert omp.OhMyPiRuntimeAdapter.__module__ == "ga_tui.ohmypi_provider"
     provider_source = Path(omp.__file__).read_text(encoding="utf-8")
@@ -376,9 +404,12 @@ def assert_ohmypi_runtime_registry() -> None:
         assert ohmypi["schema_version"] == "agentruntime.provider.v1", ohmypi
         assert ohmypi["transport"] == "jsonl_stdio_rpc", ohmypi
         assert ohmypi["capabilities"]["streaming"] is True, ohmypi
+        assert ohmypi["capabilities"]["host_tools"] is False, ohmypi
+        assert ohmypi["capabilities"]["tui_readonly_host_tools"] is True, ohmypi
         assert ohmypi["capabilities"]["memory_candidates"] is True, ohmypi
         assert ohmypi["capabilities"]["memory_candidate_signals"] is True, ohmypi
         assert ohmypi["policy"]["approval_gate_owner"] == "ga-tui.policy", ohmypi
+        assert ohmypi["policy"]["tool_permissions"] == "tui_readonly_host_tools_only", ohmypi
         assert ohmypi["policy"]["memory_write"] == "candidate_signal_only", ohmypi
         os.environ["GA_TUI_RUNTIME_PROVIDER"] = "genericagent"
         assert a.agent_runtime_registry().default().provider_id == "genericagent"
@@ -448,6 +479,130 @@ def assert_ohmypi_rpc_queue_mapping() -> None:
     assert memory_signals[-1]["schema_version"] == "ohmypi.memory_candidate_signal.v1", memory_signals[-1]
     assert memory_signals[-1]["statement"] == expected_done, memory_signals[-1]
     agent.close()
+
+
+def assert_ohmypi_host_tool_bridge() -> None:
+    processes: list[FakeRpcProcess] = []
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    def process_factory(*_args, **_kwargs):
+        process = FakeRpcProcess(auto_finish=False)
+        processes.append(process)
+        return process
+
+    def handler(tool_name: str, args: dict[str, object]) -> dict[str, object]:
+        calls.append((tool_name, args))
+        if args.get("endpoint") == "explode":
+            raise RuntimeError("boom")
+        return {
+            "schema_version": "ga-tui.query.v1",
+            "status": "ok",
+            "kind": "test.host_tool",
+            "endpoint": str(args.get("endpoint") or ""),
+        }
+
+    tool = omp.RpcHostToolDefinition(
+        name="ga_tui_query",
+        label="GA/TUI Query",
+        description="Read-only test query",
+        parameters={"type": "object", "properties": {"endpoint": {"type": "string"}}},
+    )
+    agent = omp.OhMyPiRpcAgent(
+        command=["/fake/omp", "--mode", "rpc"],
+        cwd=str(ROOT),
+        process_factory=process_factory,
+        host_tool_definitions=[tool],
+        host_tool_handler=handler,
+        startup_timeout=1,
+    )
+    dq = agent.put_task("hello", source="test")
+    process = wait_for_process(processes)
+    set_host_tools = wait_for_rpc_write(process, lambda frame: frame.get("type") == "set_host_tools")
+    prompt = wait_for_rpc_write(process, lambda frame: frame.get("type") == "prompt")
+    assert process.stdin.writes.index(set_host_tools) < process.stdin.writes.index(prompt), process.stdin.writes
+    assert set_host_tools["tools"][0]["name"] == "ga_tui_query", set_host_tools
+    assert set_host_tools["tools"][0]["parameters"]["type"] == "object", set_host_tools
+
+    process.stdout.push({
+        "type": "host_tool_call",
+        "id": "call-1",
+        "toolCallId": "tc-1",
+        "toolName": "ga_tui_query",
+        "arguments": {"endpoint": "runtime_registry"},
+    })
+    success = wait_for_rpc_write(process, lambda frame: frame.get("type") == "host_tool_result" and frame.get("id") == "call-1")
+    success_text = success["result"]["content"][0]["text"]
+    success_payload = json.loads(success_text)
+    assert success_payload["schema_version"] == "ga-tui.query.v1", success_payload
+    assert success_payload["status"] == "ok", success_payload
+    assert calls[-1] == ("ga_tui_query", {"endpoint": "runtime_registry"}), calls
+
+    process.stdout.push({
+        "type": "host_tool_call",
+        "id": "call-unknown",
+        "toolCallId": "tc-unknown",
+        "toolName": "unknown_tool",
+        "arguments": {},
+    })
+    unknown = wait_for_rpc_write(
+        process,
+        lambda frame: frame.get("type") == "host_tool_result" and frame.get("id") == "call-unknown",
+    )
+    assert unknown["isError"] is True, unknown
+    assert "Unknown or unregistered host tool" in unknown["result"]["content"][0]["text"], unknown
+
+    process.stdout.push({
+        "type": "host_tool_call",
+        "id": "call-error",
+        "toolCallId": "tc-error",
+        "toolName": "ga_tui_query",
+        "arguments": {"endpoint": "explode"},
+    })
+    failed = wait_for_rpc_write(
+        process,
+        lambda frame: frame.get("type") == "host_tool_result" and frame.get("id") == "call-error",
+    )
+    assert failed["isError"] is True, failed
+    assert "RuntimeError: boom" in failed["result"]["content"][0]["text"], failed
+
+    process.stdout.push({"type": "host_tool_cancel", "id": "cancel-1", "targetId": "call-1"})
+    deadline = time.time() + 2
+    while time.time() < deadline and not any("host tool cancel requested: call-1" in item for item in agent._stderr_tail):
+        time.sleep(0.01)
+    assert any("host tool cancel requested: call-1" in item for item in agent._stderr_tail), agent._stderr_tail
+
+    agent.abort()
+    done = dq.get(timeout=2)
+    assert "中止" in done["done"], done
+    agent.close()
+
+
+def assert_ohmypi_tui_query_host_tool_contract() -> None:
+    tools = a.ohmypi_tui_readonly_host_tool_definitions()
+    assert len(tools) == 1, tools
+    tool = tools[0].to_rpc()
+    assert tool["name"] == "ga_tui_query", tool
+    assert "runtime_registry" in tool["parameters"]["properties"]["endpoint"]["enum"], tool
+    assert "artifact_list" in tool["parameters"]["properties"]["endpoint"]["enum"], tool
+
+    handler = a.ohmypi_tui_query_host_tool_handler(None)
+    runtime = handler("ga_tui_query", {"endpoint": "runtime_registry"})
+    assert runtime["schema_version"] == "ga-tui.query.v1", runtime
+    assert runtime["status"] == "ok", runtime
+    assert runtime["runtime_registry"]["default_provider_id"] == "ohmypi", runtime
+    assert runtime["runtime_registry"]["providers"], runtime
+
+    tasks = handler("ga_tui_query", {"endpoint": "task_list", "args": {"limit": 1}})
+    assert tasks["schema_version"] == "ga-tui.query.v1", tasks
+    assert tasks["kind"] == "task.list", tasks
+
+    agent_list = handler("ga_tui_query", {"endpoint": "agent_list"})
+    assert agent_list["status"] == "error", agent_list
+    assert "TUI state is not bound" in agent_list["error"], agent_list
+
+    unknown = handler("ga_tui_query", {"endpoint": "not-real"})
+    assert unknown["status"] == "error", unknown
+    assert "runtime_registry" in unknown["supported_endpoints"], unknown
 
 
 def assert_ohmypi_memory_candidate_signal_filters() -> None:
@@ -1066,7 +1221,10 @@ def assert_gateway_schema(registry: dict) -> None:
     ohmypi_provider = providers_by_id["ohmypi"]
     assert ohmypi_provider["transport"] == "jsonl_stdio_rpc", ohmypi_provider
     assert ohmypi_provider["capabilities"]["streaming"] is True, ohmypi_provider
+    assert ohmypi_provider["capabilities"]["host_tools"] is False, ohmypi_provider
+    assert ohmypi_provider["capabilities"]["tui_readonly_host_tools"] is True, ohmypi_provider
     assert ohmypi_provider["capabilities"]["memory_candidate_signals"] is True, ohmypi_provider
+    assert ohmypi_provider["policy"]["tool_permissions"] == "tui_readonly_host_tools_only", ohmypi_provider
     assert ohmypi_provider["policy"]["memory_write"] == "candidate_signal_only", ohmypi_provider
     assert os.path.exists(a.AGENT_RUNTIME_REGISTRY_PATH), a.AGENT_RUNTIME_REGISTRY_PATH
     model_orchestration = registry["model_orchestration"]
@@ -2592,6 +2750,8 @@ def run_checks() -> None:
     assert_ohmypi_runtime_registry()
     assert_ohmypi_memory_prompt_and_command()
     assert_ohmypi_rpc_queue_mapping()
+    assert_ohmypi_host_tool_bridge()
+    assert_ohmypi_tui_query_host_tool_contract()
     assert_ohmypi_memory_candidate_signal_filters()
     assert_ohmypi_missing_binary_and_abort()
     assert_top_bar_header_requested_fields()
