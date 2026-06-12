@@ -468,3 +468,36 @@ Moved GenericAgent-specific tool schema injection, handler patching, control hin
 ### Next Steps
 
 - None - task complete
+
+
+## Session 15: Fuse Oh My Pi runtime with GA memory
+
+**Date**: 2026-06-12
+**Task**: Fuse Oh My Pi runtime with GA memory
+**Branch**: `experiment/ohmypi-runtime-memory`
+
+### Summary
+
+Made Oh My Pi the experiment-branch default runtime provider while preserving GenericAgent fallback. Injected bounded GA/TUI memory into OMP through --append-system-prompt and routed completed OMP output into governed TUI memory candidate signals. Updated runtime/provider specs and policy-gate checks; verification passed.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `07d3018` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete

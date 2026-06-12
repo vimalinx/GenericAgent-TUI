@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 14
+- **Total Sessions**: 15
 - **Last Active**: 2026-06-12
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~470 | Active |
+| `journal-1.md` | ~503 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 15 | 2026-06-12 | Fuse Oh My Pi runtime with GA memory | `07d3018` | `experiment/ohmypi-runtime-memory` |
 | 14 | 2026-06-12 | Extract GenericAgent provider adapter glue | `fe45387` | `main` |
 | 13 | 2026-06-11 | Oh My Pi runtime provider | `38f257a`, `5bd8ca1` | `main` |
 | 12 | 2026-06-11 | Speed up model provider rail | `8826211` | `main` |
