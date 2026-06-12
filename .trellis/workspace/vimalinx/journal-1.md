@@ -501,3 +501,36 @@ Made Oh My Pi the experiment-branch default runtime provider while preserving Ge
 ### Next Steps
 
 - None - task complete
+
+
+## Session 16: Deepen Oh My Pi runtime governance
+
+**Date**: 2026-06-12
+**Task**: Deepen Oh My Pi runtime governance
+**Branch**: `experiment/ohmypi-runtime-memory`
+
+### Summary
+
+Added a read-only GA/TUI governance host tool bridge for Oh My Pi RPC, wired app-owned query callbacks, updated policy-gate coverage and backend spec, and verified py_compile, policy gates, compileall, diff check, and ga-tui-check.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `d9e1ac3` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
