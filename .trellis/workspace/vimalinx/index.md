@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 17
+- **Total Sessions**: 18
 - **Last Active**: 2026-06-13
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~570 | Active |
+| `journal-1.md` | ~603 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 18 | 2026-06-13 | Isolate OMP runtime settings | `719dfe0` | `experiment/ohmypi-runtime-memory` |
 | 17 | 2026-06-13 | OMP governed proposal bridge | `7c86c79`, `8b92a92` | `experiment/ohmypi-runtime-memory` |
 | 16 | 2026-06-12 | Deepen Oh My Pi runtime governance | `d9e1ac3` | `experiment/ohmypi-runtime-memory` |
 | 15 | 2026-06-12 | Fuse Oh My Pi runtime with GA memory | `07d3018` | `experiment/ohmypi-runtime-memory` |

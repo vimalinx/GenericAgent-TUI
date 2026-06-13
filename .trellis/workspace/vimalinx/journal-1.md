@@ -568,3 +568,36 @@ Added Oh My Pi ga_tui_propose host tool for governed ga-control actions and cura
 ### Next Steps
 
 - None - task complete
+
+
+## Session 18: Isolate OMP runtime settings
+
+**Date**: 2026-06-13
+**Task**: Isolate OMP runtime settings
+**Branch**: `experiment/ohmypi-runtime-memory`
+
+### Summary
+
+Implemented GA-TUI-managed isolated Oh My Pi runtime settings: generated OMP config/models from /model entries, launched OMP with PI_CODING_AGENT_DIR under the harness runtime root, kept API keys in child env only, added RPC set_model/error-frame handling, updated policy gates and backend spec, and verified system ~/.omp config hash stayed unchanged.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `719dfe0` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
