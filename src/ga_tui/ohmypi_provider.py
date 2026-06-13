@@ -92,6 +92,7 @@ class _ActivePrompt:
     display_queue: queue.Queue
     source: str = ""
     buffer: str = ""
+    final_text: str = ""
     finished: bool = False
 
 
@@ -225,6 +226,25 @@ def _host_tool_agent_result(value: Any) -> dict[str, Any]:
             }
         ]
     }
+
+
+def _visible_text_from_payload(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "".join(_visible_text_from_payload(item) for item in value)
+    if not isinstance(value, dict):
+        return ""
+    item_type = str(value.get("type") or "")
+    raw_text = value.get("text")
+    if isinstance(raw_text, str) and (not item_type or item_type in {"text", "output_text", "text_end"}):
+        return raw_text
+    parts: list[str] = []
+    for key in ("content", "message", "assistantMessage", "assistantMessageEvent"):
+        text = _visible_text_from_payload(value.get(key))
+        if text:
+            parts.append(text)
+    return "".join(parts)
 
 
 class OhMyPiRpcAgent:
@@ -479,14 +499,18 @@ class OhMyPiRpcAgent:
             event = frame.get("assistantMessageEvent")
             if isinstance(event, dict) and event.get("type") == "text_delta":
                 self._append_active_delta(str(event.get("delta") or ""))
+            elif isinstance(event, dict):
+                self._remember_active_final_text(_visible_text_from_payload(event))
             return
         if frame_type == "message_end":
             error_text = self._frame_error_text(frame)
             if error_text:
                 self._finish_active(error_text)
+            else:
+                self._remember_active_final_text(self._frame_visible_text(frame))
             return
         if frame_type in {"agent_end", "turn_end"}:
-            self._finish_active(self._frame_error_text(frame))
+            self._finish_active(self._frame_error_text(frame), fallback_text=self._frame_visible_text(frame))
             return
         if frame_type == "extension_ui_request":
             self._answer_extension_ui(frame)
@@ -582,6 +606,14 @@ class OhMyPiRpcAgent:
         parts = [part for part in (status, message or "Unknown OMP runtime error") if part]
         return "[Oh My Pi] " + ": ".join(parts)
 
+    def _frame_visible_text(self, frame: dict[str, Any]) -> str:
+        parts: list[str] = []
+        for key in ("message", "assistantMessage", "assistantMessageEvent"):
+            text = _visible_text_from_payload(frame.get(key))
+            if text:
+                parts.append(text)
+        return "".join(parts)
+
     def _append_active_delta(self, delta: str) -> None:
         if not delta:
             return
@@ -592,7 +624,16 @@ class OhMyPiRpcAgent:
             active.buffer += delta
             active.display_queue.put({"next": delta, "source": "ohmypi"})
 
-    def _finish_active(self, text: str | None = None, *, source: str = "ohmypi") -> None:
+    def _remember_active_final_text(self, text: str) -> None:
+        if not text:
+            return
+        with self._active_lock:
+            active = self._active
+            if active is None or active.finished:
+                return
+            active.final_text = text
+
+    def _finish_active(self, text: str | None = None, *, source: str = "ohmypi", fallback_text: str = "") -> None:
         done_text = ""
         signal_source = source
         request_id = ""
@@ -602,7 +643,12 @@ class OhMyPiRpcAgent:
                 self.is_running = False
                 return
             active.finished = True
-            done_text = active.buffer if text is None else text
+            if text is not None:
+                done_text = text
+            elif active.buffer:
+                done_text = active.buffer
+            else:
+                done_text = fallback_text or active.final_text
             signal_source = active.source or source
             request_id = active.request_id
             active.display_queue.put({"done": done_text, "source": source})

@@ -536,6 +536,56 @@ def assert_ohmypi_rpc_queue_mapping() -> None:
     agent.close()
 
 
+def assert_ohmypi_rpc_final_text_fallback() -> None:
+    def make_agent(processes: list[FakeRpcProcess]) -> omp.OhMyPiRpcAgent:
+        def process_factory(*_args, **_kwargs):
+            process = FakeRpcProcess(auto_finish=False)
+            processes.append(process)
+            return process
+
+        return omp.OhMyPiRpcAgent(
+            command=["/fake/omp", "--mode", "rpc"],
+            cwd=str(ROOT),
+            process_factory=process_factory,
+            startup_timeout=1,
+        )
+
+    processes_from_message_end: list[FakeRpcProcess] = []
+    agent = make_agent(processes_from_message_end)
+    dq = agent.put_task("hello", source="test")
+    process = wait_for_process(processes_from_message_end)
+    process.stdout.push({
+        "type": "message_end",
+        "message": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "测试成功。"}],
+        },
+    })
+    process.stdout.push({"type": "turn_end"})
+    done = dq.get(timeout=2)
+    assert done["done"] == "测试成功。", done
+    assert agent.is_running is False
+    assert agent.task_queue.unfinished_tasks == 0
+    agent.close()
+
+    processes_from_turn_end: list[FakeRpcProcess] = []
+    agent = make_agent(processes_from_turn_end)
+    dq = agent.put_task("hello", source="test")
+    process = wait_for_process(processes_from_turn_end)
+    process.stdout.push({
+        "type": "turn_end",
+        "message": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "直接成功。"}],
+        },
+    })
+    done = dq.get(timeout=2)
+    assert done["done"] == "直接成功。", done
+    assert agent.is_running is False
+    assert agent.task_queue.unfinished_tasks == 0
+    agent.close()
+
+
 def assert_ohmypi_rpc_env_model_switch_and_error_mapping() -> None:
     processes: list[FakeRpcProcess] = []
     popen_kwargs: list[dict[str, object]] = []
@@ -2951,6 +3001,7 @@ def run_checks() -> None:
     assert_ohmypi_memory_prompt_and_command()
     assert_ohmypi_isolated_runtime_settings()
     assert_ohmypi_rpc_queue_mapping()
+    assert_ohmypi_rpc_final_text_fallback()
     assert_ohmypi_rpc_env_model_switch_and_error_mapping()
     assert_ohmypi_host_tool_bridge()
     assert_ohmypi_tui_query_host_tool_contract()

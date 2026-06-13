@@ -425,6 +425,7 @@ configure_genericagent_provider_runtime(
 - `OhMyPiRpcAgent.put_task(prompt, source="", images=None)` must return a `queue.Queue` immediately.
 - Oh My Pi RPC `message_update` frames with `assistantMessageEvent.type:"text_delta"` map to queue items shaped as `{"next": <delta>, "source": "ohmypi"}`.
 - Oh My Pi RPC terminal frames `agent_end` or `turn_end` map to one queue item shaped as `{"done": <buffer>, "source": "ohmypi"}`.
+- If no `text_delta` populated the active buffer, the done text must fall back to visible assistant text carried by `message_end`, terminal-frame `message.content`, or `assistantMessageEvent` text payloads.
 - Startup, prompt, or missing-binary failures must map to a queue `done` item instead of raising into the TUI caller after `put_task()` returns.
 - The wrapper must expose the current GenericAgent-shaped compatibility surface used by existing TUI hot paths: `put_task()`, `abort()`, `get_llm_name()`, `list_llms()`, `load_llm_sessions()`, `next_llm()`, `is_running`, `task_queue.unfinished_tasks`, `log_path`, `llmclient.backend`, and `llmclients`.
 - `OhMyPiRuntimeAdapter.start_agent()` must not block on model or network startup. RPC process startup is lazy and happens on first prompt.
@@ -505,6 +506,7 @@ configure_genericagent_provider_runtime(
 - Tests must assert the generated memory append prompt is bounded, redacted, and passed to `omp` through `--append-system-prompt`.
 - Tests must assert completed Oh My Pi output can produce a governed memory candidate signal and that empty, too-short, and secret-looking outputs are skipped.
 - Tests must assert a fake RPC process maps `ready`, `prompt` ack, `message_update` deltas, and `agent_end` into queue `next`/`done` items.
+- Tests must assert a fake RPC process with no `text_delta` still produces non-empty `done` text when final assistant text is carried by `message_end.message.content` or terminal-frame `message.content`.
 - Tests must assert a fake RPC process receives app-injected `set_host_tools` definitions before the prompt frame.
 - Tests must assert fake `host_tool_call` frames receive `host_tool_result` success frames.
 - Tests must assert unknown or failing host tool calls receive `host_tool_result` with `isError:true`.
