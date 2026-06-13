@@ -534,3 +534,37 @@ Added a read-only GA/TUI governance host tool bridge for Oh My Pi RPC, wired app
 ### Next Steps
 
 - None - task complete
+
+
+## Session 17: OMP governed proposal bridge
+
+**Date**: 2026-06-13
+**Task**: OMP governed proposal bridge
+**Branch**: `experiment/ohmypi-runtime-memory`
+
+### Summary
+
+Added Oh My Pi ga_tui_propose host tool for governed ga-control actions and curated memory candidate approvals; updated provider metadata, tests, and backend spec.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `7c86c79` | (see git log) |
+| `8b92a92` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
