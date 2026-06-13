@@ -601,3 +601,36 @@ Implemented GA-TUI-managed isolated Oh My Pi runtime settings: generated OMP con
 ### Next Steps
 
 - None - task complete
+
+
+## Session 19: Fix OMP final text fallback
+
+**Date**: 2026-06-13
+**Task**: Fix OMP final text fallback
+**Branch**: `experiment/ohmypi-runtime-memory`
+
+### Summary
+
+Verified GA-TUI's embedded Oh My Pi runtime with a real smoke test, fixed final-only RPC text frames so OMP responses no longer render as empty done items, added regression coverage, and updated the OMP provider protocol spec.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `dfd52a4` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
