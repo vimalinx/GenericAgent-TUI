@@ -105,11 +105,16 @@ try:
         wrap_agentmain_tool_schema_loader,
     )
     from .ohmypi_provider import (
+        OhMyPiRuntimeConfig,
         OhMyPiRuntimeAdapter,
+        OhMyPiRuntimeModel,
         RpcHostToolDefinition,
+        ohmypi_isolated_agent_dir,
         ohmypi_memory_prompt_path,
         ohmypi_provider_spec,
         ohmypi_rpc_command,
+        ohmypi_subprocess_env,
+        write_ohmypi_runtime_files,
         write_ohmypi_memory_prompt,
     )
     from .runtime import RuntimeRegistry, genericagent_provider_spec
@@ -174,11 +179,16 @@ except Exception:
         wrap_agentmain_tool_schema_loader,
     )
     from ohmypi_provider import (  # type: ignore
+        OhMyPiRuntimeConfig,
         OhMyPiRuntimeAdapter,
+        OhMyPiRuntimeModel,
         RpcHostToolDefinition,
+        ohmypi_isolated_agent_dir,
         ohmypi_memory_prompt_path,
         ohmypi_provider_spec,
         ohmypi_rpc_command,
+        ohmypi_subprocess_env,
+        write_ohmypi_runtime_files,
         write_ohmypi_memory_prompt,
     )
     from runtime import RuntimeRegistry, genericagent_provider_spec  # type: ignore
@@ -11268,6 +11278,123 @@ def ohmypi_tui_query_host_tool_handler(state: Optional[State] = None):
     return ohmypi_tui_host_tool_handler(state)
 
 
+def ohmypi_model_api_for_entry(entry: LLMConfigEntry) -> str:
+    cfg_type = str(entry.cfg_type or "").lower()
+    if "claude" in cfg_type:
+        return "anthropic-messages"
+    if str(entry.cfg.get("api_mode") or "").strip() == "responses":
+        return "openai-responses"
+    return "openai-completions"
+
+
+def ohmypi_provider_id_for_entry(entry: LLMConfigEntry, index: int) -> str:
+    seed = "\0".join([
+        str(index),
+        config_display_name(entry),
+        str(entry.cfg.get("apibase") or ""),
+        str(entry.cfg.get("model") or ""),
+    ])
+    digest = hashlib.sha256(seed.encode("utf-8", errors="replace")).hexdigest()[:8]
+    base = compact_identifier(config_display_name(entry) or str(entry.cfg.get("apibase") or ""), 28)
+    return f"ga-tui-{base}-{digest}"
+
+
+def ohmypi_api_key_env_name(entry: LLMConfigEntry, index: int) -> str:
+    seed = "\0".join([
+        str(index),
+        config_display_name(entry),
+        str(entry.cfg.get("apibase") or ""),
+        str(entry.cfg.get("model") or ""),
+        str(entry.cfg.get("apikey") or ""),
+    ])
+    digest = hashlib.sha256(seed.encode("utf-8", errors="replace")).hexdigest()[:16].upper()
+    return f"GA_TUI_OMP_API_KEY_{digest}"
+
+
+def ohmypi_runtime_settings_payload(default_model: str) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "autoResume": True,
+        "browser": {"headless": True},
+        "github": {"enabled": False},
+        "memory": {"backend": "local"},
+        "providers": {"webSearch": "tavily"},
+        "symbolPreset": "unicode",
+        "task": {"maxRuntimeMs": 0},
+        "todo": {"eager": True},
+        "tools": {"approvalMode": "always-ask"},
+        "vault": {"enabled": False},
+    }
+    if default_model:
+        payload["modelRoles"] = {"default": default_model}
+    return payload
+
+
+def build_ohmypi_runtime_config(*, write_files: bool = True, base_env: Optional[dict[str, str]] = None) -> OhMyPiRuntimeConfig:
+    entries, mixin, _preserved, _error = load_llm_config_entries()
+    default_name = str((mixin.get("llm_nos") or [""])[0] or "").strip()
+    agent_dir = ohmypi_isolated_agent_dir(AGENT_HARNESS_DIR)
+    provider_payloads: dict[str, Any] = {}
+    runtime_models: list[OhMyPiRuntimeModel] = []
+    env_overrides: dict[str, str] = {}
+
+    for index, entry in enumerate(entries):
+        cfg = entry.cfg
+        api_key = str(cfg.get("apikey") or "").strip()
+        api_base = str(cfg.get("apibase") or "").strip()
+        model_id = str(cfg.get("model") or "").strip()
+        if not api_key or not api_base or not model_id:
+            continue
+        api = ohmypi_model_api_for_entry(entry)
+        provider_id = ohmypi_provider_id_for_entry(entry, index)
+        env_key = ohmypi_api_key_env_name(entry, index)
+        env_overrides[env_key] = api_key
+        provider_payloads[provider_id] = {
+            "api": api,
+            "apiKey": env_key,
+            "baseUrl": endpoint_base(api_base) or api_base,
+            "models": [{"api": api, "id": model_id}],
+        }
+        runtime_models.append(OhMyPiRuntimeModel(
+            provider=provider_id,
+            model_id=model_id,
+            display_name=config_display_name(entry),
+            base_url=api_base,
+            api=api,
+        ))
+
+    default_model = ""
+    for entry, runtime_model in zip(
+        [item for item in entries if str(item.cfg.get("apikey") or "").strip() and str(item.cfg.get("apibase") or "").strip() and str(item.cfg.get("model") or "").strip()],
+        runtime_models,
+    ):
+        if default_name and config_display_name(entry) == default_name:
+            default_model = runtime_model.selector
+            break
+    if not default_model and runtime_models:
+        default_model = runtime_models[0].selector
+
+    paths = {
+        "agent_dir": agent_dir,
+        "config_path": os.path.join(agent_dir, "config.yml"),
+        "models_path": os.path.join(agent_dir, "models.yml"),
+    }
+    if write_files:
+        paths = write_ohmypi_runtime_files(
+            agent_dir=agent_dir,
+            config=ohmypi_runtime_settings_payload(default_model),
+            models={"providers": provider_payloads},
+        )
+    env = ohmypi_subprocess_env(agent_dir=agent_dir, env_overrides=env_overrides, base_env=base_env)
+    return OhMyPiRuntimeConfig(
+        agent_dir=paths["agent_dir"],
+        env=env,
+        models=runtime_models,
+        default_model=default_model,
+        config_path=paths["config_path"],
+        models_path=paths["models_path"],
+    )
+
+
 def agent_runtime_registry(*, write_memory_prompt_file: bool = True) -> RuntimeRegistry:
     requested = os.environ.get("GA_TUI_RUNTIME_PROVIDER", "ohmypi").strip() or "ohmypi"
     registry = RuntimeRegistry(default_provider_id=requested)
@@ -11282,16 +11409,23 @@ def agent_runtime_registry(*, write_memory_prompt_file: bool = True) -> RuntimeR
         if write_memory_prompt_file
         else ohmypi_memory_prompt_path(AGENT_HARNESS_DIR)
     )
-    ohmypi_command = ohmypi_rpc_command(append_system_prompt=ohmypi_append_prompt_path)
+    ohmypi_runtime_config = build_ohmypi_runtime_config(write_files=True)
+    ohmypi_command = ohmypi_rpc_command(
+        append_system_prompt=ohmypi_append_prompt_path,
+        model=ohmypi_runtime_config.default_model,
+    )
     registry.register(OhMyPiRuntimeAdapter(ohmypi_provider_spec(
         root_dir=ROOT_DIR,
         harness_dir=AGENT_HARNESS_DIR,
         recent_models_path=LLM_RECENT_MODELS_PATH,
         schedules_path=AGENT_SCHEDULES_PATH,
         command=ohmypi_command,
+        runtime_config=ohmypi_runtime_config,
     ),
         command=ohmypi_command,
         cwd=ROOT_DIR,
+        env=ohmypi_runtime_config.env,
+        configured_models=ohmypi_runtime_config.models,
         memory_candidate_sink=append_ohmypi_memory_candidate_signal,
         host_tool_definitions=ohmypi_tui_host_tool_definitions(),
         host_tool_handler=ohmypi_tui_host_tool_handler(None),

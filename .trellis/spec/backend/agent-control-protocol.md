@@ -402,6 +402,8 @@ configure_genericagent_provider_runtime(
 - Provider metadata helper: `ohmypi_provider_spec(root_dir, harness_dir, recent_models_path, schedules_path, binary=None, command=None)`.
 - RPC command helper: `ohmypi_rpc_command(binary=None, extra_args=None, append_system_prompt=None)`.
 - Memory append prompt helpers: `write_ohmypi_memory_prompt(root_dir, harness_dir)` and `ohmypi_memory_prompt_path(harness_dir)`.
+- Isolated runtime helpers: `ohmypi_runtime_root(harness_dir)`, `ohmypi_isolated_agent_dir(harness_dir)`, `ohmypi_config_path(agent_dir)`, `ohmypi_models_path(agent_dir)`, `write_ohmypi_runtime_files(...)`, and `ohmypi_subprocess_env(...)`.
+- Isolated runtime records: `OhMyPiRuntimeConfig` and `OhMyPiRuntimeModel`.
 - TUI host tools exposed to OMP: `ga_tui_query` and `ga_tui_propose`.
 - Read-only host tool definition helper: `ohmypi_tui_readonly_host_tool_definitions()`.
 - Governed proposal host tool definition helper: `ohmypi_tui_proposal_host_tool_definition()`.
@@ -413,6 +415,9 @@ configure_genericagent_provider_runtime(
   - `GA_TUI_RUNTIME_PROVIDER=genericagent` selects the fallback GenericAgent adapter.
   - `GA_TUI_OHMYPI_BIN` overrides the executable, default `omp`.
   - `GA_TUI_OHMYPI_ARGS` appends shell-split extra CLI arguments.
+- OMP subprocess environment:
+  - `PI_CODING_AGENT_DIR` must point to the GA-TUI-owned isolated OMP agent directory under `${AGENT_HARNESS_DIR}/runtime/ohmypi/agent`.
+  - Generated per-process API key env vars use `GA_TUI_OMP_API_KEY_<digest>` and must be passed only through the OMP child process env.
 - Default RPC command shape: `omp --mode rpc --no-title --approval-mode always-ask --append-system-prompt <generated-memory-file>`.
 
 ### 3. Contracts
@@ -427,6 +432,12 @@ configure_genericagent_provider_runtime(
 - Oh My Pi unrestricted host tools remain disabled in provider metadata: `capabilities.host_tools:false`.
 - The only allowed host tool bridge is app-injected TUI governance querying and governed proposal routing: `capabilities.tui_readonly_host_tools:true` and `capabilities.tui_governed_proposal_tools:true`.
 - `OhMyPiRpcAgent` may register host tools through `set_host_tools` only from definitions injected by `app.py`; provider code must not invent writable tools or import TUI `State`.
+- Embedded OMP must use a GA-TUI-owned runtime root and must not read or write system-level `~/.omp/agent/config.yml`, `~/.omp/agent/models.yml`, sessions, auth storage, or cache as its active agent directory.
+- `app.py` owns translation from GA-TUI `/model` entries to isolated OMP `config.yml` and `models.yml`; `ohmypi_provider.py` owns only generic runtime file writing, subprocess env, command construction, and RPC behavior.
+- Generated OMP `config.yml` must set `modelRoles.default` to the GA-TUI default model selector when a complete matching `/model` entry exists.
+- Generated OMP `models.yml` must represent complete GA-TUI OpenAI-compatible entries as custom OMP providers with `baseUrl`, `apiKey`, `api`, and `models[].id`; API keys must be referenced through child-process env var names instead of written as secrets in the generated file.
+- Incomplete GA-TUI model entries without API key, base URL, or model id are skipped when generating OMP model providers.
+- OMP runtime model rows exposed to the TUI must preserve enough provider/model/base URL metadata for `/model` current-session switching to call OMP `set_model` with structured `provider` and `modelId`.
 - `ga_tui_query` is read-only and must never mutate sessions, tasks, agents, approvals, artifacts, memory, or files.
 - `ga_tui_propose` accepts only bounded proposal payloads with `proposal_type:"ga_control"` or `proposal_type:"memory_candidate"`.
 - `ga_tui_propose` with `proposal_type:"ga_control"` must require a current-schema `ga-control.v2` envelope or `agenttask.v2` action object, validate that it maps to known current controls, and route execution through `apply_tui_controls_from_text(..., source="agent:ohmypi_host_tool")` so existing policy gates and ledgers remain the source of truth.
@@ -437,6 +448,7 @@ configure_genericagent_provider_runtime(
 - Host tool result payloads must be AgentToolResult-shaped JSON, with bounded redacted text under `content:[{"type":"text","text":"..."}]`.
 - Unknown tools, missing handlers, invalid arguments, and callback failures must return `host_tool_result` with `isError:true` instead of crashing the stdout reader or active prompt.
 - OMP `host_tool_cancel` frames must be accepted safely and must not mutate TUI state.
+- OMP terminal error details from `message_end`, `turn_end`, or `agent_end` must map to a visible queue `done` item when frames carry `stopReason:"error"`, `errorMessage`, or `errorStatus`; error turns must not become empty assistant replies.
 - Host URI schemes and TUI approval mapping remain disabled until a separate explicit task designs those governance contracts.
 - On this experiment branch, Oh My Pi is the default runtime provider when `GA_TUI_RUNTIME_PROVIDER` is unset.
 - GenericAgent must remain selectable with `GA_TUI_RUNTIME_PROVIDER=genericagent`.
@@ -461,10 +473,17 @@ configure_genericagent_provider_runtime(
 - OMP `host_tool_call` for an unregistered tool -> provider sends `host_tool_result` with `isError:true`.
 - OMP `host_tool_call` whose callback raises -> provider sends `host_tool_result` with `isError:true`.
 - OMP `host_tool_cancel` -> provider records the cancellation safely and continues normal prompt handling.
+- Complete GA-TUI model entry -> isolated OMP `models.yml` gets one provider/model mapping and the child env gets a matching `GA_TUI_OMP_API_KEY_<digest>` value.
+- Incomplete GA-TUI model entry -> omitted from isolated OMP `models.yml`; no invalid OMP provider is generated.
+- Selected GA-TUI default model -> OMP command may include `--model <isolated-provider>/<model-id>` and isolated `config.yml` carries the same `modelRoles.default`.
+- User system OMP config exists -> policy checks must verify its hash remains unchanged across embedded OMP runtime setup.
+- OMP error frame with `stopReason:"error"` and `errorMessage` -> active TUI queue receives a visible `[Oh My Pi] ...` done item.
 
 ### 5. Good/Base/Bad Cases
 
 - Good: unset `GA_TUI_RUNTIME_PROVIDER` selects `OhMyPiRuntimeAdapter`, starts `omp --mode rpc` lazily with the generated memory append prompt, streams text deltas into the existing TUI message renderer, and keeps GenericAgent available as an explicit fallback.
+- Good: `/model` entries are projected into `${AGENT_HARNESS_DIR}/runtime/ohmypi/agent/models.yml`, OMP is launched with `PI_CODING_AGENT_DIR` pointing at that directory, and system `~/.omp/agent/config.yml` is untouched.
+- Good: generated `models.yml` stores `apiKey: GA_TUI_OMP_API_KEY_<digest>` while the secret value is supplied only in the child process env.
 - Good: Missing `omp` produces an assistant-visible error message instead of crashing startup.
 - Base: `/runtimes` shows both `genericagent` and `ohmypi`, while the experiment-branch default is `ohmypi`.
 - Base: Oh My Pi can query bounded TUI governance facts through `ga_tui_query` without mutating task ledgers, approvals, artifacts, or long-term memory.
@@ -473,6 +492,8 @@ configure_genericagent_provider_runtime(
 - Base: A durable completed Oh My Pi output records a memory candidate signal for later approval instead of writing long-term memory directly.
 - Base: Oh My Pi internal task/subagent events are provider-owned details until a future ledger-mapping feature is implemented.
 - Bad: The provider imports `app.py` to read TUI state or mutate ledgers directly.
+- Bad: Embedded OMP inherits `~/.omp/agent` or uses the user's system OMP `modelRoles.default`, because `/model` would no longer be the single GA-TUI settings surface.
+- Bad: Generated OMP `models.yml` writes raw API key values.
 - Bad: The adapter enables arbitrary OMP host tools, host URI schemes, writable operations, or auto-approval before TUI policy gates can audit and approve those operations.
 - Bad: `app.py` contains Oh My Pi RPC parsing logic instead of provider-local parsing.
 
@@ -491,6 +512,11 @@ configure_genericagent_provider_runtime(
 - Tests must assert `ga_tui_query` remains read-only and `ga_tui_propose` supports governed `ga_control` and `memory_candidate` proposals.
 - Tests must assert `ga_tui_propose` memory candidates create existing memory approval artifacts/approval rows and invalid proposals return structured errors.
 - Tests must assert provider metadata advertises `tui_readonly_host_tools:true` and `tui_governed_proposal_tools:true` while keeping unrestricted `host_tools:false`.
+- Tests must assert isolated OMP runtime files are generated under `${AGENT_HARNESS_DIR}/runtime/ohmypi/agent`, not under `~/.omp/agent`.
+- Tests must assert generated OMP API keys are env references in `models.yml`, raw key values are absent from generated files, and child-process env carries `PI_CODING_AGENT_DIR`.
+- Tests must assert `/model` default selection maps to isolated OMP `modelRoles.default` and RPC `set_model` can be sent before the first prompt when a TUI model is selected.
+- Tests must assert OMP terminal error frames surface `errorMessage` / `errorStatus` visibly instead of an empty done item.
+- Tests must assert system `~/.omp/agent/config.yml` hash remains unchanged when present.
 - Tests must assert missing binary failure and `abort()` cleanup decrement unfinished task state.
 - `python3 -m py_compile src/ga_tui/app.py src/ga_tui/ohmypi_provider.py scripts/check_policy_gates.py`, `python3 scripts/check_policy_gates.py`, `python3 -m compileall -q src scripts`, `git diff --check`, and `ga-tui-check --root /home/vimalinx/Programs/GenericAgent` must pass.
 

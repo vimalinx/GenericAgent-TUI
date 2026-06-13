@@ -10,6 +10,7 @@ import sys
 import tempfile
 import time
 import json
+import hashlib
 import threading
 import urllib.request
 import curses
@@ -449,6 +450,59 @@ def assert_ohmypi_memory_prompt_and_command() -> None:
     assert "/user/append.md" in command_with_user_append, command_with_user_append
 
 
+def assert_ohmypi_isolated_runtime_settings() -> None:
+    root = tempfile.mkdtemp(prefix="ga_tui_omp_isolated_")
+    retarget_harness(root)
+    mykey_file = os.path.join(root, "mykey.py")
+    Path(mykey_file).write_text(
+        "\n".join([
+            "mixin_config = {'llm_nos': ['beta'], 'max_retries': 10, 'base_delay': 0.5}",
+            "native_oai_config = {'name': 'alpha', 'apikey': 'key-alpha', 'apibase': 'https://alpha.example.invalid/v1', 'model': 'model-alpha'}",
+            "native_oai_config_1 = {'name': 'beta', 'apikey': 'key-beta', 'apibase': 'https://beta.example.invalid/v1', 'model': 'model-beta', 'api_mode': 'responses'}",
+            "",
+        ]),
+        encoding="utf-8",
+    )
+    old_mykey_path = a.mykey_path
+    system_config = Path.home() / ".omp" / "agent" / "config.yml"
+    before_hash = hashlib.sha256(system_config.read_bytes()).hexdigest() if system_config.exists() else ""
+    try:
+        a.mykey_path = lambda: mykey_file
+        runtime_config = a.build_ohmypi_runtime_config(base_env={})
+        assert runtime_config.agent_dir == os.path.join(a.AGENT_HARNESS_DIR, "runtime", "ohmypi", "agent"), runtime_config
+        assert not runtime_config.agent_dir.startswith(str(Path.home() / ".omp")), runtime_config.agent_dir
+        assert runtime_config.env["PI_CODING_AGENT_DIR"] == runtime_config.agent_dir, runtime_config.env
+        assert len(runtime_config.models) == 2, runtime_config.models
+        assert runtime_config.default_model.endswith("/model-beta"), runtime_config.default_model
+        config_data = json.loads(Path(runtime_config.config_path).read_text(encoding="utf-8"))
+        models_data = json.loads(Path(runtime_config.models_path).read_text(encoding="utf-8"))
+        assert config_data["modelRoles"]["default"] == runtime_config.default_model, config_data
+        assert config_data["tools"]["approvalMode"] == "always-ask", config_data
+        assert "providers" in models_data and len(models_data["providers"]) == 2, models_data
+        beta_provider = next(
+            provider for provider in models_data["providers"].values()
+            if provider["models"][0]["id"] == "model-beta"
+        )
+        assert beta_provider["api"] == "openai-responses", beta_provider
+        assert beta_provider["apiKey"].startswith("GA_TUI_OMP_API_KEY_"), beta_provider
+        assert "key-beta" not in Path(runtime_config.models_path).read_text(encoding="utf-8")
+
+        registry = a.agent_runtime_registry(write_memory_prompt_file=False)
+        adapter = registry.get("ohmypi")
+        assert adapter is not None
+        assert getattr(adapter, "env")["PI_CODING_AGENT_DIR"] == runtime_config.agent_dir
+        record = adapter.spec.to_record()
+        assert record["model_routing"]["isolated_agent_dir"] == runtime_config.agent_dir, record
+        assert record["model_routing"]["configured_model_count"] == 2, record
+        command = getattr(adapter, "command")
+        assert "--model" in command and runtime_config.default_model in command, command
+        if before_hash:
+            after_hash = hashlib.sha256(system_config.read_bytes()).hexdigest()
+            assert after_hash == before_hash, (before_hash, after_hash)
+    finally:
+        a.mykey_path = old_mykey_path
+
+
 def assert_ohmypi_rpc_queue_mapping() -> None:
     processes: list[FakeRpcProcess] = []
     memory_signals: list[dict[str, object]] = []
@@ -479,6 +533,58 @@ def assert_ohmypi_rpc_queue_mapping() -> None:
     assert memory_signals
     assert memory_signals[-1]["schema_version"] == "ohmypi.memory_candidate_signal.v1", memory_signals[-1]
     assert memory_signals[-1]["statement"] == expected_done, memory_signals[-1]
+    agent.close()
+
+
+def assert_ohmypi_rpc_env_model_switch_and_error_mapping() -> None:
+    processes: list[FakeRpcProcess] = []
+    popen_kwargs: list[dict[str, object]] = []
+
+    def process_factory(*_args, **kwargs):
+        process = FakeRpcProcess(auto_finish=False)
+        processes.append(process)
+        popen_kwargs.append(dict(kwargs))
+        return process
+
+    models = [
+        omp.OhMyPiRuntimeModel(provider="ga-tui-alpha", model_id="model-alpha", display_name="alpha", base_url="https://alpha.example.invalid/v1"),
+        omp.OhMyPiRuntimeModel(provider="ga-tui-beta", model_id="model-beta", display_name="beta", base_url="https://beta.example.invalid/v1"),
+    ]
+    env = {"PI_CODING_AGENT_DIR": "/tmp/ga-tui-omp-agent", "GA_TUI_OMP_API_KEY_TEST": "key"}
+    agent = omp.OhMyPiRpcAgent(
+        command=["/fake/omp", "--mode", "rpc"],
+        cwd=str(ROOT),
+        env=env,
+        process_factory=process_factory,
+        configured_models=models,
+        startup_timeout=1,
+    )
+    assert agent.list_llms() == [(0, "OhMyPi/alpha", True), (1, "OhMyPi/beta", False)], agent.list_llms()
+    agent.next_llm(1)
+    assert agent.llm_no == 1
+    assert agent.get_llm_name(model=True) == "model-beta"
+    dq = agent.put_task("hello", source="test")
+    process = wait_for_process(processes)
+    assert popen_kwargs[0]["env"] == env, popen_kwargs
+    set_model = wait_for_rpc_write(process, lambda frame: frame.get("type") == "set_model")
+    prompt = wait_for_rpc_write(process, lambda frame: frame.get("type") == "prompt")
+    assert set_model["provider"] == "ga-tui-beta", set_model
+    assert set_model["modelId"] == "model-beta", set_model
+    assert process.stdin.writes.index(set_model) < process.stdin.writes.index(prompt), process.stdin.writes
+
+    process.stdout.push({
+        "type": "message_end",
+        "message": {
+            "role": "assistant",
+            "stopReason": "error",
+            "errorMessage": "Incorrect API key provided",
+            "errorStatus": "401",
+        },
+    })
+    done = dq.get(timeout=2)
+    assert "[Oh My Pi] 401: Incorrect API key provided" == done["done"], done
+    assert agent.is_running is False
+    assert agent.task_queue.unfinished_tasks == 0
     agent.close()
 
 
@@ -2843,7 +2949,9 @@ def run_checks() -> None:
     assert_ohmypi_provider_module_boundary()
     assert_ohmypi_runtime_registry()
     assert_ohmypi_memory_prompt_and_command()
+    assert_ohmypi_isolated_runtime_settings()
     assert_ohmypi_rpc_queue_mapping()
+    assert_ohmypi_rpc_env_model_switch_and_error_mapping()
     assert_ohmypi_host_tool_bridge()
     assert_ohmypi_tui_query_host_tool_contract()
     assert_ohmypi_tui_proposal_host_tool_contract()

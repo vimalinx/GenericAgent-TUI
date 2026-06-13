@@ -16,7 +16,7 @@ import shutil
 import subprocess
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 try:
@@ -32,6 +32,8 @@ HostToolHandler = Callable[[str, dict[str, Any]], dict[str, Any]]
 
 GA_TUI_MEMORY_PROMPT_FILENAME = "ohmypi-ga-tui-memory.md"
 GA_TUI_MEMORY_PROMPT_HEADER = "GA/TUI Memory Guidance"
+OHMYPI_RUNTIME_DIRNAME = "ohmypi"
+OHMYPI_AGENT_DIRNAME = "agent"
 MAX_HOST_TOOL_RESULT_CHARS = 12000
 _SECRET_PATTERNS = (
     re.compile(r"\bsk-[A-Za-z0-9_\-]{16,}\b"),
@@ -66,6 +68,8 @@ class _OhMyPiBackend:
     api_base: str = ""
     apibase: str = ""
     log_path: str = ""
+    provider: str = ""
+    model_id: str = ""
 
     def __post_init__(self) -> None:
         self.history: list[dict[str, Any]] = []
@@ -112,6 +116,87 @@ class RpcHostToolDefinition:
         return data
 
 
+@dataclass(frozen=True)
+class OhMyPiRuntimeModel:
+    provider: str
+    model_id: str
+    display_name: str = ""
+    base_url: str = ""
+    api: str = ""
+
+    @property
+    def selector(self) -> str:
+        if self.provider and self.model_id:
+            return f"{self.provider}/{self.model_id}"
+        return self.model_id or self.provider
+
+
+@dataclass(frozen=True)
+class OhMyPiRuntimeConfig:
+    agent_dir: str
+    env: dict[str, str] = field(default_factory=dict)
+    models: list[OhMyPiRuntimeModel] = field(default_factory=list)
+    default_model: str = ""
+    config_path: str = ""
+    models_path: str = ""
+
+
+def ohmypi_runtime_root(harness_dir: str) -> str:
+    return os.path.join(harness_dir, "runtime", OHMYPI_RUNTIME_DIRNAME)
+
+
+def ohmypi_isolated_agent_dir(harness_dir: str) -> str:
+    return os.path.join(ohmypi_runtime_root(harness_dir), OHMYPI_AGENT_DIRNAME)
+
+
+def ohmypi_config_path(agent_dir: str) -> str:
+    return os.path.join(agent_dir, "config.yml")
+
+
+def ohmypi_models_path(agent_dir: str) -> str:
+    return os.path.join(agent_dir, "models.yml")
+
+
+def _json_yaml_text(value: dict[str, Any]) -> str:
+    return json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+
+
+def _write_text_atomic(path: str, text: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as handle:
+        handle.write(text)
+    os.replace(tmp_path, path)
+
+
+def write_ohmypi_runtime_files(
+    *,
+    agent_dir: str,
+    config: dict[str, Any],
+    models: dict[str, Any],
+) -> dict[str, str]:
+    os.makedirs(agent_dir, exist_ok=True)
+    config_path = ohmypi_config_path(agent_dir)
+    models_path = ohmypi_models_path(agent_dir)
+    _write_text_atomic(config_path, _json_yaml_text(config))
+    _write_text_atomic(models_path, _json_yaml_text(models))
+    return {"agent_dir": agent_dir, "config_path": config_path, "models_path": models_path}
+
+
+def ohmypi_subprocess_env(
+    *,
+    agent_dir: str,
+    env_overrides: dict[str, str] | None = None,
+    base_env: dict[str, str] | None = None,
+) -> dict[str, str]:
+    env = dict(os.environ if base_env is None else base_env)
+    env["PI_CODING_AGENT_DIR"] = agent_dir
+    for key, value in (env_overrides or {}).items():
+        if key:
+            env[str(key)] = str(value)
+    return env
+
+
 def _host_tool_definition_to_rpc(definition: RpcHostToolDefinition | dict[str, Any]) -> dict[str, Any]:
     if isinstance(definition, RpcHostToolDefinition):
         return definition.to_rpc()
@@ -150,16 +235,19 @@ class OhMyPiRpcAgent:
         *,
         command: list[str] | None = None,
         cwd: str | None = None,
+        env: dict[str, str] | None = None,
         process_factory: ProcessFactory | None = None,
         thread_factory: ThreadFactory = threading.Thread,
         memory_candidate_sink: MemoryCandidateSink | None = None,
         host_tool_definitions: list[RpcHostToolDefinition | dict[str, Any]] | None = None,
         host_tool_handler: HostToolHandler | None = None,
+        configured_models: list[OhMyPiRuntimeModel] | None = None,
         startup_timeout: float = 10.0,
         stop_timeout: float = 3.0,
     ) -> None:
         self.command = list(command or ohmypi_rpc_command())
         self.cwd = cwd or os.getcwd()
+        self.env = dict(env) if env is not None else None
         self.process_factory = process_factory or subprocess.Popen
         self.thread_factory = thread_factory
         self.memory_candidate_sink = memory_candidate_sink
@@ -177,8 +265,9 @@ class OhMyPiRpcAgent:
         self.history: list[str] = []
         self.handler = None
         self.llm_no = 0
-        self.llmclient = _OhMyPiClient(_OhMyPiBackend())
-        self.llmclients = [self.llmclient]
+        self.configured_models = list(configured_models or [])
+        self.llmclients = self._clients_from_models(self.configured_models)
+        self.llmclient = self.llmclients[0]
         self._process: Any = None
         self._ready = threading.Event()
         self._send_lock = threading.Lock()
@@ -188,6 +277,23 @@ class OhMyPiRpcAgent:
         self._stderr_tail: list[str] = []
         self._closed = False
         self._host_tools_registered = False
+        self._pending_model: OhMyPiRuntimeModel | None = None
+
+    def _clients_from_models(self, models: list[OhMyPiRuntimeModel]) -> list[_OhMyPiClient]:
+        if not models:
+            return [_OhMyPiClient(_OhMyPiBackend())]
+        clients: list[_OhMyPiClient] = []
+        for model in models:
+            backend = _OhMyPiBackend(
+                name=model.display_name or model.selector or "Oh My Pi",
+                model=model.model_id or "unknown",
+                api_base=model.base_url,
+                apibase=model.base_url,
+                provider=model.provider,
+                model_id=model.model_id,
+            )
+            clients.append(_OhMyPiClient(backend))
+        return clients
 
     def configure_host_tools(
         self,
@@ -215,12 +321,25 @@ class OhMyPiRpcAgent:
             self._send({"id": self._next_request_id("models"), "type": "get_available_models"})
 
     def next_llm(self, index: int = -1) -> None:
-        del index
-        if self._process is not None:
+        if self.configured_models:
+            if index < 0:
+                index = (self.llm_no + 1) % len(self.configured_models)
+            if index < 0 or index >= len(self.configured_models):
+                return
+            self.llm_no = index
+            self.llmclient = self.llmclients[index]
+            self._pending_model = self.configured_models[index]
+            if self._process is not None and self._process.poll() is None and self._ready.is_set():
+                self._apply_pending_model()
+            return
+        if self._process is not None and self._process.poll() is None:
             self._send({"id": self._next_request_id("cycle"), "type": "cycle_model"})
 
     def list_llms(self) -> list[tuple[int, str, bool]]:
-        return [(0, self.get_llm_name(model=False), True)]
+        return [
+            (idx, f"OhMyPi/{getattr(client.backend, 'name', 'Oh My Pi')}", idx == self.llm_no)
+            for idx, client in enumerate(self.llmclients)
+        ]
 
     def get_llm_name(self, b: Any = None, model: bool = False) -> str:
         client = self.llmclient if b is None else b
@@ -278,6 +397,7 @@ class OhMyPiRpcAgent:
     def _ensure_process(self) -> None:
         if self._process is not None and self._process.poll() is None:
             if self._ready.wait(self.startup_timeout):
+                self._apply_pending_model()
                 return
             raise RuntimeError("RPC ready timeout")
         binary = self.command[0] if self.command else "omp"
@@ -295,12 +415,14 @@ class OhMyPiRpcAgent:
             encoding="utf-8",
             errors="replace",
             bufsize=1,
+            env=self.env,
         )
         self.thread_factory(target=self._read_stdout, daemon=True, name="ohmypi-rpc-stdout").start()
         self.thread_factory(target=self._read_stderr, daemon=True, name="ohmypi-rpc-stderr").start()
         if not self._ready.wait(self.startup_timeout):
             self._terminate_process(self._process)
             raise RuntimeError("RPC ready timeout")
+        self._apply_pending_model()
 
     def _read_stdout(self) -> None:
         process = self._process
@@ -358,8 +480,13 @@ class OhMyPiRpcAgent:
             if isinstance(event, dict) and event.get("type") == "text_delta":
                 self._append_active_delta(str(event.get("delta") or ""))
             return
+        if frame_type == "message_end":
+            error_text = self._frame_error_text(frame)
+            if error_text:
+                self._finish_active(error_text)
+            return
         if frame_type in {"agent_end", "turn_end"}:
-            self._finish_active()
+            self._finish_active(self._frame_error_text(frame))
             return
         if frame_type == "extension_ui_request":
             self._answer_extension_ui(frame)
@@ -384,9 +511,7 @@ class OhMyPiRpcAgent:
         if command == "get_available_models" and isinstance(data, dict):
             models = data.get("models")
             if isinstance(models, list) and models:
-                first = models[0]
-                if isinstance(first, dict):
-                    self._update_model(first)
+                self._replace_models_from_rpc(models)
 
     def _update_model(self, model: dict[str, Any]) -> None:
         provider = str(model.get("provider") or self.llmclient.backend.name or "Oh My Pi")
@@ -394,6 +519,68 @@ class OhMyPiRpcAgent:
         name = str(model.get("name") or provider or "Oh My Pi")
         self.llmclient.backend.name = provider or name
         self.llmclient.backend.model = model_id
+        self.llmclient.backend.provider = provider
+        self.llmclient.backend.model_id = model_id
+
+    def _replace_models_from_rpc(self, models: list[Any]) -> None:
+        configured: list[OhMyPiRuntimeModel] = []
+        for item in models:
+            if not isinstance(item, dict):
+                continue
+            provider = str(item.get("provider") or "").strip()
+            model_id = str(item.get("id") or item.get("modelId") or "").strip()
+            if not provider or not model_id:
+                continue
+            configured.append(OhMyPiRuntimeModel(
+                provider=provider,
+                model_id=model_id,
+                display_name=str(item.get("name") or f"{provider}/{model_id}"),
+                base_url=str(item.get("baseUrl") or item.get("base_url") or ""),
+                api=str(item.get("api") or ""),
+            ))
+        if not configured:
+            return
+        current_selector = self.configured_models[self.llm_no].selector if self.configured_models and self.llm_no < len(self.configured_models) else ""
+        self.configured_models = configured
+        self.llmclients = self._clients_from_models(configured)
+        self.llm_no = 0
+        for idx, model in enumerate(configured):
+            if model.selector == current_selector:
+                self.llm_no = idx
+                break
+        self.llmclient = self.llmclients[self.llm_no]
+
+    def _apply_pending_model(self) -> None:
+        model = self._pending_model
+        if model is None or not model.provider or not model.model_id:
+            return
+        self._pending_model = None
+        self._send({
+            "id": self._next_request_id("set-model"),
+            "type": "set_model",
+            "provider": model.provider,
+            "modelId": model.model_id,
+        })
+
+    def _frame_error_text(self, frame: dict[str, Any]) -> str | None:
+        objects: list[dict[str, Any]] = [frame]
+        for key in ("message", "assistantMessage", "assistantMessageEvent", "error"):
+            value = frame.get(key)
+            if isinstance(value, dict):
+                objects.append(value)
+        stop_reason = ""
+        status = ""
+        message = ""
+        for item in objects:
+            stop_reason = stop_reason or str(item.get("stopReason") or item.get("stop_reason") or "")
+            status = status or str(item.get("errorStatus") or item.get("status") or "")
+            raw_message = item.get("errorMessage") or item.get("error")
+            if raw_message and not isinstance(raw_message, dict):
+                message = message or str(raw_message)
+        if not message and stop_reason != "error":
+            return None
+        parts = [part for part in (status, message or "Unknown OMP runtime error") if part]
+        return "[Oh My Pi] " + ": ".join(parts)
 
     def _append_active_delta(self, delta: str) -> None:
         if not delta:
@@ -569,25 +756,31 @@ class OhMyPiRuntimeAdapter(RuntimeAdapter):
         memory_candidate_sink: MemoryCandidateSink | None = None,
         host_tool_definitions: list[RpcHostToolDefinition | dict[str, Any]] | None = None,
         host_tool_handler: HostToolHandler | None = None,
+        env: dict[str, str] | None = None,
+        configured_models: list[OhMyPiRuntimeModel] | None = None,
     ) -> None:
         super().__init__(spec)
         self.command = command
         self.cwd = cwd
+        self.env = dict(env) if env is not None else None
         self.process_factory = process_factory
         self.thread_factory = thread_factory
         self.memory_candidate_sink = memory_candidate_sink
         self.host_tool_definitions = list(host_tool_definitions or [])
         self.host_tool_handler = host_tool_handler
+        self.configured_models = list(configured_models or [])
 
     def create_agent(self) -> OhMyPiRpcAgent:
         return OhMyPiRpcAgent(
             command=self.command,
             cwd=self.cwd,
+            env=self.env,
             process_factory=self.process_factory,
             thread_factory=self.thread_factory,
             memory_candidate_sink=self.memory_candidate_sink,
             host_tool_definitions=self.host_tool_definitions,
             host_tool_handler=self.host_tool_handler,
+            configured_models=self.configured_models,
         )
 
     def prepare_agent(self, agent: Any, *, state: Any = None) -> None:
@@ -613,6 +806,7 @@ def ohmypi_rpc_command(
     binary: str | None = None,
     extra_args: list[str] | None = None,
     append_system_prompt: str | None = None,
+    model: str | None = None,
 ) -> list[str]:
     binary = binary or os.environ.get("GA_TUI_OHMYPI_BIN", "omp")
     env_args = shlex.split(os.environ.get("GA_TUI_OHMYPI_ARGS", ""))
@@ -625,6 +819,8 @@ def ohmypi_rpc_command(
         "--approval-mode",
         "always-ask",
     ]
+    if model and not _has_cli_flag(appended_args, "--model"):
+        args.extend(["--model", model])
     if append_system_prompt and not _has_cli_flag(appended_args, "--append-system-prompt"):
         args.extend(["--append-system-prompt", append_system_prompt])
     args.extend(appended_args)
@@ -724,6 +920,7 @@ def ohmypi_provider_spec(
     schedules_path: str,
     binary: str | None = None,
     command: list[str] | None = None,
+    runtime_config: OhMyPiRuntimeConfig | None = None,
 ) -> RuntimeProviderSpec:
     command = list(command or ohmypi_rpc_command(binary=binary))
     executable = command[0]
@@ -751,12 +948,17 @@ def ohmypi_provider_spec(
             "provider_owned_subagents": True,
         },
         model_routing={
-            "owner": "ohmypi.rpc",
-            "supports_runtime_switch": False,
-            "supports_default_model": False,
+            "owner": "ga-tui.control_plane",
+            "supports_runtime_switch": True,
+            "supports_default_model": True,
             "supports_per_agent_default": False,
             "recent_models_path": recent_models_path,
-            "selection_contract": "Oh My Pi model registry via RPC get_state/get_available_models",
+            "selection_contract": "GA-TUI /model entries projected into isolated OMP config.yml and models.yml",
+            "isolated_agent_dir": runtime_config.agent_dir if runtime_config else "",
+            "config_path": runtime_config.config_path if runtime_config else "",
+            "models_path": runtime_config.models_path if runtime_config else "",
+            "default_model": runtime_config.default_model if runtime_config else "",
+            "configured_model_count": len(runtime_config.models) if runtime_config else 0,
         },
         scheduler={
             "owner": "ga-tui.control_plane",
@@ -783,6 +985,7 @@ def ohmypi_provider_spec(
         notes=[
             "Experiment branch default provider; GenericAgent remains available via GA_TUI_RUNTIME_PROVIDER=genericagent.",
             "Oh My Pi runs out-of-process through JSONL stdio RPC.",
+            "Embedded Oh My Pi uses a GA-TUI-owned PI_CODING_AGENT_DIR instead of ~/.omp/agent.",
             "GenericAgent/TUI memory is injected through --append-system-prompt.",
             "Oh My Pi completion text can emit memory candidate signals; TUI remains the approval owner.",
             "Only app-injected TUI query and governed proposal host tools are enabled; unrestricted host tools, host URI schemes, and direct TUI approval mapping stay disabled.",
@@ -796,10 +999,18 @@ def ohmypi_provider_spec(
 __all__ = [
     "OhMyPiRpcAgent",
     "OhMyPiRuntimeAdapter",
+    "OhMyPiRuntimeConfig",
+    "OhMyPiRuntimeModel",
     "build_ohmypi_memory_prompt",
+    "ohmypi_config_path",
+    "ohmypi_isolated_agent_dir",
     "ohmypi_memory_candidate_signal",
     "ohmypi_memory_prompt_path",
+    "ohmypi_models_path",
     "ohmypi_provider_spec",
     "ohmypi_rpc_command",
+    "ohmypi_runtime_root",
+    "ohmypi_subprocess_env",
+    "write_ohmypi_runtime_files",
     "write_ohmypi_memory_prompt",
 ]
