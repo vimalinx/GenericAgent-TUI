@@ -634,3 +634,36 @@ Verified GA-TUI's embedded Oh My Pi runtime with a real smoke test, fixed final-
 ### Next Steps
 
 - None - task complete
+
+
+## Session 20: Fix temp subagent resolution
+
+**Date**: 2026-06-13
+**Task**: Fix temp subagent resolution
+**Branch**: `experiment/ohmypi-runtime-memory`
+
+### Summary
+
+Fixed empty-session temporary subagent reload by using the same current owner fallback for create and load paths; added regression coverage, updated the agent-control spec, and verified with automated checks plus a real TUI /agent ask smoke.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `0815437` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
