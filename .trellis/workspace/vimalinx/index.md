@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 20
-- **Last Active**: 2026-06-13
+- **Total Sessions**: 21
+- **Last Active**: 2026-06-14
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~669 | Active |
+| `journal-1.md` | ~703 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 21 | 2026-06-14 | OMP-first runtime orchestration foundation | `8a01cf0`, `2cd8ad3` | `experiment/ohmypi-runtime-memory` |
 | 20 | 2026-06-13 | Fix temp subagent resolution | `0815437` | `experiment/ohmypi-runtime-memory` |
 | 19 | 2026-06-13 | Fix OMP final text fallback | `dfd52a4` | `experiment/ohmypi-runtime-memory` |
 | 18 | 2026-06-13 | Isolate OMP runtime settings | `719dfe0` | `experiment/ohmypi-runtime-memory` |

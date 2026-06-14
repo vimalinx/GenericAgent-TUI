@@ -667,3 +667,37 @@ Fixed empty-session temporary subagent reload by using the same current owner fa
 ### Next Steps
 
 - None - task complete
+
+
+## Session 21: OMP-first runtime orchestration foundation
+
+**Date**: 2026-06-14
+**Task**: OMP-first runtime orchestration foundation
+**Branch**: `experiment/ohmypi-runtime-memory`
+
+### Summary
+
+Integrated OMP as the primary bounded runtime under GA-TUI orchestration with runtime task/event contracts, typed governed host tools, context-pack task requests, scheduler provider provenance, and updated docs/spec/tests.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `8a01cf0` | (see git log) |
+| `2cd8ad3` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
