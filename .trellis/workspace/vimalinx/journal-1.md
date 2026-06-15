@@ -701,3 +701,36 @@ Integrated OMP as the primary bounded runtime under GA-TUI orchestration with ru
 ### Next Steps
 
 - None - task complete
+
+
+## Session 22: GA-TUI agent bridge and OMP plugin
+
+**Date**: 2026-06-15
+**Task**: GA-TUI agent bridge and OMP plugin
+**Branch**: `experiment/ohmypi-runtime-memory`
+
+### Summary
+
+Added a GA-TUI-owned local agent bridge plus repo-managed OMP plugin tools for context reads and governed memory-candidate submission; verified compile, policy gates, bridge CLI, Bun loading, OMP --tool RPC smoke, and ga-tui-check.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `8ffb953` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
