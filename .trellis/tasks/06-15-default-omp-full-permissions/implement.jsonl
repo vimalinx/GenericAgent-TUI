@@ -1,1 +1,3 @@
-{"_example": "Fill with {\"file\": \"<path>\", \"reason\": \"<why>\"}. Put spec/research files only — no code paths. Run `python3 .trellis/scripts/get_context.py --mode packages` to list available specs. Delete this line once real entries are added."}
+{"file":".trellis/spec/backend/agent-control-protocol.md","reason":"Defines the OMP provider boundary, RPC queue/event mapping, foldable process-block contract, and memory-candidate cleanup requirements for this change."}
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"Required reuse check before adding helpers; existing GA-TUI renderer should be reused instead of duplicating UI folding logic."}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Required because OMP RPC frames cross provider, queue, renderer, history, and memory-candidate boundaries."}

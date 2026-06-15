@@ -379,6 +379,21 @@ def wait_for_process(processes: list[FakeRpcProcess], *, timeout: float = 2.0) -
     raise AssertionError("fake RPC process was not started")
 
 
+def wait_for_queue_done(dq: queue.Queue, *, timeout: float = 2.0) -> tuple[dict, str]:
+    deadline = time.time() + timeout
+    chunks: list[str] = []
+    while time.time() < deadline:
+        try:
+            item = dq.get(timeout=0.05)
+        except queue.Empty:
+            continue
+        if "next" in item:
+            chunks.append(str(item.get("next") or ""))
+        if "done" in item:
+            return item, "".join(chunks)
+    raise AssertionError("queue did not receive a done item")
+
+
 def assert_ohmypi_provider_module_boundary() -> None:
     assert omp.OhMyPiRuntimeAdapter.__module__ == "ga_tui.ohmypi_provider"
     provider_source = Path(omp.__file__).read_text(encoding="utf-8")
@@ -734,6 +749,109 @@ def assert_ohmypi_rpc_final_text_fallback() -> None:
     agent.close()
 
 
+def assert_ohmypi_rpc_process_blocks_fold_like_genericagent() -> None:
+    processes: list[FakeRpcProcess] = []
+
+    def process_factory(*_args, **_kwargs):
+        process = FakeRpcProcess(auto_finish=False)
+        processes.append(process)
+        return process
+
+    agent = omp.OhMyPiRpcAgent(
+        command=["/fake/omp", "--mode", "rpc"],
+        cwd=str(ROOT),
+        process_factory=process_factory,
+        startup_timeout=1,
+    )
+    dq = agent.put_task("hello", source="test")
+    process = wait_for_process(processes)
+    process.stdout.push({
+        "type": "message_update",
+        "assistantMessageEvent": {
+            "type": "thinking_delta",
+            "delta": "Hidden OMP reasoning should be folded, not shown as final speech.",
+        },
+    })
+    process.stdout.push({
+        "type": "tool_execution_start",
+        "toolCallId": "tool-read-1",
+        "toolName": "read",
+        "args": {"path": "README.md"},
+    })
+    process.stdout.push({
+        "type": "tool_execution_end",
+        "toolCallId": "tool-read-1",
+        "toolName": "read",
+        "result": {"content": [{"type": "text", "text": "README contents that should stay folded."}]},
+    })
+    final_reply = (
+        "Validated durable lesson: OMP process blocks should fold in GA-TUI while final replies "
+        "stay visible for memory approval and restored sessions."
+    )
+    process.stdout.push({
+        "type": "message_update",
+        "assistantMessageEvent": {"type": "text_delta", "delta": final_reply},
+    })
+    process.stdout.push({"type": "agent_end"})
+
+    done, streamed = wait_for_queue_done(dq)
+    text = done["done"]
+    assert "**LLM Running (Turn 1) ...**" in text, text
+    assert "<summary>OMP 思考</summary>" in text, text
+    assert "🛠️ Tool: `read` 📥 args:" in text, text
+    assert final_reply in text, text
+    assert streamed and streamed in text, streamed
+
+    rendered = a.render_assistant_text(text, done=True, fold_process=True, message_index=20)
+    assert "过程组 G21" in rendered, rendered
+    assert "OMP 思考" in rendered, rendered
+    assert final_reply in rendered, rendered
+    assert "README.md" not in rendered, rendered
+    assert "README contents that should stay folded" not in rendered, rendered
+    assert "Hidden OMP reasoning" not in rendered, rendered
+
+    signal = omp.ohmypi_memory_candidate_signal(text, source="test", request_id="fold-1")
+    assert signal is not None, signal
+    assert signal["statement"] == final_reply, signal
+    agent.close()
+
+    fallback_processes: list[FakeRpcProcess] = []
+
+    def fallback_process_factory(*_args, **_kwargs):
+        process = FakeRpcProcess(auto_finish=False)
+        fallback_processes.append(process)
+        return process
+
+    fallback_agent = omp.OhMyPiRpcAgent(
+        command=["/fake/omp", "--mode", "rpc"],
+        cwd=str(ROOT),
+        process_factory=fallback_process_factory,
+        startup_timeout=1,
+    )
+    fallback_q = fallback_agent.put_task("hello", source="test")
+    fallback_process = wait_for_process(fallback_processes)
+    fallback_process.stdout.push({
+        "type": "message_update",
+        "assistantMessageEvent": {"type": "thinking_delta", "delta": "fold this fallback thought"},
+    })
+    fallback_process.stdout.push({
+        "type": "message_end",
+        "message": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "fallback final reply stays visible"}],
+        },
+    })
+    fallback_process.stdout.push({"type": "turn_end"})
+    fallback_done, _fallback_streamed = wait_for_queue_done(fallback_q)
+    fallback_text = fallback_done["done"]
+    assert "OMP 思考" in fallback_text, fallback_text
+    assert "fallback final reply stays visible" in fallback_text, fallback_text
+    fallback_rendered = a.render_assistant_text(fallback_text, done=True, fold_process=True, message_index=21)
+    assert "fallback final reply stays visible" in fallback_rendered, fallback_rendered
+    assert "fold this fallback thought" not in fallback_rendered, fallback_rendered
+    fallback_agent.close()
+
+
 def assert_ohmypi_rpc_env_model_switch_and_error_mapping() -> None:
     processes: list[FakeRpcProcess] = []
     popen_kwargs: list[dict[str, object]] = []
@@ -877,7 +995,7 @@ def assert_ohmypi_host_tool_bridge() -> None:
     assert any("host tool cancel requested: call-1" in item for item in agent._stderr_tail), agent._stderr_tail
 
     agent.abort()
-    done = dq.get(timeout=2)
+    done, _streamed = wait_for_queue_done(dq)
     assert "中止" in done["done"], done
     agent.close()
 
@@ -3314,6 +3432,7 @@ def run_checks() -> None:
     assert_ohmypi_rpc_extension_approval_bridge()
     assert_ohmypi_rpc_queue_mapping()
     assert_ohmypi_rpc_final_text_fallback()
+    assert_ohmypi_rpc_process_blocks_fold_like_genericagent()
     assert_ohmypi_rpc_env_model_switch_and_error_mapping()
     assert_ohmypi_host_tool_bridge()
     assert_ohmypi_tui_query_host_tool_contract()

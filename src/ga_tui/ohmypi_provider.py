@@ -36,6 +36,17 @@ GA_TUI_MEMORY_PROMPT_HEADER = "GA/TUI Memory Guidance"
 OHMYPI_RUNTIME_DIRNAME = "ohmypi"
 OHMYPI_AGENT_DIRNAME = "agent"
 MAX_HOST_TOOL_RESULT_CHARS = 12000
+MAX_PROCESS_ARGS_CHARS = 4000
+MAX_PROCESS_RESULT_CHARS = 6000
+_PROCESS_TURN_MARKER_RE = re.compile(r"(?m)^[ \t]*\**LLM Running \(Turn \d+\) \.\.\.\**[ \t\r]*$")
+_PROCESS_META_BLOCK_RE = re.compile(r"<(?:summary|thinking|think)>[\s\S]*?</(?:summary|thinking|think)>", re.IGNORECASE)
+_PROCESS_TOOL_ARGS_BLOCK_RE = re.compile(
+    r"🛠️\s*Tool:\s*`[^`]+`\s*📥\s*args:\s*\n`{4}text\n[\s\S]*?^`{4}\s*",
+    re.IGNORECASE | re.MULTILINE,
+)
+_PROCESS_TOOL_HEADER_RE = re.compile(r"🛠️\s*Tool:\s*`[^`]+`\s*📥\s*args:\s*", re.IGNORECASE)
+_PROCESS_TOOL_RESULT_FENCE_RE = re.compile(r"`{5}\s*\n[\s\S]*?\n`{5}", re.MULTILINE)
+_PROCESS_FINAL_RESPONSE_INFO_RE = re.compile(r"^\s*\[Info\]\s+Final response to user\.\s*$", re.IGNORECASE | re.MULTILINE)
 _SECRET_PATTERNS = (
     re.compile(r"\bsk-[A-Za-z0-9_\-]{16,}\b"),
     re.compile(r"\b(api[_-]?key|secret|token|password|passwd|密码|密钥)\s*[:=]\s*\S+", re.IGNORECASE),
@@ -129,6 +140,8 @@ class _ActivePrompt:
     buffer: str = ""
     final_text: str = ""
     finished: bool = False
+    process_turn_no: int = 0
+    pending_thinking: str = ""
 
 
 @dataclass(frozen=True)
@@ -251,6 +264,60 @@ def _bounded_host_tool_text(value: Any, *, max_chars: int = MAX_HOST_TOOL_RESULT
     if len(text) > max_chars:
         text = text[:max_chars].rstrip() + "\n...[truncated]"
     return text
+
+
+def _compact_process_summary(text: str, *, max_chars: int = 140) -> str:
+    summary = re.sub(r"\s+", " ", str(text or "")).strip()
+    summary = summary.replace("<summary>", "").replace("</summary>", "")
+    summary = summary.replace("<thinking>", "").replace("</thinking>", "")
+    if len(summary) > max_chars:
+        summary = summary[:max_chars].rstrip() + "..."
+    return summary or "OMP runtime event"
+
+
+def _safe_process_tool_name(tool_name: str) -> str:
+    clean = re.sub(r"[^A-Za-z0-9_.:-]+", "_", str(tool_name or "").strip())
+    return clean.strip("_") or "unknown_tool"
+
+
+def _thinking_text_from_payload(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "".join(_thinking_text_from_payload(item) for item in value)
+    if not isinstance(value, dict):
+        return ""
+    parts: list[str] = []
+    item_type = str(value.get("type") or "")
+    seen_values: set[str] = set()
+    if item_type in {"thinking", "reasoning", "thought", "redacted_thinking"}:
+        for key in ("delta", "thinking", "thought", "reasoning", "text"):
+            raw = value.get(key)
+            if isinstance(raw, str) and raw not in seen_values:
+                seen_values.add(raw)
+                parts.append(raw)
+    for key in ("delta", "thinking", "thought", "reasoning"):
+        raw = value.get(key)
+        if isinstance(raw, str) and raw not in seen_values:
+            seen_values.add(raw)
+            parts.append(raw)
+    for key in ("content", "message", "assistantMessage", "assistantMessageEvent"):
+        text = _thinking_text_from_payload(value.get(key))
+        if text:
+            parts.append(text)
+    return "".join(parts)
+
+
+def _strip_ohmypi_process_noise_for_memory(text: str) -> str:
+    clean = str(text or "")
+    clean = _PROCESS_META_BLOCK_RE.sub(" ", clean)
+    clean = _PROCESS_TOOL_ARGS_BLOCK_RE.sub(" ", clean)
+    clean = _PROCESS_TOOL_RESULT_FENCE_RE.sub(" ", clean)
+    clean = _PROCESS_FINAL_RESPONSE_INFO_RE.sub(" ", clean)
+    clean = _PROCESS_TOOL_HEADER_RE.sub(" ", clean)
+    clean = _PROCESS_TURN_MARKER_RE.sub(" ", clean)
+    clean = re.sub(r"\n{3,}", "\n\n", clean)
+    return clean.strip()
 
 
 def _host_tool_agent_result(value: Any) -> dict[str, Any]:
@@ -557,12 +624,13 @@ class OhMyPiRpcAgent:
         if frame_type == "host_tool_cancel":
             self._handle_host_tool_cancel(frame)
             return
+        if frame_type in {"tool_execution_start", "tool_execution_update", "tool_execution_end"}:
+            self._handle_tool_execution_event(frame)
+            return
         if frame_type == "message_update":
             event = frame.get("assistantMessageEvent")
-            if isinstance(event, dict) and event.get("type") == "text_delta":
-                self._append_active_delta(str(event.get("delta") or ""))
-            elif isinstance(event, dict):
-                self._remember_active_final_text(_visible_text_from_payload(event))
+            if isinstance(event, dict):
+                self._handle_message_update_event(event)
             return
         if frame_type == "message_end":
             error_text = self._frame_error_text(frame)
@@ -577,6 +645,67 @@ class OhMyPiRpcAgent:
         if frame_type == "extension_ui_request":
             self._answer_extension_ui(frame)
             return
+
+    def _handle_message_update_event(self, event: dict[str, Any]) -> None:
+        event_type = str(event.get("type") or "")
+        if event_type == "text_delta":
+            self._append_active_delta(str(event.get("delta") or ""))
+            return
+        if event_type in {"thinking_delta", "reasoning_delta", "thought_delta", "thinking", "reasoning", "thought"}:
+            self._remember_active_thinking_delta(_thinking_text_from_payload(event))
+            return
+        if event_type == "done":
+            self._flush_active_thinking()
+            self._remember_active_final_text(_visible_text_from_payload(event.get("message") or event))
+            return
+        if event_type == "error":
+            self._flush_active_thinking()
+            error_payload = event.get("error")
+            error_text = ""
+            if isinstance(error_payload, dict):
+                error_text = str(error_payload.get("errorMessage") or error_payload.get("message") or error_payload.get("error") or "")
+            else:
+                error_text = str(error_payload or event.get("errorMessage") or event.get("message") or "")
+            if error_text:
+                self._finish_active(f"[Oh My Pi] {error_text}")
+            return
+        text = _visible_text_from_payload(event)
+        if text:
+            self._remember_active_final_text(text)
+
+    def _handle_tool_execution_event(self, frame: dict[str, Any]) -> None:
+        frame_type = str(frame.get("type") or "")
+        if frame_type == "tool_execution_update":
+            return
+        tool_name = _safe_process_tool_name(str(frame.get("toolName") or frame.get("name") or ""))
+        tool_call_id = str(frame.get("toolCallId") or frame.get("id") or "")
+        if frame_type == "tool_execution_start":
+            args = frame.get("args")
+            if args is None:
+                args = frame.get("arguments") if "arguments" in frame else frame.get("input")
+            if frame.get("intent"):
+                args = {"intent": frame.get("intent"), "args": args if args is not None else {}}
+            self._append_active_tool_call_process(tool_name, args if args is not None else {}, summary=f"调用 OMP 工具: {tool_name}")
+            self._emit_runtime_event(
+                "runtime_tool_execution_start",
+                status="started",
+                tool_call_refs=[tool_call_id] if tool_call_id else [],
+                payload={"tool_name": tool_name, "tool_call_id": tool_call_id},
+            )
+            return
+        if frame_type == "tool_execution_end":
+            result = frame.get("result")
+            if result is None and frame.get("error") is not None:
+                result = {"error": frame.get("error")}
+            is_error = bool(frame.get("isError"))
+            self._append_active_tool_result_process(tool_name, result, tool_call_id=tool_call_id, is_error=is_error)
+            self._emit_runtime_event(
+                "runtime_tool_execution_result",
+                status="failed" if is_error else "completed",
+                error=_bounded_host_tool_text(result, max_chars=1000) if is_error else "",
+                tool_call_refs=[tool_call_id] if tool_call_id else [],
+                payload={"tool_name": tool_name, "tool_call_id": tool_call_id},
+            )
 
     def _handle_response(self, frame: dict[str, Any]) -> None:
         command = str(frame.get("command") or "")
@@ -676,9 +805,84 @@ class OhMyPiRpcAgent:
                 parts.append(text)
         return "".join(parts)
 
+    def _append_active_process_block(self, summary: str, body: str) -> None:
+        body_text = str(body or "").strip()
+        if not body_text:
+            return
+        with self._active_lock:
+            active = self._active
+            if active is None or active.finished:
+                return
+            active.process_turn_no += 1
+            block = (
+                f"\n\n**LLM Running (Turn {active.process_turn_no}) ...**\n"
+                f"<summary>{_compact_process_summary(summary)}</summary>\n"
+                f"{body_text}\n\n"
+            )
+            active.buffer += block
+            active.display_queue.put({"next": block, "source": "ohmypi"})
+
+    def _remember_active_thinking_delta(self, delta: str) -> None:
+        if not delta:
+            return
+        with self._active_lock:
+            active = self._active
+            if active is None or active.finished:
+                return
+            active.pending_thinking += delta
+
+    def _flush_active_thinking(self) -> None:
+        with self._active_lock:
+            active = self._active
+            if active is None or active.finished or not active.pending_thinking:
+                return
+            thinking = active.pending_thinking
+            active.pending_thinking = ""
+        body = "<thinking>\n" + _bounded_host_tool_text(thinking, max_chars=MAX_PROCESS_RESULT_CHARS) + "\n</thinking>"
+        self._append_active_process_block("OMP 思考", body)
+
+    def _append_active_tool_call_process(self, tool_name: str, args: Any, *, summary: str = "") -> None:
+        self._flush_active_thinking()
+        tool = _safe_process_tool_name(tool_name)
+        args_text = _bounded_host_tool_text(args if args is not None else {}, max_chars=MAX_PROCESS_ARGS_CHARS)
+        body = (
+            f"🛠️ Tool: `{tool}` 📥 args:\n"
+            "````text\n"
+            f"{args_text}\n"
+            "````"
+        )
+        self._append_active_process_block(summary or f"调用 OMP 工具: {tool}", body)
+
+    def _append_active_tool_result_process(
+        self,
+        tool_name: str,
+        result: Any,
+        *,
+        tool_call_id: str = "",
+        is_error: bool = False,
+    ) -> None:
+        self._flush_active_thinking()
+        tool = _safe_process_tool_name(tool_name)
+        status = "error" if is_error else "ok"
+        args = {"toolCallId": tool_call_id, "status": status}
+        args_text = _bounded_host_tool_text(args, max_chars=MAX_PROCESS_ARGS_CHARS)
+        result_text = _bounded_host_tool_text(result if result is not None else {}, max_chars=MAX_PROCESS_RESULT_CHARS)
+        body = (
+            f"🛠️ Tool: `{tool}` 📥 args:\n"
+            "````text\n"
+            f"{args_text}\n"
+            "````\n"
+            "`````\n"
+            f"{result_text}\n"
+            "`````"
+        )
+        summary = f"OMP 工具{'失败' if is_error else '结果'}: {tool}"
+        self._append_active_process_block(summary, body)
+
     def _append_active_delta(self, delta: str) -> None:
         if not delta:
             return
+        self._flush_active_thinking()
         with self._active_lock:
             active = self._active
             if active is None or active.finished:
@@ -696,6 +900,8 @@ class OhMyPiRpcAgent:
             active.final_text = text
 
     def _finish_active(self, text: str | None = None, *, source: str = "ohmypi", fallback_text: str = "") -> None:
+        if text is None:
+            self._flush_active_thinking()
         done_text = ""
         signal_source = source
         request_id = ""
@@ -710,6 +916,9 @@ class OhMyPiRpcAgent:
                 done_text = text
             elif active.buffer:
                 done_text = active.buffer
+                final_tail = fallback_text or active.final_text
+                if final_tail and final_tail not in done_text:
+                    done_text = done_text.rstrip() + "\n\n" + final_tail
             else:
                 done_text = fallback_text or active.final_text
             signal_source = active.source or source
@@ -878,29 +1087,30 @@ class OhMyPiRpcAgent:
         if not request_id:
             self._remember_stderr("host tool call missing id")
             return
+        self._append_active_tool_call_process(
+            tool_name or "unknown_tool",
+            arguments,
+            summary=f"调用 GA-TUI host tool: {tool_name or 'unknown_tool'}",
+        )
         allowed_names = {str(tool.get("name") or "") for tool in self.host_tool_definitions}
         if not tool_name or tool_name not in allowed_names:
-            self._send_host_tool_result(
-                request_id,
-                {
-                    "schema_version": "ga-tui.host_tool.v1",
-                    "status": "error",
-                    "error": f"Unknown or unregistered host tool: {tool_name or '<missing>'}",
-                },
-                is_error=True,
-            )
+            result = {
+                "schema_version": "ga-tui.host_tool.v1",
+                "status": "error",
+                "error": f"Unknown or unregistered host tool: {tool_name or '<missing>'}",
+            }
+            self._send_host_tool_result(request_id, result, is_error=True)
+            self._append_active_tool_result_process(tool_name or "unknown_tool", result, tool_call_id=tool_call_id, is_error=True)
             return
         if self.host_tool_handler is None:
-            self._send_host_tool_result(
-                request_id,
-                {
-                    "schema_version": "ga-tui.host_tool.v1",
-                    "status": "error",
-                    "tool_name": tool_name,
-                    "error": "No host tool handler is configured.",
-                },
-                is_error=True,
-            )
+            result = {
+                "schema_version": "ga-tui.host_tool.v1",
+                "status": "error",
+                "tool_name": tool_name,
+                "error": "No host tool handler is configured.",
+            }
+            self._send_host_tool_result(request_id, result, is_error=True)
+            self._append_active_tool_result_process(tool_name, result, tool_call_id=tool_call_id, is_error=True)
             return
         try:
             self._emit_runtime_event(
@@ -918,16 +1128,14 @@ class OhMyPiRpcAgent:
                 tool_call_refs=[tool_call_id],
                 payload={"request_id": request_id, "tool_name": tool_name},
             )
-            self._send_host_tool_result(
-                request_id,
-                {
-                    "schema_version": "ga-tui.host_tool.v1",
-                    "status": "error",
-                    "tool_name": tool_name,
-                    "error": f"{type(exc).__name__}: {exc}",
-                },
-                is_error=True,
-            )
+            result = {
+                "schema_version": "ga-tui.host_tool.v1",
+                "status": "error",
+                "tool_name": tool_name,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+            self._send_host_tool_result(request_id, result, is_error=True)
+            self._append_active_tool_result_process(tool_name, result, tool_call_id=tool_call_id, is_error=True)
             return
         self._emit_runtime_event(
             "runtime_host_tool_result",
@@ -936,6 +1144,7 @@ class OhMyPiRpcAgent:
             payload={"request_id": request_id, "tool_name": tool_name},
         )
         self._send_host_tool_result(request_id, result)
+        self._append_active_tool_result_process(tool_name, result, tool_call_id=tool_call_id)
 
     def _handle_host_tool_cancel(self, frame: dict[str, Any]) -> None:
         target_id = str(frame.get("targetId") or "")
@@ -1146,7 +1355,7 @@ def write_ohmypi_memory_prompt(*, root_dir: str, harness_dir: str) -> str:
 def ohmypi_memory_candidate_signal(text: str, *, source: str = "", request_id: str = "") -> dict[str, Any] | None:
     if str(source or "").startswith("secret-"):
         return None
-    statement = _redact_memory_text(str(text or "")).strip()
+    statement = _redact_memory_text(_strip_ohmypi_process_noise_for_memory(str(text or ""))).strip()
     if not statement or len(statement) < 80:
         return None
     if statement.startswith("[Oh My Pi]"):

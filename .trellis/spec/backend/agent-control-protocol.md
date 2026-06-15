@@ -567,6 +567,12 @@ configure_genericagent_provider_runtime(
 - `OhMyPiRpcAgent.put_runtime_task(RuntimeTaskRequest)` must accept provider-neutral task requests and preserve `task_id`, `provider_id`, `agent_id`, `role`, `objective`, `source`, `context_pack_ref`, artifact refs, permissions, approval policy, output contract, and metadata in normalized runtime events.
 - Durable `runtime.task_request.v1` records must not store the full prompt; they store bounded `prompt_preview`, `prompt_chars`, and artifact/context refs. The full prompt remains in-memory for runtime dispatch only.
 - Oh My Pi RPC `message_update` frames with `assistantMessageEvent.type:"text_delta"` map to queue items shaped as `{"next": <delta>, "source": "ohmypi"}`.
+- Oh My Pi non-final process frames must be normalized into the existing GenericAgent-TUI foldable process text protocol instead of adding a second renderer. The emitted text uses `**LLM Running (Turn N) ...**`, `<summary>...</summary>`, tool args fences, and result fences that `render_assistant_text(..., fold_process:true)` already understands.
+- OMP `message_update` thinking/reasoning deltas are buffered and emitted as a bounded `<thinking>...</thinking>` process turn before the next visible text/tool/final event. The final assistant reply must remain normal assistant text, not hidden inside a thinking block.
+- OMP `tool_execution_start` / `tool_execution_end` frames and GA-TUI `host_tool_call` / `host_tool_result` bridge activity must become bounded, redacted tool process turns so tool args/results are folded by default while the final reply remains visible.
+- Process normalization belongs inside `ohmypi_provider.py`; `app.py` must not contain OMP-specific RPC parsing or a second OMP renderer.
+- OMP process args/results included in assistant text must be bounded and secret-redacted before entering the display queue, history, artifacts, traces, or memory-candidate extraction.
+- OMP memory-candidate signal extraction must strip normalized process markers, `<thinking>` blocks, tool args, and tool result fences before deciding whether a durable candidate exists.
 - Oh My Pi RPC terminal frames `agent_end` or `turn_end` map to one queue item shaped as `{"done": <buffer>, "source": "ohmypi"}`.
 - If no `text_delta` populated the active buffer, the done text must fall back to visible assistant text carried by `message_end`, terminal-frame `message.content`, or `assistantMessageEvent` text payloads.
 - Startup, prompt, or missing-binary failures must map to a queue `done` item instead of raising into the TUI caller after `put_task()` returns.
@@ -634,6 +640,9 @@ configure_genericagent_provider_runtime(
 - Selected GA-TUI default model -> OMP command may include `--model <isolated-provider>/<model-id>` and isolated `config.yml` carries the same `modelRoles.default`.
 - User system OMP config exists -> policy checks must verify its hash remains unchanged across embedded OMP runtime setup.
 - OMP error frame with `stopReason:"error"` and `errorMessage` -> active TUI queue receives a visible `[Oh My Pi] ...` done item.
+- OMP thinking delta + tool execution frames + final text delta -> active TUI queue receives GA-style process markers plus the final reply; `render_assistant_text(..., fold_process:true)` folds thinking/tool noise and keeps the final reply visible.
+- OMP host tool calls/results -> active TUI queue receives folded GA-style tool process turns while RPC still receives matching `host_tool_result` frames.
+- OMP memory-candidate signal extraction over normalized process output -> candidate statement contains only the final durable reply, not thinking text, tool args, or tool results.
 - `put_runtime_task(RuntimeTaskRequest)` -> provider emits at least `runtime_task_requested` and a terminal `runtime_task_completed`, `runtime_task_failed`, or `runtime_task_aborted` event carrying the original request and context-pack artifact refs.
 
 ### 5. Good/Base/Bad Cases
@@ -663,6 +672,7 @@ configure_genericagent_provider_runtime(
 - Tests must assert the generated memory append prompt is bounded, redacted, and passed to `omp` through `--append-system-prompt`.
 - Tests must assert completed Oh My Pi output can produce a governed memory candidate signal and that empty, too-short, secret-looking, and Secret-context outputs are skipped.
 - Tests must assert a fake RPC process maps `ready`, `prompt` ack, `message_update` deltas, and `agent_end` into queue `next`/`done` items.
+- Tests must assert a fake RPC process maps OMP thinking/tool events into GenericAgent-TUI foldable process blocks, that the existing assistant renderer folds them, and that final replies remain visible.
 - Tests must assert `put_runtime_task(RuntimeTaskRequest)` emits `runtime.task_event.v1` rows that preserve `runtime.task_request.v1`, `prompt_preview`, `prompt_chars`, `context_pack_ref`, and artifact refs without storing the raw prompt.
 - Tests must assert a fake RPC process with no `text_delta` still produces non-empty `done` text when final assistant text is carried by `message_end.message.content` or terminal-frame `message.content`.
 - Tests must assert a fake RPC process receives app-injected `set_host_tools` definitions before the prompt frame.

@@ -1,1 +1,2 @@
-{"_example": "Fill with {\"file\": \"<path>\", \"reason\": \"<why>\"}. Put spec/research files only — no code paths. Run `python3 .trellis/scripts/get_context.py --mode packages` to list available specs. Delete this line once real entries are added."}
+{"file":".trellis/spec/backend/agent-control-protocol.md","reason":"Post-change contract check: OMP process normalization stays provider-owned, uses existing foldable renderer markers, bounds/redacts tool payloads, and keeps memory candidates final-reply-only."}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Post-change data-flow check: OMP frames become queue text, renderer-folded history, runtime traces, and memory-candidate input without a second UI protocol."}
