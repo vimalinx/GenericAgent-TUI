@@ -41,6 +41,39 @@ _SECRET_PATTERNS = (
     re.compile(r"\b(api[_-]?key|secret|token|password|passwd|密码|密钥)\s*[:=]\s*\S+", re.IGNORECASE),
     re.compile(r"\b[A-Za-z0-9_\-]{24,}\.[A-Za-z0-9_\-]{12,}\.[A-Za-z0-9_\-]{12,}\b"),
 )
+_APPROVAL_SELECT_OPTIONS = {"approve", "deny"}
+_APPROVAL_RISK_RE = re.compile(
+    r"\b("
+    r"rm\s+-rf|sudo|su\s+-|chmod\s+777|chown\s+|mkfs|dd\s+if=|shutdown|reboot|systemctl|pacman|apt\s+|dnf\s+|"
+    r"deploy|release|publish|email|mail|send\s+to|curl\s+.*\|\s*(sh|bash)|wget\s+.*\|\s*(sh|bash)|"
+    r"delete|remove|unlink|secret|credential|password|passwd|api[_-]?key|token|payment|purchase|charge"
+    r")\b",
+    re.IGNORECASE,
+)
+_FULL_APPROVAL_TOOL_MAP = {
+    "ask": {"ask"},
+    "bash": {"bash", "shell"},
+    "browser": {"browser"},
+    "edit": {"edit", "repo.write", "write"},
+    "eval": {"eval", "python", "javascript"},
+    "find": {"find", "search", "repo.read"},
+    "grep": {"grep", "search", "repo.read"},
+    "inspect_image": {"inspect_image", "read"},
+    "lsp": {"lsp", "repo.read", "repo.write"},
+    "notebook": {"notebook", "edit", "write"},
+    "python": {"python", "eval"},
+    "read": {"read", "repo.read"},
+    "task": {"task", "subagent.delegate"},
+    "todo": {"todo", "write"},
+    "web_search": {"web_search", "web.search"},
+    "write": {"write", "repo.write"},
+}
+_OHMYPI_APPROVAL_MODES = {"always-ask", "write", "yolo"}
+
+
+def normalized_ohmypi_approval_mode(value: str = "") -> str:
+    raw = str(value or "").strip().lower().replace("_", "-")
+    return raw if raw in _OHMYPI_APPROVAL_MODES else "write"
 
 
 class _TaskCounter:
@@ -142,6 +175,7 @@ class OhMyPiRuntimeConfig:
     default_model: str = ""
     config_path: str = ""
     models_path: str = ""
+    approval_mode: str = "write"
 
 
 def ohmypi_runtime_root(harness_dir: str) -> str:
@@ -761,6 +795,41 @@ class OhMyPiRpcAgent:
         except Exception as exc:
             self._remember_stderr(f"runtime event sink failed: {type(exc).__name__}: {exc}")
 
+    def _active_permissions(self) -> dict[str, Any]:
+        request = self._active_runtime_request()
+        if request is None or not isinstance(request.permissions, dict):
+            return {}
+        return request.permissions
+
+    def _approval_tool_name(self, frame: dict[str, Any]) -> str:
+        title = str(frame.get("title") or "")
+        match = re.search(r"(?im)^Allow tool:\s*([A-Za-z0-9_.:-]+)\s*$", title)
+        return match.group(1).strip() if match else ""
+
+    def _tool_allowed_by_permissions(self, tool_name: str, permissions: dict[str, Any]) -> bool:
+        if not tool_name:
+            return False
+        tools_allowed = {str(item) for item in (permissions.get("tools_allowed") or [])}
+        if tool_name in tools_allowed:
+            return True
+        aliases = _FULL_APPROVAL_TOOL_MAP.get(tool_name) or {tool_name}
+        return bool(aliases & tools_allowed)
+
+    def _should_auto_approve_extension_select(self, frame: dict[str, Any]) -> tuple[bool, str]:
+        options = [str(item).strip().lower() for item in (frame.get("options") or [])]
+        if set(options) != _APPROVAL_SELECT_OPTIONS:
+            return False, "not_tool_approval_select"
+        permissions = self._active_permissions()
+        if str(permissions.get("permission_profile") or "") != "full":
+            return False, "permission_profile_not_full"
+        prompt_text = "\n".join(str(frame.get(key) or "") for key in ("title", "message"))
+        if _APPROVAL_RISK_RE.search(prompt_text):
+            return False, "risky_tool_prompt"
+        tool_name = self._approval_tool_name(frame)
+        if not self._tool_allowed_by_permissions(tool_name, permissions):
+            return False, f"tool_not_allowed:{tool_name or '<unknown>'}"
+        return True, f"approved:{tool_name}"
+
     def _answer_extension_ui(self, frame: dict[str, Any]) -> None:
         request_id = frame.get("id")
         if not request_id:
@@ -768,7 +837,23 @@ class OhMyPiRpcAgent:
         method = str(frame.get("method") or "")
         if method == "confirm":
             self._send({"type": "extension_ui_response", "id": request_id, "confirmed": False})
-        elif method in {"select", "input", "editor"}:
+        elif method == "select":
+            approved, reason = self._should_auto_approve_extension_select(frame)
+            self._emit_runtime_event(
+                "runtime_extension_ui_response",
+                status="approved" if approved else "denied",
+                payload={
+                    "request_id": str(request_id),
+                    "method": "select",
+                    "reason": reason,
+                    "title": str(frame.get("title") or "")[:500],
+                },
+            )
+            if approved:
+                self._send({"type": "extension_ui_response", "id": request_id, "value": "Approve"})
+            else:
+                self._send({"type": "extension_ui_response", "id": request_id, "value": "Deny"})
+        elif method in {"input", "editor"}:
             self._send({"type": "extension_ui_response", "id": request_id, "cancelled": True})
 
     def _register_host_tools(self) -> None:
@@ -969,17 +1054,19 @@ def ohmypi_rpc_command(
     extra_args: list[str] | None = None,
     append_system_prompt: str | None = None,
     model: str | None = None,
+    approval_mode: str | None = None,
 ) -> list[str]:
     binary = binary or os.environ.get("GA_TUI_OHMYPI_BIN", "omp")
     env_args = shlex.split(os.environ.get("GA_TUI_OHMYPI_ARGS", ""))
     appended_args = list(extra_args or env_args)
+    approval_mode = normalized_ohmypi_approval_mode(approval_mode or os.environ.get("GA_TUI_OMP_APPROVAL_MODE") or "write")
     args = [
         binary,
         "--mode",
         "rpc",
         "--no-title",
         "--approval-mode",
-        "always-ask",
+        approval_mode,
     ]
     if model and not _has_cli_flag(appended_args, "--model"):
         args.extend(["--model", model])
@@ -1126,6 +1213,7 @@ def ohmypi_provider_spec(
             "models_path": runtime_config.models_path if runtime_config else "",
             "default_model": runtime_config.default_model if runtime_config else "",
             "configured_model_count": len(runtime_config.models) if runtime_config else 0,
+            "tool_approval_mode": runtime_config.approval_mode if runtime_config else "",
         },
         scheduler={
             "owner": "ga-tui.control_plane",
@@ -1137,6 +1225,7 @@ def ohmypi_provider_spec(
         policy={
             "approval_gate_owner": "ga-tui.policy",
             "tool_permissions": "tui_readonly_and_governed_proposal_tools_only",
+            "runtime_tool_approval_mode": runtime_config.approval_mode if runtime_config else "write",
             "memory_write": "candidate_only",
             "risky_actions": ["deploy", "external_send", "delete_file", "spend_money", "access_secret"],
         },
@@ -1156,6 +1245,7 @@ def ohmypi_provider_spec(
             "GenericAgent/TUI memory is injected through --append-system-prompt.",
             "GA-TUI emits provider-neutral runtime.task_request.v1 and runtime.task_event.v1 records around OMP execution.",
             "Oh My Pi completion text can emit memory candidate signals; TUI remains the approval owner.",
+            "Default isolated OMP approval mode is write: read/write tiers run headless, exec prompts are bridged through GA-TUI permission-profile checks.",
             "Only app-injected TUI query, typed read-only, and governed proposal host tools are enabled; unrestricted host tools, host URI schemes, and direct TUI approval mapping stay disabled.",
             f"runtime_root={root_dir}",
             f"harness_dir={harness_dir}",
@@ -1171,6 +1261,7 @@ __all__ = [
     "OhMyPiRuntimeModel",
     "RuntimeEventSink",
     "build_ohmypi_memory_prompt",
+    "normalized_ohmypi_approval_mode",
     "ohmypi_config_path",
     "ohmypi_isolated_agent_dir",
     "ohmypi_memory_candidate_signal",

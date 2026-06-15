@@ -2,6 +2,83 @@
 
 > Executable contract for GenericAgent-TUI control blocks and governed subagent delegation.
 
+## Scenario: OMP Runtime Permission Profiles
+
+### 1. Scope / Trigger
+
+- Trigger: OMP is used as the main GA-TUI runtime provider and receives a generated context pack.
+- Applies to: `permissions_for_role()`, `build_context_pack()`, `build_main_runtime_context_pack()`, `format_context_pack_for_prompt()`, OMP runtime task requests, isolated OMP config generation, and OMP RPC extension-UI approval responses.
+- Non-goal: This does not give OMP direct ownership of GA-TUI memory, approvals, ledgers, schedules, or system-level `~/.omp/agent` configuration.
+
+### 2. Signatures
+
+- Permission profiles: `standard`, `read_only`, `full`.
+- OMP profile env override: `GA_TUI_OMP_PERMISSION_PROFILE`.
+- Generic fallback env override: `GA_TUI_DEFAULT_PERMISSION_PROFILE`.
+- OMP tool approval env override: `GA_TUI_OMP_APPROVAL_MODE=always-ask|write|yolo`.
+- Default OMP main-runtime profile: `full`.
+- Default subagent profile: `standard`.
+- Default isolated OMP approval mode: `write`.
+
+### 3. Contracts
+
+- `standard` means role-derived permissions from `ROLE_TEMPLATES`.
+- `read_only` means no write policy and no bash/browser/task write-capability expansion.
+- `full` means the main OMP runtime context pack advertises practical read/write/search/bash/browser/eval/git/LSP/host-tool/task/artifact/memory-candidate capabilities.
+- `full` must keep `memory_write:"candidate_only"` and must not enable direct long-term memory writes.
+- `full` must keep high-risk action classes in `approval_required_for`; it is not an approval bypass.
+- `build_main_runtime_context_pack()` must default to the OMP permission profile, which defaults to `full`.
+- `build_context_pack()` for subagents must default to `standard` unless explicitly passed another profile.
+- `format_context_pack_for_prompt()` must include `permission_profile` so OMP can answer capability questions without claiming read-only mode.
+- OMP isolated runtime config must be written under the GA-TUI harness runtime directory and must not mutate the user's system OMP config.
+- OMP isolated runtime config defaults `tools.approvalMode` to `write`, so read/write tool tiers can run headless while exec-tier prompts remain visible to the GA-TUI adapter.
+- OMP RPC extension-UI approval prompts may be auto-approved only when the active runtime request has `permission_profile:"full"`, the requested tool maps to an allowed capability, and the prompt text does not contain high-risk deletion/deploy/secret/payment/policy indicators.
+
+### 4. Validation & Error Matrix
+
+- No env override + main OMP context -> `permission_profile:"full"`, `write_policy:"single_writer"`, full tool list, and `memory_write:"candidate_only"`.
+- `GA_TUI_OMP_PERMISSION_PROFILE=read_only` + main OMP context -> `permission_profile:"read_only"`, `write_policy:"none"`, no bash in `tools_allowed`.
+- Subagent context without an explicit profile -> `permission_profile:"standard"` and role-bounded tools.
+- OMP isolated config generation -> `tools.approvalMode:"write"` and `PI_CODING_AGENT_DIR` under the GA-TUI harness.
+- OMP RPC approval select for safe `bash` under full profile -> respond `Approve`.
+- OMP RPC approval select for risky `rm -rf` under full profile -> respond `Deny`.
+- OMP RPC approval select under `standard` profile -> respond `Deny`.
+
+### 5. Good/Base/Bad Cases
+
+- Good: Main OMP runtime receives `permission_profile:"full"`, shows `write_policy:"single_writer"`, can use normal write/search/bash/browser capabilities, and still reports `memory_write:"candidate_only"`.
+- Good: A role-bounded researcher subagent receives `permission_profile:"standard"` with `tools_allowed:["web","read"]` and `write_policy:"none"`.
+- Base: Operator sets `GA_TUI_OMP_PERMISSION_PROFILE=read_only`; OMP main runtime starts in compatibility mode and does not advertise bash/write tools.
+- Base: Operator sets `GA_TUI_OMP_APPROVAL_MODE=always-ask`; command/config generation preserves the override.
+- Bad: Main OMP runtime inherits `specialist` role permissions and tells users it only has `read, reason`.
+- Bad: OMP is launched with `--approval-mode always-ask` by default, causing write-tier tools to prompt and then be denied by the headless RPC bridge.
+- Bad: `permission_profile:"full"` turns into direct memory writes or auto-approves high-risk delete/deploy/secret prompts.
+
+### 6. Tests Required
+
+- `scripts/check_policy_gates.py` must assert default full main context, read-only env override, standard subagent context, isolated OMP approval mode, runtime provider metadata, and OMP RPC extension approval bridge behavior.
+- `python3 -m compileall -q src scripts` must pass.
+- `python3 scripts/check_policy_gates.py` must pass.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```text
+permission_profile: standard
+write_policy: none
+tools_allowed: read, reason
+```
+
+#### Correct
+
+```text
+permission_profile: full
+write_policy: single_writer
+tools_allowed: read, reason, search, repo.read, repo.write, edit, write, test, bash, shell, browser, eval, python, javascript, web.search, web_search, git, lsp, artifact.read, artifact.write, host_tools, task, subagent.delegate, memory.candidate
+memory_write: candidate_only
+```
+
 ## Scenario: ga-control v2 Delegation
 
 ### 1. Scope / Trigger
@@ -482,7 +559,7 @@ configure_genericagent_provider_runtime(
 - OMP subprocess environment:
   - `PI_CODING_AGENT_DIR` must point to the GA-TUI-owned isolated OMP agent directory under `${AGENT_HARNESS_DIR}/runtime/ohmypi/agent`.
   - Generated per-process API key env vars use `GA_TUI_OMP_API_KEY_<digest>` and must be passed only through the OMP child process env.
-- Default RPC command shape: `omp --mode rpc --no-title --approval-mode always-ask --append-system-prompt <generated-memory-file>`.
+- Default RPC command shape: `omp --mode rpc --no-title --approval-mode write --append-system-prompt <generated-memory-file>`.
 
 ### 3. Contracts
 

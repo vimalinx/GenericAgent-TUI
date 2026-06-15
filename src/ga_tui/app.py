@@ -109,6 +109,7 @@ try:
         OhMyPiRuntimeAdapter,
         OhMyPiRuntimeModel,
         RpcHostToolDefinition,
+        normalized_ohmypi_approval_mode,
         ohmypi_isolated_agent_dir,
         ohmypi_memory_prompt_path,
         ohmypi_provider_spec,
@@ -183,6 +184,7 @@ except Exception:
         OhMyPiRuntimeAdapter,
         OhMyPiRuntimeModel,
         RpcHostToolDefinition,
+        normalized_ohmypi_approval_mode,
         ohmypi_isolated_agent_dir,
         ohmypi_memory_prompt_path,
         ohmypi_provider_spec,
@@ -3282,6 +3284,77 @@ ROLE_TEMPLATES: dict[str, dict[str, Any]] = {
     },
 }
 
+PERMISSION_PROFILE_STANDARD = "standard"
+PERMISSION_PROFILE_READ_ONLY = "read_only"
+PERMISSION_PROFILE_FULL = "full"
+PERMISSION_PROFILES = {
+    PERMISSION_PROFILE_STANDARD,
+    PERMISSION_PROFILE_READ_ONLY,
+    PERMISSION_PROFILE_FULL,
+}
+PERMISSION_PROFILE_ALIASES = {
+    "": PERMISSION_PROFILE_STANDARD,
+    "default": PERMISSION_PROFILE_STANDARD,
+    "role": PERMISSION_PROFILE_STANDARD,
+    "role_based": PERMISSION_PROFILE_STANDARD,
+    "role-bounded": PERMISSION_PROFILE_STANDARD,
+    "role_bounded": PERMISSION_PROFILE_STANDARD,
+    "readonly": PERMISSION_PROFILE_READ_ONLY,
+    "read-only": PERMISSION_PROFILE_READ_ONLY,
+    "read_only": PERMISSION_PROFILE_READ_ONLY,
+    "safe": PERMISSION_PROFILE_READ_ONLY,
+    "full": PERMISSION_PROFILE_FULL,
+    "all": PERMISSION_PROFILE_FULL,
+    "unrestricted": PERMISSION_PROFILE_FULL,
+}
+FULL_PERMISSION_TOOLS_ALLOWED = [
+    "read",
+    "reason",
+    "search",
+    "repo.read",
+    "repo.write",
+    "edit",
+    "write",
+    "test",
+    "bash",
+    "shell",
+    "browser",
+    "eval",
+    "python",
+    "javascript",
+    "web.search",
+    "web_search",
+    "git",
+    "lsp",
+    "artifact.read",
+    "artifact.write",
+    "host_tools",
+    "task",
+    "subagent.delegate",
+    "memory.candidate",
+]
+READ_ONLY_PERMISSION_TOOLS_ALLOWED = ["read", "reason", "search", "repo.read", "artifact.read"]
+
+
+def normalized_permission_profile(profile: str = "", *, default: str = PERMISSION_PROFILE_STANDARD) -> str:
+    raw = unicodedata.normalize("NFKC", str(profile or "")).strip().lower()
+    raw = re.sub(r"\s+", "_", raw).replace("-", "_")
+    fallback = default if default in PERMISSION_PROFILES else PERMISSION_PROFILE_STANDARD
+    return PERMISSION_PROFILE_ALIASES.get(raw, raw if raw in PERMISSION_PROFILES else fallback)
+
+
+def default_omp_permission_profile() -> str:
+    raw = (
+        os.environ.get("GA_TUI_OMP_PERMISSION_PROFILE")
+        or os.environ.get("GA_TUI_DEFAULT_PERMISSION_PROFILE")
+        or PERMISSION_PROFILE_FULL
+    )
+    return normalized_permission_profile(raw, default=PERMISSION_PROFILE_FULL)
+
+
+def default_ohmypi_approval_mode() -> str:
+    return normalized_ohmypi_approval_mode(os.environ.get("GA_TUI_OMP_APPROVAL_MODE") or "write")
+
 
 POLICY_ACTIONS: dict[str, dict[str, Any]] = {
     "external_send": {
@@ -4027,25 +4100,43 @@ def normalized_security_context(value: str = "") -> str:
     return "secret" if value == "secret" else "standard"
 
 
-def permissions_for_role(role: str = "", security_context: str = "standard") -> dict[str, Any]:
+def permissions_for_role(
+    role: str = "",
+    security_context: str = "standard",
+    *,
+    permission_profile: str = PERMISSION_PROFILE_STANDARD,
+) -> dict[str, Any]:
     role = normalized_role(role) if role else "specialist"
     security_context = normalized_security_context(security_context)
+    permission_profile = normalized_permission_profile(permission_profile)
     tools_forbidden = ["email.send", "deploy", "filesystem.delete", "memory.write.direct"]
     network_policy = "allowlist" if role in {"researcher", "ops"} else "none"
     secrets_policy = "no_secret_access"
+    tools_allowed = role_tools_allowed(role)
+    write_policy = role_write_policy(role)
+    if permission_profile == PERMISSION_PROFILE_READ_ONLY:
+        tools_allowed = list(READ_ONLY_PERMISSION_TOOLS_ALLOWED)
+        write_policy = "none"
+        network_policy = "none"
+    elif permission_profile == PERMISSION_PROFILE_FULL:
+        tools_allowed = list(FULL_PERMISSION_TOOLS_ALLOWED)
+        write_policy = "single_writer"
+        network_policy = "allowlist"
     if security_context == "secret":
         network_policy = "secret_proxy_chain_required"
         secrets_policy = "secret_vault_only_no_export"
         tools_forbidden.extend(["network.direct", "history.normal", "artifact.normal_plaintext", "secret.export_without_approval"])
     return {
         "role": role,
+        "permission_profile": permission_profile,
         "security_context": security_context,
-        "tools_allowed": role_tools_allowed(role),
+        "tools_allowed": tools_allowed,
         "tools_forbidden": tools_forbidden,
-        "write_policy": role_write_policy(role),
+        "write_policy": write_policy,
         "network_policy": network_policy,
         "secrets_policy": secrets_policy,
         "memory_write": "candidate_only",
+        "approval_required_for": APPROVAL_REQUIRED_FOR,
     }
 
 
@@ -5243,13 +5334,22 @@ def context_layers_for_task(
     }
 
 
-def build_context_pack(state: State, sub: SubAgentRuntime, objective: str, task_id: str, parent_task_id: str = "") -> tuple[dict[str, Any], str]:
+def build_context_pack(
+    state: State,
+    sub: SubAgentRuntime,
+    objective: str,
+    task_id: str,
+    parent_task_id: str = "",
+    *,
+    permission_profile: str = PERMISSION_PROFILE_STANDARD,
+) -> tuple[dict[str, Any], str]:
     template = role_template(sub.role)
     profile = subagent_profile_text(sub).strip()
     memory = subagent_memory_text(sub).strip() if sub.persistent else ""
     recent_mail = [] if sub.security_context == "secret" else read_jsonl(AGENT_MAIL_PATH, limit=8)
     task_contract = task_contract_for_role(sub.role, objective)
     context_policy = context_policy_for_task(objective, security_context=sub.security_context)
+    permissions = permissions_for_role(sub.role, security_context=sub.security_context, permission_profile=permission_profile)
     memory_pack = memory_hydration_pack(task_id=task_id, sub=sub, profile=profile, memory=memory, recent_mail=recent_mail)
     layers = context_layers_for_task(
         state,
@@ -5278,7 +5378,8 @@ def build_context_pack(state: State, sub: SubAgentRuntime, objective: str, task_
         "objective": objective,
         "role_template": template,
         "budget": default_task_budget(sub.role),
-        "permissions": permissions_for_role(sub.role, security_context=sub.security_context),
+        "permission_profile": permissions.get("permission_profile", PERMISSION_PROFILE_STANDARD),
+        "permissions": permissions,
         "context_policy": context_policy,
         "task": task_contract,
         "task_brief": {
@@ -5337,6 +5438,7 @@ def build_main_runtime_context_pack(
     task_id: str,
     parent_task_id: str = "",
 ) -> tuple[dict[str, Any], str]:
+    permission_profile = default_omp_permission_profile()
     main_worker = SubAgentRuntime(
         agent_id="orchestrator.main",
         name="GA-TUI Main Orchestrator",
@@ -5352,7 +5454,14 @@ def build_main_runtime_context_pack(
             "task ledgers, artifact refs, trace, and memory-candidate governance around OMP."
         ),
     )
-    return build_context_pack(state, main_worker, objective, task_id, parent_task_id=parent_task_id)
+    return build_context_pack(
+        state,
+        main_worker,
+        objective,
+        task_id,
+        parent_task_id=parent_task_id,
+        permission_profile=permission_profile,
+    )
 
 
 def agent_runtime_provider_id(agent: Any) -> str:
@@ -5430,6 +5539,7 @@ task_id: {pack.get("task_id", "")}
 agent: {(pack.get("for_agent") or {}).get("name", "")} ({(pack.get("for_agent") or {}).get("id", "")})
 role: {(pack.get("for_agent") or {}).get("role", "specialist")}
 objective: {pack.get("objective", "")}
+permission_profile: {pack.get("permission_profile") or permissions.get("permission_profile", PERMISSION_PROFILE_STANDARD)}
 budget: tokens={budget.get("max_tokens", 0)} tool_calls={budget.get("max_tool_calls", 0)} wall_clock={budget.get("max_wall_clock_seconds", 0)}s
 write_policy: {permissions.get("write_policy", "none")}
 tools_allowed: {", ".join(permissions.get("tools_allowed", []))}
@@ -7569,6 +7679,11 @@ def start_main_agent_task(
     runtime_prompt = agent_text
     runtime_task_id = f"main-{task_id}"
     runtime_context_ref = ""
+    runtime_permissions = permissions_for_role(
+        "specialist",
+        security_context="standard",
+        permission_profile=default_omp_permission_profile(),
+    )
     if hasattr(state.agent, "put_runtime_task") and not secret_task:
         try:
             context_pack, runtime_context_ref = build_main_runtime_context_pack(
@@ -7576,6 +7691,7 @@ def start_main_agent_task(
                 policy_relevant_subagent_prompt_text(text),
                 runtime_task_id,
             )
+            runtime_permissions = dict(context_pack.get("permissions") or runtime_permissions)
             runtime_prompt = f"{format_context_pack_for_prompt(context_pack)}\n\n[Task]\n{agent_text}\n[/Task]"
         except Exception as exc:
             append_trace(
@@ -7596,7 +7712,7 @@ def start_main_agent_task(
                 role="orchestrator",
                 objective=policy_relevant_subagent_prompt_text(text),
                 context_pack_ref=runtime_context_ref,
-                permissions=permissions_for_role("specialist", security_context="secret" if secret_task else "standard"),
+                permissions=runtime_permissions,
                 approval_policy=approval_metadata(),
                 output_contract={"required_sections": role_output_contract("specialist")},
                 artifact_refs=[runtime_context_ref] if runtime_context_ref else [],
@@ -11598,7 +11714,8 @@ def ohmypi_api_key_env_name(entry: LLMConfigEntry, index: int) -> str:
     return f"GA_TUI_OMP_API_KEY_{digest}"
 
 
-def ohmypi_runtime_settings_payload(default_model: str) -> dict[str, Any]:
+def ohmypi_runtime_settings_payload(default_model: str, *, approval_mode: str = "") -> dict[str, Any]:
+    approval_mode = normalized_ohmypi_approval_mode(approval_mode or default_ohmypi_approval_mode())
     payload: dict[str, Any] = {
         "autoResume": True,
         "browser": {"headless": True},
@@ -11608,7 +11725,7 @@ def ohmypi_runtime_settings_payload(default_model: str) -> dict[str, Any]:
         "symbolPreset": "unicode",
         "task": {"maxRuntimeMs": 0},
         "todo": {"eager": True},
-        "tools": {"approvalMode": "always-ask"},
+        "tools": {"approvalMode": approval_mode},
         "vault": {"enabled": False},
     }
     if default_model:
@@ -11659,6 +11776,7 @@ def build_ohmypi_runtime_config(*, write_files: bool = True, base_env: Optional[
             break
     if not default_model and runtime_models:
         default_model = runtime_models[0].selector
+    approval_mode = default_ohmypi_approval_mode()
 
     paths = {
         "agent_dir": agent_dir,
@@ -11668,7 +11786,7 @@ def build_ohmypi_runtime_config(*, write_files: bool = True, base_env: Optional[
     if write_files:
         paths = write_ohmypi_runtime_files(
             agent_dir=agent_dir,
-            config=ohmypi_runtime_settings_payload(default_model),
+            config=ohmypi_runtime_settings_payload(default_model, approval_mode=approval_mode),
             models={"providers": provider_payloads},
         )
     env = ohmypi_subprocess_env(agent_dir=agent_dir, env_overrides=env_overrides, base_env=base_env)
@@ -11679,6 +11797,7 @@ def build_ohmypi_runtime_config(*, write_files: bool = True, base_env: Optional[
         default_model=default_model,
         config_path=paths["config_path"],
         models_path=paths["models_path"],
+        approval_mode=approval_mode,
     )
 
 
@@ -11700,6 +11819,7 @@ def agent_runtime_registry(*, write_memory_prompt_file: bool = True) -> RuntimeR
     ohmypi_command = ohmypi_rpc_command(
         append_system_prompt=ohmypi_append_prompt_path,
         model=ohmypi_runtime_config.default_model,
+        approval_mode=ohmypi_runtime_config.approval_mode,
     )
     registry.register(OhMyPiRuntimeAdapter(ohmypi_provider_spec(
         root_dir=ROOT_DIR,

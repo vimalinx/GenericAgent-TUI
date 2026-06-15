@@ -417,6 +417,7 @@ def assert_ohmypi_runtime_registry() -> None:
         assert ohmypi["scheduler"]["status"] == "registry_ready", ohmypi
         assert ohmypi["policy"]["approval_gate_owner"] == "ga-tui.policy", ohmypi
         assert ohmypi["policy"]["tool_permissions"] == "tui_readonly_and_governed_proposal_tools_only", ohmypi
+        assert ohmypi["policy"]["runtime_tool_approval_mode"] == "write", ohmypi
         assert ohmypi["policy"]["memory_write"] == "candidate_only", ohmypi
         os.environ["GA_TUI_RUNTIME_PROVIDER"] = "genericagent"
         assert a.agent_runtime_registry().default().provider_id == "genericagent"
@@ -444,8 +445,20 @@ def assert_ohmypi_memory_prompt_and_command() -> None:
     assert "[REDACTED]" in prompt_text, prompt_text
     command = omp.ohmypi_rpc_command(binary="/fake/omp", append_system_prompt=prompt_path)
     assert command[:3] == ["/fake/omp", "--mode", "rpc"], command
+    assert "--approval-mode" in command, command
+    assert command[command.index("--approval-mode") + 1] == "write", command
     assert "--append-system-prompt" in command, command
     assert command[command.index("--append-system-prompt") + 1] == prompt_path, command
+    old_approval_mode = os.environ.get("GA_TUI_OMP_APPROVAL_MODE")
+    try:
+        os.environ["GA_TUI_OMP_APPROVAL_MODE"] = "always-ask"
+        command_with_approval_override = omp.ohmypi_rpc_command(binary="/fake/omp")
+        assert command_with_approval_override[command_with_approval_override.index("--approval-mode") + 1] == "always-ask", command_with_approval_override
+    finally:
+        if old_approval_mode is None:
+            os.environ.pop("GA_TUI_OMP_APPROVAL_MODE", None)
+        else:
+            os.environ["GA_TUI_OMP_APPROVAL_MODE"] = old_approval_mode
     command_with_user_append = omp.ohmypi_rpc_command(
         binary="/fake/omp",
         extra_args=["--append-system-prompt", "/user/append.md"],
@@ -469,6 +482,7 @@ def assert_ohmypi_isolated_runtime_settings() -> None:
         encoding="utf-8",
     )
     old_mykey_path = a.mykey_path
+    old_approval_mode = os.environ.pop("GA_TUI_OMP_APPROVAL_MODE", None)
     system_config = Path.home() / ".omp" / "agent" / "config.yml"
     before_hash = hashlib.sha256(system_config.read_bytes()).hexdigest() if system_config.exists() else ""
     try:
@@ -479,10 +493,11 @@ def assert_ohmypi_isolated_runtime_settings() -> None:
         assert runtime_config.env["PI_CODING_AGENT_DIR"] == runtime_config.agent_dir, runtime_config.env
         assert len(runtime_config.models) == 2, runtime_config.models
         assert runtime_config.default_model.endswith("/model-beta"), runtime_config.default_model
+        assert runtime_config.approval_mode == "write", runtime_config
         config_data = json.loads(Path(runtime_config.config_path).read_text(encoding="utf-8"))
         models_data = json.loads(Path(runtime_config.models_path).read_text(encoding="utf-8"))
         assert config_data["modelRoles"]["default"] == runtime_config.default_model, config_data
-        assert config_data["tools"]["approvalMode"] == "always-ask", config_data
+        assert config_data["tools"]["approvalMode"] == "write", config_data
         assert "providers" in models_data and len(models_data["providers"]) == 2, models_data
         beta_provider = next(
             provider for provider in models_data["providers"].values()
@@ -499,6 +514,8 @@ def assert_ohmypi_isolated_runtime_settings() -> None:
         record = adapter.spec.to_record()
         assert record["model_routing"]["isolated_agent_dir"] == runtime_config.agent_dir, record
         assert record["model_routing"]["configured_model_count"] == 2, record
+        assert record["model_routing"]["tool_approval_mode"] == "write", record
+        assert record["policy"]["runtime_tool_approval_mode"] == "write", record
         command = getattr(adapter, "command")
         assert "--model" in command and runtime_config.default_model in command, command
         if before_hash:
@@ -506,6 +523,110 @@ def assert_ohmypi_isolated_runtime_settings() -> None:
             assert after_hash == before_hash, (before_hash, after_hash)
     finally:
         a.mykey_path = old_mykey_path
+        if old_approval_mode is None:
+            os.environ.pop("GA_TUI_OMP_APPROVAL_MODE", None)
+        else:
+            os.environ["GA_TUI_OMP_APPROVAL_MODE"] = old_approval_mode
+
+
+def assert_ohmypi_permission_profiles() -> None:
+    root = tempfile.mkdtemp(prefix="ga_tui_omp_permissions_")
+    retarget_harness(root)
+    old_profile = os.environ.pop("GA_TUI_OMP_PERMISSION_PROFILE", None)
+    old_default_profile = os.environ.pop("GA_TUI_DEFAULT_PERMISSION_PROFILE", None)
+    try:
+        state = a.State(agent=FakeLLMAgent())
+        pack, context_ref = a.build_main_runtime_context_pack(state, "Can you edit code?", "task_omp_full")
+        assert context_ref.startswith("artifact://"), context_ref
+        assert pack["permission_profile"] == "full", pack
+        assert pack["permissions"]["permission_profile"] == "full", pack["permissions"]
+        assert pack["permissions"]["write_policy"] == "single_writer", pack["permissions"]
+        assert pack["permissions"]["memory_write"] == "candidate_only", pack["permissions"]
+        assert {"bash", "edit", "write", "browser", "task", "memory.candidate"} <= set(pack["permissions"]["tools_allowed"]), pack["permissions"]
+        prompt = a.format_context_pack_for_prompt(pack)
+        assert "permission_profile: full" in prompt, prompt
+        assert "tools_allowed: " in prompt and "bash" in prompt and "memory.candidate" in prompt, prompt
+
+        sub = a.create_subagent(state, "Role Bounded Researcher", role="researcher", persistent=False)
+        sub_pack, _sub_ref = a.build_context_pack(state, sub, "Read only research", "task_sub_standard")
+        assert sub_pack["permission_profile"] == "standard", sub_pack
+        assert sub_pack["permissions"]["write_policy"] == "none", sub_pack["permissions"]
+        assert sub_pack["permissions"]["tools_allowed"] == ["web", "read"], sub_pack["permissions"]
+
+        os.environ["GA_TUI_OMP_PERMISSION_PROFILE"] = "read_only"
+        read_only_pack, _read_only_ref = a.build_main_runtime_context_pack(state, "Compatibility mode", "task_omp_read_only")
+        assert read_only_pack["permission_profile"] == "read_only", read_only_pack
+        assert read_only_pack["permissions"]["write_policy"] == "none", read_only_pack["permissions"]
+        assert "bash" not in read_only_pack["permissions"]["tools_allowed"], read_only_pack["permissions"]
+    finally:
+        if old_profile is None:
+            os.environ.pop("GA_TUI_OMP_PERMISSION_PROFILE", None)
+        else:
+            os.environ["GA_TUI_OMP_PERMISSION_PROFILE"] = old_profile
+        if old_default_profile is None:
+            os.environ.pop("GA_TUI_DEFAULT_PERMISSION_PROFILE", None)
+        else:
+            os.environ["GA_TUI_DEFAULT_PERMISSION_PROFILE"] = old_default_profile
+
+
+def assert_ohmypi_rpc_extension_approval_bridge() -> None:
+    sent: list[dict] = []
+    agent = omp.OhMyPiRpcAgent(command=["/fake/omp"])
+    agent._send = lambda obj: sent.append(obj)  # type: ignore[method-assign]
+
+    full_request = a.RuntimeTaskRequest(
+        task_id="task_approval_full",
+        provider_id="ohmypi",
+        agent_id="orchestrator.main",
+        role="orchestrator",
+        objective="run safe bash",
+        prompt="",
+        permissions={"permission_profile": "full", "tools_allowed": ["bash", "shell"], "memory_write": "candidate_only"},
+    )
+    agent._active = omp._ActivePrompt(  # type: ignore[attr-defined]
+        request_id="prompt-1",
+        display_queue=queue.Queue(),
+        source="test",
+        runtime_request=full_request,
+    )
+    agent._answer_extension_ui({  # type: ignore[attr-defined]
+        "id": "ui-safe",
+        "method": "select",
+        "title": "Allow tool: bash\nCommand: pwd",
+        "options": ["Approve", "Deny"],
+    })
+    assert sent[-1] == {"type": "extension_ui_response", "id": "ui-safe", "value": "Approve"}, sent[-1]
+
+    agent._answer_extension_ui({  # type: ignore[attr-defined]
+        "id": "ui-risky",
+        "method": "select",
+        "title": "Allow tool: bash\nCommand: rm -rf /tmp/ga-tui-test",
+        "options": ["Approve", "Deny"],
+    })
+    assert sent[-1] == {"type": "extension_ui_response", "id": "ui-risky", "value": "Deny"}, sent[-1]
+
+    standard_request = a.RuntimeTaskRequest(
+        task_id="task_approval_standard",
+        provider_id="ohmypi",
+        agent_id="orchestrator.main",
+        role="orchestrator",
+        objective="standard mode",
+        prompt="",
+        permissions={"permission_profile": "standard", "tools_allowed": ["bash"]},
+    )
+    agent._active = omp._ActivePrompt(  # type: ignore[attr-defined]
+        request_id="prompt-2",
+        display_queue=queue.Queue(),
+        source="test",
+        runtime_request=standard_request,
+    )
+    agent._answer_extension_ui({  # type: ignore[attr-defined]
+        "id": "ui-standard",
+        "method": "select",
+        "title": "Allow tool: bash\nCommand: pwd",
+        "options": ["Approve", "Deny"],
+    })
+    assert sent[-1] == {"type": "extension_ui_response", "id": "ui-standard", "value": "Deny"}, sent[-1]
 
 
 def assert_ohmypi_rpc_queue_mapping() -> None:
@@ -1637,6 +1758,7 @@ def assert_gateway_schema(registry: dict) -> None:
     assert ohmypi_provider["capabilities"]["memory_candidate_signals"] is True, ohmypi_provider
     assert ohmypi_provider["scheduler"]["status"] == "registry_ready", ohmypi_provider
     assert ohmypi_provider["policy"]["tool_permissions"] == "tui_readonly_and_governed_proposal_tools_only", ohmypi_provider
+    assert ohmypi_provider["policy"]["runtime_tool_approval_mode"] == "write", ohmypi_provider
     assert ohmypi_provider["policy"]["memory_write"] == "candidate_only", ohmypi_provider
     assert os.path.exists(a.AGENT_RUNTIME_REGISTRY_PATH), a.AGENT_RUNTIME_REGISTRY_PATH
     model_orchestration = registry["model_orchestration"]
@@ -3188,6 +3310,8 @@ def run_checks() -> None:
     assert_ohmypi_runtime_registry()
     assert_ohmypi_memory_prompt_and_command()
     assert_ohmypi_isolated_runtime_settings()
+    assert_ohmypi_permission_profiles()
+    assert_ohmypi_rpc_extension_approval_bridge()
     assert_ohmypi_rpc_queue_mapping()
     assert_ohmypi_rpc_final_text_fallback()
     assert_ohmypi_rpc_env_model_switch_and_error_mapping()
