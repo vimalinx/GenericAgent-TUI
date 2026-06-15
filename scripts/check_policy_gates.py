@@ -22,6 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from ga_tui import app as a  # noqa: E402
+from ga_tui import agent_bridge as bridge  # noqa: E402
 from ga_tui import control_protocol as cp  # noqa: E402
 from ga_tui import genericagent_provider as gap  # noqa: E402
 from ga_tui import ohmypi_provider as omp  # noqa: E402
@@ -935,6 +936,78 @@ def assert_ohmypi_tui_proposal_host_tool_contract() -> None:
     })
     assert missing_state["status"] == "error", missing_state
     assert "TUI state is not bound" in missing_state["error"], missing_state
+
+
+def assert_agent_bridge_contract_and_omp_plugin() -> None:
+    root = tempfile.mkdtemp(prefix="ga_tui_agent_bridge_")
+    retarget_harness(root)
+    state = a.State(agent=FakeLLMAgent())
+    target = a.create_subagent(
+        state,
+        "Bridge Memory Target",
+        "Receives memory candidates from external agent bridge clients.",
+        role="researcher",
+        persistent=True,
+    )
+    service = bridge.AgentBridgeService(app=a, state=state)
+    metadata = service.handle({"action": "metadata"})
+    assert metadata["schema_version"] == "ga-tui.agent_bridge.v1", metadata
+    assert metadata["owner"] == "ga-tui.control_plane", metadata
+    assert "memory_context_get" in metadata["supported_actions"], metadata
+    assert metadata["policy"]["provider_direct_writes"] is False, metadata
+
+    context = service.handle({
+        "action": "memory_context_get",
+        "args": {
+            "target": target.agent_id,
+            "objective": "Hydrate OMP with GA-TUI-owned bridge context.",
+            "task_id": "task_agent_bridge_context",
+        },
+    })
+    assert context["schema_version"] == "ga-tui.query.v1", context
+    assert context["status"] == "ok", context
+    assert context["context_pack_ref"].startswith("artifact://"), context
+    artifact_rows = a.read_jsonl(a.AGENT_ARTIFACT_INDEX_PATH)
+    assert artifact_rows and artifact_rows[-1]["type"] == "context_pack", artifact_rows
+
+    memory = service.handle({
+        "action": "memory_candidate_submit",
+        "args": {
+            "target": target.agent_id,
+            "statement": (
+                "type: project\n"
+                "Bridge clients must submit durable memories through GA-TUI "
+                "approval gates instead of writing provider-owned memory."
+            ),
+            "evidence_ref": "runtime://provider/ohmypi/plugin-test",
+            "task_id": "task_agent_bridge_memory",
+        },
+    })
+    assert memory["schema_version"] == "ga-tui.proposal.v1", memory
+    assert memory["status"] == "ok", memory
+    assert memory["kind"] == "memory_candidate", memory
+    assert memory["result_status"] == "queued", memory
+    assert memory["approval_ids"], memory
+    candidate = a.read_jsonl(a.AGENT_MEMORY_CANDIDATES_PATH)[-1]["memory_candidate"]
+    assert_memory_candidate_schema(candidate)
+    assert candidate["source"] == "agent:omp_plugin", candidate
+    assert candidate["target_subagent"] == target.agent_id, candidate
+
+    missing = service.handle({"action": "does_not_exist"})
+    assert missing["schema_version"] == "ga-tui.agent_bridge.v1", missing
+    assert missing["status"] == "error", missing
+    assert "memory_context_get" in missing["supported_actions"], missing
+
+    plugin_dir = ROOT / "integrations" / "omp-ga-tui-plugin"
+    package_json = json.loads((plugin_dir / "package.json").read_text(encoding="utf-8"))
+    manifest = package_json["omp"]
+    assert manifest["tools"] == "tools/index.ts", manifest
+    assert manifest["settings"]["repoRoot"]["env"] == "GA_TUI_REPO", manifest
+    tool_source = (plugin_dir / "tools" / "index.ts").read_text(encoding="utf-8")
+    assert "ga_tui_context_get" in tool_source, tool_source
+    assert "ga_tui_memory_candidate_submit" in tool_source, tool_source
+    assert "ga_tui.agent_bridge" in tool_source, tool_source
+    assert "PYTHONPATH=" in tool_source, tool_source
 
 
 def assert_ohmypi_memory_candidate_signal_filters() -> None:
@@ -3121,6 +3194,7 @@ def run_checks() -> None:
     assert_ohmypi_host_tool_bridge()
     assert_ohmypi_tui_query_host_tool_contract()
     assert_ohmypi_tui_proposal_host_tool_contract()
+    assert_agent_bridge_contract_and_omp_plugin()
     assert_ohmypi_memory_candidate_signal_filters()
     assert_ohmypi_missing_binary_and_abort()
     assert_top_bar_header_requested_fields()

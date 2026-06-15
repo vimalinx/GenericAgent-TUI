@@ -948,3 +948,102 @@ At 08:00, scheduler writes scheduledtask.run.v1 starting, converts the schedule 
 - Tests must assert durable UI system message persistence writes no session metadata during temporary sessions.
 - Tests must assert memory candidate creation writes no memory candidate or approval rows during temporary sessions.
 - Tests must assert `/new` exits temporary mode and restores a normal `model_responses_*.txt` log path.
+
+## Scenario: GA-TUI Agent Bridge And OMP Plugin Client
+
+### 1. Scope / Trigger
+
+- Trigger: Agent clients that are not directly launched by the TUI need GA-TUI-owned project context and governed proposal submission.
+- Applies to: `src/ga_tui/agent_bridge.py`, `ga-tui-agent-bridge`, `python -m ga_tui.agent_bridge`, repo-managed OMP plugin files under `integrations/omp-ga-tui-plugin`, OMP `--tool` loading, and future Codex/Claude Code adapters that consume the same bridge contract.
+- Non-goal: This bridge does not make OMP, Codex, Claude Code, or any plugin the owner of long-term memory, approval queues, schedule registries, task ledgers, artifacts, or traces.
+
+### 2. Signatures
+
+- Python module: `src/ga_tui/agent_bridge.py`.
+- Console script: `ga-tui-agent-bridge`.
+- Module command: `python -m ga_tui.agent_bridge`.
+- Bridge schema: `ga-tui.agent_bridge.v1`.
+- Bridge actions: `metadata`, `query`, `memory_context_get`, `memory_candidate_submit`, and `proposal_submit`.
+- JSON call shape:
+
+```json
+{
+  "action": "memory_context_get",
+  "args": {
+    "target": "optional-subagent-id-or-name",
+    "objective": "task objective",
+    "task_id": "optional-task-id",
+    "parent_task_id": "optional-parent-task-id"
+  }
+}
+```
+
+- OMP plugin package: `integrations/omp-ga-tui-plugin/package.json`.
+- OMP custom tool entry: `integrations/omp-ga-tui-plugin/tools/index.ts`.
+- OMP plugin tools: `ga_tui_context_get` and `ga_tui_memory_candidate_submit`.
+- Environment keys:
+  - `GA_TUI_REPO` or `GA_TUI_ROOT`: GenericAgent-TUI checkout used by the plugin when locating `src/ga_tui/agent_bridge.py`.
+  - `GA_TUI_BRIDGE_PYTHON`: Python executable used by the OMP plugin, default `python3`.
+  - `GENERICAGENT_ROOT`: GenericAgent root override consumed by `ga_tui.app` discovery.
+  - `GA_TUI_HARNESS_DIR`: harness directory override for bridge tests or isolated runs.
+  - `GA_TUI_SECRET_VAULT_DIR`: secret vault directory override for bridge tests or isolated runs.
+
+### 3. Contracts
+
+- `AgentBridgeService` must be a thin facade over existing app-owned services; it must not reimplement memory, approval, context-pack, or scheduler governance.
+- `memory_context_get` must call the same app-layer `memory_context_get` query path used by OMP host tools and must return `ga-tui.query.v1` with `context_pack_ref` plus a JSON-safe context pack.
+- `memory_candidate_submit` must call the same governed memory-candidate proposal path as OMP host tools and must return `ga-tui.proposal.v1`.
+- Bridge-submitted memory candidates must use source provenance such as `agent:omp_plugin`, not pretend to be direct human or internal TUI writes.
+- Long-term memory writes remain `candidate_only`; the bridge may queue memory candidates and approval rows but must not append to subagent memory files directly.
+- The default OMP usage path should be process-local `omp --tool <repo>/integrations/omp-ga-tui-plugin/tools/index.ts` so a user can test the plugin without linking it into the system OMP plugin store.
+- Persistent `omp plugin link <repo>/integrations/omp-ga-tui-plugin` is optional and must be documented as an explicit user choice.
+- The OMP plugin must call the bridge CLI with `PYTHONPATH=<repo>/src` so it can run from a checkout without requiring package installation.
+- The OMP plugin must not read or write GA-TUI JSONL stores directly.
+- The OMP plugin must not call `queue_approval`, `queue_curated_memory_candidate`, scheduler helpers, or artifact writers itself; only Python GA-TUI code owns those operations.
+- Bridge metadata must report owner `ga-tui.control_plane`, supported actions, relevant paths, and policy fields showing provider direct writes are disabled.
+
+### 4. Validation & Error Matrix
+
+- Bridge payload is not a JSON object -> `ga-tui.agent_bridge.v1` error.
+- Unknown bridge action -> `ga-tui.agent_bridge.v1` error with `supported_actions`.
+- `query` without endpoint -> `ga-tui.agent_bridge.v1` error.
+- `memory_context_get` target not found or ambiguous -> `ga-tui.query.v1` error from the existing app query path.
+- `memory_candidate_submit` without target or statement -> `ga-tui.proposal.v1` error.
+- `memory_candidate_submit` target is temporary/non-persistent -> no direct memory write; return the existing governed no-op result.
+- Candidate text contains secrets or weak/empty content -> existing Memory Curator rejection path writes a rejected candidate record and no approval row.
+- OMP plugin cannot parse bridge stdout as JSON -> plugin tool execution throws a user-visible tool error instead of fabricating success.
+- Bridge CLI exits non-zero with a structured error payload -> plugin returns that structured error payload to the model.
+
+### 5. Good/Base/Bad Cases
+
+- Good: OMP loads `ga_tui_context_get` through `--tool`, requests project context, and receives a context-pack artifact ref without mutating any ledger except the context-pack artifact index.
+- Good: OMP calls `ga_tui_memory_candidate_submit`; GA-TUI validates the target, builds a memory-candidate artifact, appends a pending candidate row, queues a human approval, and records provenance.
+- Base: A user links the plugin persistently with `omp plugin link` only after explicitly choosing to let OMP remember the repo-managed plugin.
+- Base: Codex or Claude Code later calls the same bridge action names and gets the same schemas without OMP-specific contract names.
+- Bad: A plugin writes directly to `memory/subagents/*/memory.md` or `memory_candidates.jsonl`.
+- Bad: A plugin scrapes `context_packs/` or `subagents/` files directly instead of calling the bridge.
+- Bad: The bridge adds a second memory-candidate schema instead of reusing `queue_curated_memory_candidate(...)`.
+
+### 6. Tests Required
+
+- `scripts/check_policy_gates.py` must assert `AgentBridgeService` metadata includes `schema_version:"ga-tui.agent_bridge.v1"`, owner `ga-tui.control_plane`, supported bridge actions, and `provider_direct_writes:false`.
+- Tests must assert bridge `memory_context_get` writes a context-pack artifact and returns a `ga-tui.query.v1` response with `context_pack_ref`.
+- Tests must assert bridge `memory_candidate_submit` queues a `ga-tui.proposal.v1` memory candidate through the existing approval path and records source `agent:omp_plugin`.
+- Tests must assert unknown bridge actions return a structured bridge error.
+- Tests must assert the repo-managed OMP plugin manifest points to `tools/index.ts`.
+- Tests must assert the OMP plugin tool source contains `ga_tui_context_get`, `ga_tui_memory_candidate_submit`, `ga_tui.agent_bridge`, and `PYTHONPATH=<repo>/src` wiring.
+- Smoke checks should include `PYTHONPATH=src python3 -m ga_tui.agent_bridge ...`, Bun-loading the plugin tool factory, and a temporary-HOME OMP plugin dry-run or process-local `--tool` smoke so the user's real system OMP config is not mutated.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```text
+OMP plugin opens memory/subagents/researcher/memory.md and appends a learned fact directly.
+```
+
+#### Correct
+
+```text
+OMP plugin calls ga-tui-agent-bridge memory-candidate-submit; GA-TUI builds a memory_candidate.v1 record, writes artifact refs, queues human approval, and only approved memory writes reach subagent memory.
+```

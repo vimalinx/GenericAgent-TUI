@@ -23,6 +23,13 @@ Runtime providers own narrow execution:
 - Stream events or return a final result.
 - Expose artifact refs, status, and interrupt support.
 
+Agent clients that are not launched directly by the TUI, such as OMP plugins,
+Codex adapters, or Claude Code adapters, must use a GA-TUI-owned bridge instead
+of scraping files or writing ledgers. The local bridge entrypoint is
+`ga-tui-agent-bridge` / `python -m ga_tui.agent_bridge`; it exposes read-only
+context retrieval and governed proposal submission while keeping approvals,
+memory, schedules, artifacts, and traces in the TUI control plane.
+
 ## Runtime Task Boundary
 
 New OMP-first orchestration paths use provider-neutral task records before they
@@ -82,6 +89,9 @@ Runtime and top-level control metadata are exposed through:
 - OMP host tools: compatibility aliases `ga_tui_query` / `ga_tui_propose` plus
   typed tools such as `agent_list`, `task_get`, `schedule_list`,
   `memory_context_get`, `memory_candidate_submit`, and `schedule_create`.
+- OMP plugin tools: repo-managed plugin
+  `integrations/omp-ga-tui-plugin` exposes `ga_tui_context_get` and
+  `ga_tui_memory_candidate_submit` by calling the local GA-TUI bridge CLI.
 - MCP resources: `resource://agent-mail/runtime-providers`, `resource://agent-mail/schedules`, and `resource://agent-mail/schedule-runs`.
 - TUI commands: `/runtimes`, `/schedules`, and `/scheduler`.
 
@@ -97,6 +107,9 @@ Runtime and top-level control metadata are exposed through:
 - Do not let model choice override policy gates. Model routing is subordinate to TUI governance.
 - Keep provider selection explicit and reversible; this experiment branch defaults
   to `ohmypi`, with `genericagent` retained as the fallback adapter.
+- Do not make an OMP plugin a new memory owner. Plugin tools may read context and
+  submit memory candidates; GA-TUI validates, queues approvals, writes durable
+  rows, and records provenance.
 
 ## Next Providers
 

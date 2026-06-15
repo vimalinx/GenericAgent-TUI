@@ -11396,13 +11396,14 @@ def ohmypi_tui_propose_memory_candidate(state: Optional[State], args: dict[str, 
         )
     task_id = str(args.get("task_id") or "").strip()
     evidence_ref = str(args.get("evidence_ref") or "").strip() or "runtime://provider/ohmypi/host_tool"
+    source = str(args.get("source") or "").strip() or "agent:ohmypi_host_tool"
     candidate_start = len(read_jsonl(AGENT_MEMORY_CANDIDATES_PATH))
     approval_start = len(read_jsonl(AGENT_APPROVALS_PATH))
     result_message = queue_curated_memory_candidate(
         state,
         target_sub,
         statement,
-        source="agent:ohmypi_host_tool",
+        source=source,
         evidence_ref=evidence_ref,
         task_id=task_id,
     )

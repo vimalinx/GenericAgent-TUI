@@ -1,0 +1,27 @@
+{
+  "name": "@ga-tui/omp-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Oh My Pi plugin that exposes GA-TUI-managed context and governed memory proposals.",
+  "omp": {
+    "name": "GA-TUI Bridge",
+    "version": "0.1.0",
+    "description": "Read GA-TUI context packs and submit memory candidates through GA-TUI approval gates.",
+    "tools": "tools/index.ts",
+    "settings": {
+      "python": {
+        "type": "string",
+        "description": "Python executable used to run ga_tui.agent_bridge.",
+        "default": "python3",
+        "env": "GA_TUI_BRIDGE_PYTHON"
+      },
+      "repoRoot": {
+        "type": "string",
+        "description": "GenericAgent-TUI repository root. Auto-detected when empty.",
+        "default": "",
+        "env": "GA_TUI_REPO"
+      }
+    }
+  }
+}
