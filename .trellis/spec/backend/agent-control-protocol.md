@@ -1,6 +1,58 @@
 # Agent Control Protocol
 
-> Executable contract for GenericAgent-TUI control blocks and governed subagent delegation.
+> Executable contract for Shuheng / GenericAgent-TUI compatibility control blocks and governed subagent delegation.
+
+## Scenario: Shuheng Brand Entry Points
+
+### 1. Scope / Trigger
+
+- Trigger: The user-facing product name is `Shuheng` / `枢衡`, while legacy `ga-tui` protocol and Python module names remain compatibility surfaces.
+- Applies to: `pyproject.toml` console scripts, README command examples, integration doctor output, core shim help text, runtime prompts, and OMP/tool descriptions.
+- Non-goal: This does not rename `src/ga_tui`, `GA_TUI_*` environment variables, `ga-tui.*` schema versions, `ga_tui_query`, `ga_tui_propose`, existing JSONL context ids, or historical compatibility markers.
+
+### 2. Signatures
+
+- Primary console scripts: `shuheng`, `shuheng-agent-bridge`, `shuheng-check`, `shuheng-install-core-shim`, and `shuheng-integration`.
+- Compatibility console scripts: `ga-tui`, `ga-tui-agent-bridge`, `ga-tui-check`, `ga-tui-install-core-shim`, and `ga-tui-integration`.
+- Python module entry remains `python -m ga_tui` / `python -m ga_tui.app`.
+- Distribution name in `pyproject.toml`: `shuheng`.
+
+### 3. Contracts
+
+- User-facing docs and doctor output should prefer `Shuheng` and `shuheng*` commands.
+- Compatibility docs may mention `ga-tui*` as legacy aliases, not as the primary product name.
+- Protocol-level identifiers keep their current stable values until an explicit migration task exists.
+- Core shim discovery should search both `Shuheng` and historical `GenericAgent-TUI` checkout directory names.
+
+### 4. Validation & Error Matrix
+
+- Missing `shuheng*` console script in `pyproject.toml` -> packaging regression.
+- Missing `ga-tui*` compatibility script -> existing user scripts break.
+- Doctor output says primary launch is `ga-tui` -> brand regression.
+- Runtime strings identify the main orchestrator only as `GA-TUI` -> product identity regression.
+
+### 5. Good/Base/Bad Cases
+
+- Good: `shuheng-check --root <GenericAgent>` reports `Shuheng root`, `Launch without core patches: shuheng`, and `Compatibility launch alias: ga-tui`.
+- Base: `ga-tui-check --root <GenericAgent>` still works and prints the same Shuheng-branded report.
+- Base: OMP host tools keep names such as `ga_tui_query` because they are protocol compatibility tool ids.
+- Bad: Renaming `ga_tui_query`, `GA_TUI_*`, or `ga-tui.query.v1` in a brand-only task, because that breaks external clients without a schema migration.
+
+### 6. Tests Required
+
+- `scripts/check_policy_gates.py` must assert `pyproject.toml` contains all primary `shuheng*` scripts and all legacy `ga-tui*` aliases.
+- Tests must assert integration doctor report prefers `shuheng` while mentioning `ga-tui` as compatibility.
+- `python3 -m compileall -q src scripts`, `python3 scripts/check_policy_gates.py`, `git diff --check`, and `shuheng-check --root /home/vimalinx/Programs/GenericAgent` must pass.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+Rename every `ga-tui`, `ga_tui`, and `GA_TUI` token in one sweep.
+
+#### Correct
+
+Rename user-visible brand surfaces to Shuheng first, add `shuheng*` entrypoints, and preserve legacy protocol/module/env names until a dedicated compatibility migration is designed.
 
 ## Scenario: OMP Runtime Permission Profiles
 

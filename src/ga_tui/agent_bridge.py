@@ -1,8 +1,8 @@
-"""Local agent bridge API for GA-TUI-managed context and proposals.
+"""Local agent bridge API for Shuheng-managed context and proposals.
 
 This module is intentionally a thin boundary over existing app-owned services.
 Agent clients such as OMP plugins should call this bridge instead of reading
-GA-TUI files directly or writing memory/scheduler ledgers themselves.
+Shuheng files directly or writing memory/scheduler ledgers themselves.
 """
 from __future__ import annotations
 
@@ -180,9 +180,9 @@ def run_bridge_call(payload: dict[str, Any], options: BridgeOptions | None = Non
 
 
 def _common_options(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--root", default="", help="GenericAgent root used by GA-TUI path discovery")
-    parser.add_argument("--harness-dir", default="", help="GA-TUI harness directory override")
-    parser.add_argument("--secret-vault-dir", default="", help="GA-TUI secret vault directory override")
+    parser.add_argument("--root", default="", help="GenericAgent root used by Shuheng path discovery")
+    parser.add_argument("--harness-dir", default="", help="Shuheng harness directory override")
+    parser.add_argument("--secret-vault-dir", default="", help="Shuheng secret vault directory override")
 
 
 def _options_from_args(args: argparse.Namespace) -> BridgeOptions:
@@ -198,7 +198,7 @@ def _print_json(payload: dict[str, Any]) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="GA-TUI local agent bridge")
+    parser = argparse.ArgumentParser(description="Shuheng local agent bridge")
     sub = parser.add_subparsers(dest="command", required=True)
 
     metadata = sub.add_parser("metadata", help="print bridge metadata")
@@ -216,7 +216,7 @@ def main(argv: list[str] | None = None) -> int:
     context = sub.add_parser("context-get", help="generate a context pack")
     _common_options(context)
     context.add_argument("--target", default="")
-    context.add_argument("--objective", default="GA-TUI bridge context request")
+    context.add_argument("--objective", default="Shuheng bridge context request")
     context.add_argument("--task-id", default="")
     context.add_argument("--parent-task-id", default="")
 

@@ -1,11 +1,11 @@
 <div align="center">
 
-<h1>GenericAgent TUI</h1>
+<h1>枢衡 Shuheng</h1>
 
-<p><strong>给 GenericAgent 打造的独立终端控制台。</strong></p>
+<p><strong>面向本地多 Agent 的中心执行、调度、记忆与审批层。</strong></p>
 
 <p>
-把会话管理、多 Agent 调度、任务看板和自动化执行入口收进一个更稳定、更清爽、更适合长期工作的 curses TUI。
+把会话管理、多 Agent 调度、任务看板、记忆治理和自动化执行入口收进一个更稳定、更清爽、更适合长期工作的 curses TUI。
 </p>
 
 <p>
@@ -39,23 +39,23 @@
 
 ## 项目定位
 
-`GenericAgent TUI` 是从 `GenericAgent` 主项目中拆出来的独立终端界面。它不重写核心 agent runtime，而是把用户每天真正接触的终端工作台单独维护起来。
+`枢衡 Shuheng` 是面向本地多 Agent 的终端控制面。它从早期 `GenericAgent TUI` 演进而来：不重写底层 agent runtime，而是把用户每天真正接触的执行、调度、审批、记忆和会话工作台单独维护起来。
 
 你可以把它理解成：
 
 ```text
-会话管理器 + 多 Agent 调度台 + 任务看板 + 自动化控制面板
+会话管理器 + 多 Agent 调度台 + 任务看板 + 记忆/审批治理层 + 自动化控制面板
 ```
 
-它负责让 `GenericAgent` 在终端中更可控、更耐用、更适合长任务；`GenericAgent` 主项目继续负责模型调用、工具执行、历史恢复、会话命名等核心能力。
+它负责让 OMP、GenericAgent、Codex、Claude Code 等本地 agent runtime 在终端中更可控、更耐用、更适合长任务；当前兼容层仍复用 `GenericAgent` 主项目的历史恢复等核心能力。
 
-> Core stays in `GenericAgent`. Control surface lives here.
+> Runtimes execute. Shuheng governs the control surface.
 
 ## 为什么需要它
 
-| 痛点 | GenericAgent TUI 的处理方式 |
+| 痛点 | 枢衡 Shuheng 的处理方式 |
 | --- | --- |
-| 主项目 TUI 改动容易和上游冲突 | TUI 外置维护，日常直接运行 `ga-tui` |
+| 主项目 TUI 改动容易和上游冲突 | TUI 外置维护，日常直接运行 `shuheng` |
 | 长会话容易混乱 | 历史恢复、置顶、分类、过滤、归档和回收站 |
 | 多 Agent 容易失控 | 主控 orchestrator 统一拆解、调度、汇总和验收 |
 | 子 Agent 身份不稳定 | 支持临时/持久子 Agent、profile、role、模型和记忆候选 |
@@ -68,7 +68,7 @@
 
 ### 一句话
 
-`GenericAgent TUI` 把自然语言指挥、会话整理、任务拆解、多 Agent 协作和自动化执行合成一个终端控制面。
+`枢衡 Shuheng` 把自然语言指挥、会话整理、任务拆解、多 Agent 协作、记忆治理和自动化执行合成一个终端控制面。
 
 ### 核心能力矩阵
 
@@ -181,6 +181,8 @@ python -m pip install -e .
 PYTHONPATH=src python -m ga_tui
 ```
 
+`ga_tui` 是保留的 Python 模块名；正式命令入口使用 `shuheng`，旧 `ga-tui` 命令仍作为兼容别名。
+
 ### 2. 指定 GenericAgent 主项目
 
 TUI 会自动寻找 `GenericAgent` 主项目。如果自动发现失败，显式设置：
@@ -198,7 +200,7 @@ export GA_ROOT=/path/to/GenericAgent
 ### 3. 检查接入状态
 
 ```bash
-ga-tui-check
+shuheng-check
 ```
 
 健康输出包含：
@@ -206,13 +208,13 @@ ga-tui-check
 ```text
 Status: OK
 Core imports: agentmain, continue_cmd
-Launch without core patches: ga-tui
+Launch without core patches: shuheng
 ```
 
 ### 4. 启动
 
 ```bash
-ga-tui
+shuheng
 ```
 
 推荐更新方式：
@@ -221,8 +223,8 @@ ga-tui
 cd /path/to/GenericAgent
 git pull
 
-cd /path/to/GenericAgent-TUI
-ga-tui
+cd /path/to/Shuheng
+shuheng
 ```
 
 这样可以让 `GenericAgent` 主项目正常更新，同时让 TUI 作为独立界面层持续迭代。
@@ -234,7 +236,7 @@ ga-tui
 覆盖主项目 `frontends/tuiapp.py`：
 
 ```bash
-ga-tui-install-core-shim --target tuiapp --overwrite
+shuheng-install-core-shim --target tuiapp --overwrite
 ```
 
 第一次覆盖时会保留备份：
@@ -246,16 +248,18 @@ frontends/tuiapp.py.genericagent-tui.bak
 不覆盖 `frontends/tuiapp.py`，只安装 sidecar：
 
 ```bash
-ga-tui-install-core-shim
+shuheng-install-core-shim
 python /path/to/GenericAgent/frontends/tuiapp_curses.py
 ```
 
 显式调用集成工具：
 
 ```bash
-ga-tui-integration doctor --root /path/to/GenericAgent
-ga-tui-integration install-core-shim --root /path/to/GenericAgent --target tuiapp-curses
+shuheng-integration doctor --root /path/to/GenericAgent
+shuheng-integration install-core-shim --root /path/to/GenericAgent --target tuiapp-curses
 ```
+
+兼容入口仍可用：`ga-tui`、`ga-tui-check`、`ga-tui-install-core-shim`、`ga-tui-integration`。
 
 ## 命令入口
 
@@ -373,7 +377,7 @@ ga-tui-integration install-core-shim --root /path/to/GenericAgent --target tuiap
 
 ## 架构方向
 
-`GenericAgent TUI` 正在从聊天入口演进为可治理的本地 agent harness。
+`枢衡 Shuheng` 正在从聊天入口演进为可治理的本地 agent harness。
 
 架构基线：
 
@@ -403,7 +407,7 @@ PYTHONPATH=src python -m ga_tui
 集成检查：
 
 ```bash
-ga-tui-check
+shuheng-check
 ```
 
 提交前建议：

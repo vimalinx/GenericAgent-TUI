@@ -1,7 +1,7 @@
-"""Integration helpers for keeping GenericAgent-TUI outside GenericAgent core.
+"""Integration helpers for keeping Shuheng outside GenericAgent core.
 
-The external TUI should normally be launched as ``ga-tui``.  For users who want
-the upstream ``ga tui`` command to land in this external TUI, this module can
+The external TUI should normally be launched as ``shuheng``.  For users who want
+the upstream ``ga tui`` command to land in Shuheng, this module can
 install a tiny re-runnable shim into a GenericAgent checkout instead of carrying
 large local patches in upstream TUI files.
 """
@@ -108,10 +108,10 @@ def generated_core_shim(tui_root: Path | None = None) -> str:
     repo_s = str(repo)
     return dedent(
         f'''\
-        """Generated GenericAgent-TUI external launcher.
+        """Generated Shuheng external launcher.
 
-        Re-run `ga-tui-install-core-shim` after upstream GenericAgent updates if
-        this file is replaced.  The real TUI lives outside GenericAgent core.
+        Re-run `shuheng-install-core-shim` after upstream GenericAgent updates
+        if this file is replaced.  Shuheng lives outside GenericAgent core.
         """
         from __future__ import annotations
 
@@ -130,7 +130,9 @@ def generated_core_shim(tui_root: Path | None = None) -> str:
             if env_repo:
                 yield Path(env_repo).expanduser()
             yield Path({repo_s!r})
+            yield _genericagent_root().parent / "Shuheng"
             yield _genericagent_root().parent / "GenericAgent-TUI"
+            yield Path.home() / "Programs" / "Shuheng"
             yield Path.home() / "Programs" / "GenericAgent-TUI"
 
 
@@ -170,7 +172,10 @@ def install_core_shim(
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists() and not overwrite:
         current = path.read_text(encoding="utf-8", errors="replace")
-        if "Generated GenericAgent-TUI external launcher" not in current:
+        if (
+            "Generated Shuheng external launcher" not in current
+            and "Generated GenericAgent-TUI external launcher" not in current
+        ):
             raise FileExistsError(f"{path} exists; pass --overwrite to replace it")
     if path.exists() and target == "frontends/tuiapp.py":
         backup = path.with_suffix(path.suffix + ".genericagent-tui.bak")
@@ -182,7 +187,7 @@ def install_core_shim(
 
 def _print_report(root: Path, failures: Iterable[str]) -> int:
     print(f"GenericAgent root: {root}")
-    print(f"GenericAgent-TUI root: {tui_repo_root()}")
+    print(f"Shuheng root: {tui_repo_root()}")
     if failures:
         print("Status: FAIL")
         for failure in failures:
@@ -190,13 +195,14 @@ def _print_report(root: Path, failures: Iterable[str]) -> int:
         return 1
     print("Status: OK")
     print("Core imports: agentmain, continue_cmd")
-    print("Launch without core patches: ga-tui")
-    print("Optional shim: ga-tui-install-core-shim --target tuiapp")
+    print("Launch without core patches: shuheng")
+    print("Compatibility launch alias: ga-tui")
+    print("Optional shim: shuheng-install-core-shim --target tuiapp")
     return 0
 
 
 def doctor_main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Validate GenericAgent-TUI core integration")
+    parser = argparse.ArgumentParser(description="Validate Shuheng core integration")
     parser.add_argument("--root", default="", help="GenericAgent root; defaults to auto-discovery")
     args = parser.parse_args(argv)
     root = Path(args.root).expanduser().resolve() if args.root else find_genericagent_root()
@@ -204,7 +210,7 @@ def doctor_main(argv: list[str] | None = None) -> int:
 
 
 def install_core_shim_main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Install an external GenericAgent-TUI launcher shim")
+    parser = argparse.ArgumentParser(description="Install an external Shuheng launcher shim")
     parser.add_argument("--root", default="", help="GenericAgent root; defaults to auto-discovery")
     parser.add_argument(
         "--target",
@@ -217,7 +223,7 @@ def install_core_shim_main(argv: list[str] | None = None) -> int:
     root = Path(args.root).expanduser().resolve() if args.root else find_genericagent_root()
     target = "frontends/tuiapp.py" if args.target == "tuiapp" else "frontends/tuiapp_curses.py"
     path = install_core_shim(root, target=target, overwrite=args.overwrite)
-    print(f"Installed GenericAgent-TUI shim: {path}")
+    print(f"Installed Shuheng shim: {path}")
     if args.target == "tuiapp":
         print("Upstream `ga tui` should now delegate to the external TUI.")
     else:
@@ -226,7 +232,7 @@ def install_core_shim_main(argv: list[str] | None = None) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="GenericAgent-TUI integration utilities")
+    parser = argparse.ArgumentParser(description="Shuheng integration utilities")
     sub = parser.add_subparsers(dest="command", required=True)
     doctor = sub.add_parser("doctor", help="validate imports and discovery")
     doctor.add_argument("--root", default="")

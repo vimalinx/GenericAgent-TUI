@@ -3,9 +3,9 @@ requires = ["setuptools>=69"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "genericagent-tui"
+name = "shuheng"
 version = "0.1.0"
-description = "Standalone curses TUI launcher for GenericAgent"
+description = "Shuheng: governed terminal control plane for local agents"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -16,6 +16,11 @@ dependencies = [
 ]
 
 [project.scripts]
+shuheng = "ga_tui.app:main"
+shuheng-agent-bridge = "ga_tui.agent_bridge:main"
+shuheng-check = "ga_tui.integration:doctor_main"
+shuheng-install-core-shim = "ga_tui.integration:install_core_shim_main"
+shuheng-integration = "ga_tui.integration:main"
 ga-tui = "ga_tui.app:main"
 ga-tui-agent-bridge = "ga_tui.agent_bridge:main"
 ga-tui-check = "ga_tui.integration:doctor_main"

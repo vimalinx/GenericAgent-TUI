@@ -1133,7 +1133,7 @@ class OhMyPiRpcAgent:
         self._append_active_tool_call_process(
             tool_name or "unknown_tool",
             arguments,
-            summary=f"调用 GA-TUI host tool: {tool_name or 'unknown_tool'}",
+            summary=f"调用 Shuheng host tool: {tool_name or 'unknown_tool'}",
         )
         allowed_names = {str(tool.get("name") or "") for tool in self.host_tool_definitions}
         if not tool_name or tool_name not in allowed_names:
@@ -1364,8 +1364,8 @@ def build_ohmypi_memory_prompt(*, root_dir: str, harness_dir: str) -> str:
     sections = [
         f"# {GA_TUI_MEMORY_PROMPT_HEADER}",
         "",
-        "You are running as the Oh My Pi execution runtime inside GenericAgent-TUI.",
-        "GenericAgent-TUI remains the Orchestrator: it owns task ledgers, approvals, artifact refs, and long-term memory governance.",
+        "You are running as the Oh My Pi execution runtime inside Shuheng.",
+        "Shuheng remains the Orchestrator: it owns task ledgers, approvals, artifact refs, and long-term memory governance.",
         "Use the memory below as heuristic context. Verify current repository state before acting when memory could be stale.",
         "Do not write long-term memory directly. If execution reveals a durable, verified lesson, include it in your final answer under `Memory candidates` with evidence refs.",
         "Never expose or store secrets. Treat redacted or credential-looking content as unavailable.",
@@ -1459,7 +1459,7 @@ def ohmypi_provider_spec(
             "supports_default_model": True,
             "supports_per_agent_default": False,
             "recent_models_path": recent_models_path,
-            "selection_contract": "GA-TUI /model entries projected into isolated OMP config.yml and models.yml",
+            "selection_contract": "Shuheng /model entries projected into isolated OMP config.yml and models.yml",
             "isolated_agent_dir": runtime_config.agent_dir if runtime_config else "",
             "config_path": runtime_config.config_path if runtime_config else "",
             "models_path": runtime_config.models_path if runtime_config else "",
@@ -1493,11 +1493,11 @@ def ohmypi_provider_spec(
         notes=[
             "Experiment branch default provider; GenericAgent remains available via GA_TUI_RUNTIME_PROVIDER=genericagent.",
             "Oh My Pi runs out-of-process through JSONL stdio RPC.",
-            "Embedded Oh My Pi uses a GA-TUI-owned PI_CODING_AGENT_DIR instead of ~/.omp/agent.",
+            "Embedded Oh My Pi uses a Shuheng-owned PI_CODING_AGENT_DIR instead of ~/.omp/agent.",
             "GenericAgent/TUI memory is injected through --append-system-prompt.",
-            "GA-TUI emits provider-neutral runtime.task_request.v1 and runtime.task_event.v1 records around OMP execution.",
+            "Shuheng emits provider-neutral runtime.task_request.v1 and runtime.task_event.v1 records around OMP execution.",
             "Oh My Pi completion text can emit memory candidate signals; TUI remains the approval owner.",
-            "Default isolated OMP approval mode is write: read/write tiers run headless, exec prompts are bridged through GA-TUI permission-profile checks.",
+            "Default isolated OMP approval mode is write: read/write tiers run headless, exec prompts are bridged through Shuheng permission-profile checks.",
             "Only app-injected TUI query, typed read-only, and governed proposal host tools are enabled; unrestricted host tools, host URI schemes, and direct TUI approval mapping stay disabled.",
             f"runtime_root={root_dir}",
             f"harness_dir={harness_dir}",

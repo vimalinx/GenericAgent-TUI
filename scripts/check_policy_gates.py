@@ -15,6 +15,8 @@ import threading
 import urllib.request
 import curses
 import zipfile
+import contextlib
+import io
 from pathlib import Path
 
 
@@ -25,6 +27,7 @@ from ga_tui import app as a  # noqa: E402
 from ga_tui import agent_bridge as bridge  # noqa: E402
 from ga_tui import control_protocol as cp  # noqa: E402
 from ga_tui import genericagent_provider as gap  # noqa: E402
+from ga_tui import integration as integ  # noqa: E402
 from ga_tui import ohmypi_provider as omp  # noqa: E402
 from ga_tui import scheduler as sched  # noqa: E402
 
@@ -407,6 +410,31 @@ def assert_ohmypi_provider_module_boundary() -> None:
         "from .app import State",
     ):
         assert forbidden not in provider_source, forbidden
+
+
+def assert_shuheng_brand_entrypoints() -> None:
+    pyproject = Path(ROOT, "pyproject.toml").read_text(encoding="utf-8")
+    assert 'name = "shuheng"' in pyproject, pyproject
+    for script in (
+        "shuheng",
+        "shuheng-agent-bridge",
+        "shuheng-check",
+        "shuheng-install-core-shim",
+        "shuheng-integration",
+        "ga-tui",
+        "ga-tui-agent-bridge",
+        "ga-tui-check",
+        "ga-tui-install-core-shim",
+        "ga-tui-integration",
+    ):
+        assert f"{script} =" in pyproject, script
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        assert integ._print_report(ROOT, []) == 0
+    report = buffer.getvalue()
+    assert "Shuheng root:" in report, report
+    assert "Launch without core patches: shuheng" in report, report
+    assert "Compatibility launch alias: ga-tui" in report, report
 
 
 def assert_ohmypi_runtime_registry() -> None:
@@ -3478,6 +3506,7 @@ def run_checks() -> None:
     assert_scheduler_module_boundary()
     assert_genericagent_provider_module_boundary()
     assert_ohmypi_provider_module_boundary()
+    assert_shuheng_brand_entrypoints()
     assert_ohmypi_runtime_registry()
     assert_ohmypi_memory_prompt_and_command()
     assert_ohmypi_isolated_runtime_settings()

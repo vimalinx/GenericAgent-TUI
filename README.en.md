@@ -1,11 +1,11 @@
 <div align="center">
 
-<h1>GenericAgent TUI</h1>
+<h1>Shuheng</h1>
 
-<p><strong>An independent terminal control plane for GenericAgent.</strong></p>
+<p><strong>A central execution, orchestration, memory, and approval layer for local agents.</strong></p>
 
 <p>
-Bring session management, multi-agent orchestration, task planning, and automation control into a stable curses-based TUI built for long-running local agent work.
+Bring session management, multi-agent orchestration, task planning, memory governance, and automation control into a stable curses-based TUI built for long-running local agent work.
 </p>
 
 <p>
@@ -39,23 +39,23 @@ Bring session management, multi-agent orchestration, task planning, and automati
 
 ## Positioning
 
-`GenericAgent TUI` is an external terminal interface for `GenericAgent`. It does not reimplement the core agent runtime. Instead, it separates the daily user-facing terminal workspace into a dedicated repository.
+`Shuheng` is a terminal control plane for local multi-agent work. It evolved from the earlier `GenericAgent TUI`: it does not reimplement agent runtimes, but separates the daily user-facing execution, orchestration, approval, memory, and session workspace into a dedicated repository.
 
 Think of it as:
 
 ```text
-Session Manager + Multi-Agent Console + Task Board + Automation Control Plane
+Session Manager + Multi-Agent Console + Task Board + Memory/Approval Governance + Automation Control Plane
 ```
 
-The TUI is responsible for making `GenericAgent` easier to operate in long-running terminal workflows. The main `GenericAgent` project still owns model calls, tool execution, history restoration, and session naming.
+Shuheng makes OMP, GenericAgent, Codex, Claude Code, and other local agent runtimes easier to govern in long-running terminal workflows. The current compatibility layer still reuses the main `GenericAgent` project for history restoration and related core capabilities.
 
-> Core stays in `GenericAgent`. Control surface lives here.
+> Runtimes execute. Shuheng governs the control surface.
 
 ## Why This Exists
 
-| Problem | What GenericAgent TUI does |
+| Problem | What Shuheng does |
 | --- | --- |
-| TUI patches conflict with upstream core updates | Keep the TUI external and launch it with `ga-tui` |
+| TUI patches conflict with upstream core updates | Keep the TUI external and launch it with `shuheng` |
 | Long conversations become hard to manage | Restore, pin, categorize, filter, archive, and trash sessions |
 | Multi-agent work can drift | Keep one orchestrator responsible for planning, dispatch, synthesis, and validation |
 | Subagent identities need continuity | Support temporary and persistent subagents with profile, role, model, and memory candidates |
@@ -68,7 +68,7 @@ The implementation uses Python `curses` for a small, controlled, low-dependency 
 
 ### In One Sentence
 
-`GenericAgent TUI` combines conversational control, session organization, task planning, multi-agent collaboration, and automation execution in one terminal control plane.
+`Shuheng` combines conversational control, session organization, task planning, multi-agent collaboration, memory governance, and automation execution in one terminal control plane.
 
 ### Core Capability Matrix
 
@@ -181,6 +181,8 @@ Run directly from source without installation:
 PYTHONPATH=src python -m ga_tui
 ```
 
+`ga_tui` remains the Python module name for compatibility. The official command is `shuheng`; the older `ga-tui` command remains as a compatibility alias.
+
 ### 2. Point To GenericAgent Core
 
 The TUI tries to discover the `GenericAgent` checkout automatically. If discovery fails:
@@ -198,7 +200,7 @@ export GA_ROOT=/path/to/GenericAgent
 ### 3. Validate Integration
 
 ```bash
-ga-tui-check
+shuheng-check
 ```
 
 Healthy output includes:
@@ -206,13 +208,13 @@ Healthy output includes:
 ```text
 Status: OK
 Core imports: agentmain, continue_cmd
-Launch without core patches: ga-tui
+Launch without core patches: shuheng
 ```
 
 ### 4. Launch
 
 ```bash
-ga-tui
+shuheng
 ```
 
 Recommended update flow:
@@ -221,8 +223,8 @@ Recommended update flow:
 cd /path/to/GenericAgent
 git pull
 
-cd /path/to/GenericAgent-TUI
-ga-tui
+cd /path/to/Shuheng
+shuheng
 ```
 
 This lets the core `GenericAgent` project update normally while the TUI evolves as a separate interface layer.
@@ -234,7 +236,7 @@ If you want `ga tui` inside the `GenericAgent` checkout to launch this external 
 Replace `frontends/tuiapp.py`:
 
 ```bash
-ga-tui-install-core-shim --target tuiapp --overwrite
+shuheng-install-core-shim --target tuiapp --overwrite
 ```
 
 The first replacement keeps a backup:
@@ -246,16 +248,18 @@ frontends/tuiapp.py.genericagent-tui.bak
 Install a sidecar without replacing `frontends/tuiapp.py`:
 
 ```bash
-ga-tui-install-core-shim
+shuheng-install-core-shim
 python /path/to/GenericAgent/frontends/tuiapp_curses.py
 ```
 
 Call integration utilities explicitly:
 
 ```bash
-ga-tui-integration doctor --root /path/to/GenericAgent
-ga-tui-integration install-core-shim --root /path/to/GenericAgent --target tuiapp-curses
+shuheng-integration doctor --root /path/to/GenericAgent
+shuheng-integration install-core-shim --root /path/to/GenericAgent --target tuiapp-curses
 ```
+
+Compatibility entrypoints remain available: `ga-tui`, `ga-tui-check`, `ga-tui-install-core-shim`, and `ga-tui-integration`.
 
 ## Command Surface
 
@@ -373,7 +377,7 @@ This boundary lets the core project follow upstream updates while the TUI can be
 
 ## Architecture Direction
 
-`GenericAgent TUI` is evolving from a chat entrypoint into a governed local agent harness.
+`Shuheng` is evolving from a chat entrypoint into a governed local agent harness.
 
 Architecture baseline:
 
@@ -403,7 +407,7 @@ PYTHONPATH=src python -m ga_tui
 Validate integration:
 
 ```bash
-ga-tui-check
+shuheng-check
 ```
 
 Recommended checks before committing:
