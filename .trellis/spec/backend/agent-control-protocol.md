@@ -573,7 +573,8 @@ configure_genericagent_provider_runtime(
 - Process normalization belongs inside `ohmypi_provider.py`; `app.py` must not contain OMP-specific RPC parsing or a second OMP renderer.
 - OMP process args/results included in assistant text must be bounded and secret-redacted before entering the display queue, history, artifacts, traces, or memory-candidate extraction.
 - OMP memory-candidate signal extraction must strip normalized process markers, `<thinking>` blocks, tool args, and tool result fences before deciding whether a durable candidate exists.
-- Oh My Pi RPC terminal frames `agent_end` or `turn_end` map to one queue item shaped as `{"done": <buffer>, "source": "ohmypi"}`.
+- Oh My Pi RPC `turn_end` captures the completed visible turn but must not release the active prompt until `agent_end`, because real OMP may still be finalizing UI/status events and will reject a next prompt as `Agent is already processing`.
+- Oh My Pi RPC `agent_end` maps the active prompt to one queue item shaped as `{"done": <buffer>, "source": "ohmypi"}`. If `agent_end` is absent, a short provider-owned grace fallback may complete from the captured `turn_end` payload for compatibility with older/fake streams.
 - If no `text_delta` populated the active buffer, the done text must fall back to visible assistant text carried by `message_end`, terminal-frame `message.content`, or `assistantMessageEvent` text payloads.
 - Startup, prompt, or missing-binary failures must map to a queue `done` item instead of raising into the TUI caller after `put_task()` returns.
 - The wrapper must expose the current GenericAgent-shaped compatibility surface used by existing TUI hot paths: `put_task()`, `abort()`, `get_llm_name()`, `list_llms()`, `load_llm_sessions()`, `next_llm()`, `is_running`, `task_queue.unfinished_tasks`, `log_path`, `llmclient.backend`, and `llmclients`.
@@ -584,6 +585,7 @@ configure_genericagent_provider_runtime(
 - Provider metadata must advertise `capabilities.runtime_task_requests:true` and `capabilities.runtime_task_events:true` once OMP execution is wrapped by `runtime.task_request.v1` and `runtime.task_event.v1`.
 - `OhMyPiRpcAgent` may register host tools through `set_host_tools` only from definitions injected by `app.py`; provider code must not invent writable tools or import TUI `State`.
 - Embedded OMP must use a GA-TUI-owned runtime root and must not read or write system-level `~/.omp/agent/config.yml`, `~/.omp/agent/models.yml`, sessions, auth storage, or cache as its active agent directory.
+- Embedded OMP must run with the GenericAgent-TUI repository root as its subprocess `cwd`, while GA-TUI harness paths, memory, ledgers, isolated OMP runtime files, and provider metadata continue to use the GenericAgent root / `${AGENT_HARNESS_DIR}` ownership boundary.
 - `app.py` owns translation from GA-TUI `/model` entries to isolated OMP `config.yml` and `models.yml`; `ohmypi_provider.py` owns only generic runtime file writing, subprocess env, command construction, and RPC behavior.
 - Generated OMP `config.yml` must set `modelRoles.default` to the GA-TUI default model selector when a complete matching `/model` entry exists.
 - Generated OMP `models.yml` must represent complete GA-TUI OpenAI-compatible entries as custom OMP providers with `baseUrl`, `apiKey`, `api`, and `models[].id`; API keys must be referenced through child-process env var names instead of written as secrets in the generated file.
@@ -639,7 +641,10 @@ configure_genericagent_provider_runtime(
 - Incomplete GA-TUI model entry -> omitted from isolated OMP `models.yml`; no invalid OMP provider is generated.
 - Selected GA-TUI default model -> OMP command may include `--model <isolated-provider>/<model-id>` and isolated `config.yml` carries the same `modelRoles.default`.
 - User system OMP config exists -> policy checks must verify its hash remains unchanged across embedded OMP runtime setup.
+- OMP adapter registration -> subprocess `cwd` is the GenericAgent-TUI app root so relative repo paths such as `AGENTS.md` resolve to the TUI project while isolated runtime files still live under the GA-TUI-owned harness directory.
 - OMP error frame with `stopReason:"error"` and `errorMessage` -> active TUI queue receives a visible `[Oh My Pi] ...` done item.
+- OMP `turn_end` followed by an immediate next `put_task()` before `agent_end` -> wrapper rejects the next prompt as concurrent instead of sending it to OMP and surfacing `Agent is already processing`.
+- OMP `turn_end` followed by `agent_end` -> active queue receives the done item and the next prompt can then be sent normally.
 - OMP thinking delta + tool execution frames + final text delta -> active TUI queue receives GA-style process markers plus the final reply; `render_assistant_text(..., fold_process:true)` folds thinking/tool noise and keeps the final reply visible.
 - OMP host tool calls/results -> active TUI queue receives folded GA-style tool process turns while RPC still receives matching `host_tool_result` frames.
 - OMP memory-candidate signal extraction over normalized process output -> candidate statement contains only the final durable reply, not thinking text, tool args, or tool results.
@@ -672,6 +677,7 @@ configure_genericagent_provider_runtime(
 - Tests must assert the generated memory append prompt is bounded, redacted, and passed to `omp` through `--append-system-prompt`.
 - Tests must assert completed Oh My Pi output can produce a governed memory candidate signal and that empty, too-short, secret-looking, and Secret-context outputs are skipped.
 - Tests must assert a fake RPC process maps `ready`, `prompt` ack, `message_update` deltas, and `agent_end` into queue `next`/`done` items.
+- Tests must assert `turn_end` does not release the active prompt before `agent_end`, preventing immediate next-prompt races against real OMP finalization.
 - Tests must assert a fake RPC process maps OMP thinking/tool events into GenericAgent-TUI foldable process blocks, that the existing assistant renderer folds them, and that final replies remain visible.
 - Tests must assert `put_runtime_task(RuntimeTaskRequest)` emits `runtime.task_event.v1` rows that preserve `runtime.task_request.v1`, `prompt_preview`, `prompt_chars`, `context_pack_ref`, and artifact refs without storing the raw prompt.
 - Tests must assert a fake RPC process with no `text_delta` still produces non-empty `done` text when final assistant text is carried by `message_end.message.content` or terminal-frame `message.content`.
@@ -685,6 +691,7 @@ configure_genericagent_provider_runtime(
 - Tests must assert `ga_tui_propose` memory candidates create existing memory approval artifacts/approval rows and invalid proposals return structured errors.
 - Tests must assert provider metadata advertises `tui_readonly_host_tools:true`, `tui_governed_proposal_tools:true`, `tui_typed_host_tools:true`, `runtime_task_requests:true`, and `runtime_task_events:true` while keeping unrestricted `host_tools:false`.
 - Tests must assert isolated OMP runtime files are generated under `${AGENT_HARNESS_DIR}/runtime/ohmypi/agent`, not under `~/.omp/agent`.
+- Tests must assert the OMP runtime adapter subprocess `cwd` is the GenericAgent-TUI app root, not the GenericAgent harness root.
 - Tests must assert generated OMP API keys are env references in `models.yml`, raw key values are absent from generated files, and child-process env carries `PI_CODING_AGENT_DIR`.
 - Tests must assert `/model` default selection maps to isolated OMP `modelRoles.default` and RPC `set_model` can be sent before the first prompt when a TUI model is selected.
 - Tests must assert OMP terminal error frames surface `errorMessage` / `errorStatus` visibly instead of an empty done item.

@@ -1,3 +1,4 @@
 {"file":".trellis/spec/backend/agent-control-protocol.md","reason":"Defines the OMP provider boundary, RPC queue/event mapping, foldable process-block contract, and memory-candidate cleanup requirements for this change."}
 {"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"Required reuse check before adding helpers; existing GA-TUI renderer should be reused instead of duplicating UI folding logic."}
 {"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Required because OMP RPC frames cross provider, queue, renderer, history, and memory-candidate boundaries."}
+{"file":".trellis/spec/backend/agent-control-protocol.md","reason":"Updated after live OMP smoke exposed that turn_end carries completed text but agent_end is the safe RPC-idle release point for the next prompt."}

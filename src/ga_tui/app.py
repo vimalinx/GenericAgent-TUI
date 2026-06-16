@@ -11830,7 +11830,7 @@ def agent_runtime_registry(*, write_memory_prompt_file: bool = True) -> RuntimeR
         runtime_config=ohmypi_runtime_config,
     ),
         command=ohmypi_command,
-        cwd=ROOT_DIR,
+        cwd=APP_ROOT_DIR,
         env=ohmypi_runtime_config.env,
         configured_models=ohmypi_runtime_config.models,
         memory_candidate_sink=append_ohmypi_memory_candidate_signal,

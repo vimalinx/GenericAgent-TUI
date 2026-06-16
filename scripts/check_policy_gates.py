@@ -525,6 +525,7 @@ def assert_ohmypi_isolated_runtime_settings() -> None:
         registry = a.agent_runtime_registry(write_memory_prompt_file=False)
         adapter = registry.get("ohmypi")
         assert adapter is not None
+        assert getattr(adapter, "cwd") == a.APP_ROOT_DIR, getattr(adapter, "cwd")
         assert getattr(adapter, "env")["PI_CODING_AGENT_DIR"] == runtime_config.agent_dir
         record = adapter.spec.to_record()
         assert record["model_routing"]["isolated_agent_dir"] == runtime_config.agent_dir, record
@@ -746,6 +747,58 @@ def assert_ohmypi_rpc_final_text_fallback() -> None:
     assert done["done"] == "直接成功。", done
     assert agent.is_running is False
     assert agent.task_queue.unfinished_tasks == 0
+    agent.close()
+
+
+def assert_ohmypi_rpc_waits_for_agent_end_before_next_prompt() -> None:
+    processes: list[FakeRpcProcess] = []
+
+    def process_factory(*_args, **_kwargs):
+        process = FakeRpcProcess(auto_finish=False)
+        processes.append(process)
+        return process
+
+    agent = omp.OhMyPiRpcAgent(
+        command=["/fake/omp", "--mode", "rpc"],
+        cwd=str(ROOT),
+        process_factory=process_factory,
+        startup_timeout=1,
+        terminal_grace_timeout=1,
+    )
+    first_q = agent.put_task("first", source="test")
+    process = wait_for_process(processes)
+    process.stdout.push({
+        "type": "message_update",
+        "assistantMessageEvent": {"type": "text_delta", "delta": "first done"},
+    })
+    process.stdout.push({"type": "turn_end"})
+    second_q = agent.put_task("second", source="test")
+    rejected = second_q.get(timeout=2)
+    assert "不能并发启动新任务" in rejected["done"], rejected
+
+    deadline = time.time() + 0.15
+    while time.time() < deadline:
+        try:
+            item = first_q.get(timeout=0.02)
+        except queue.Empty:
+            continue
+        assert "done" not in item, item
+
+    process.stdout.push({"type": "agent_end"})
+    first_done = first_q.get(timeout=2)
+    assert first_done["done"] == "first done", first_done
+    assert agent.is_running is False
+    assert agent.task_queue.unfinished_tasks == 0
+
+    third_q = agent.put_task("third", source="test")
+    wait_for_rpc_write(process, lambda frame: frame.get("type") == "prompt" and frame.get("message") == "third")
+    process.stdout.push({
+        "type": "message_update",
+        "assistantMessageEvent": {"type": "text_delta", "delta": "third done"},
+    })
+    process.stdout.push({"type": "agent_end"})
+    third_done, _third_streamed = wait_for_queue_done(third_q)
+    assert third_done["done"] == "third done", third_done
     agent.close()
 
 
@@ -3432,6 +3485,7 @@ def run_checks() -> None:
     assert_ohmypi_rpc_extension_approval_bridge()
     assert_ohmypi_rpc_queue_mapping()
     assert_ohmypi_rpc_final_text_fallback()
+    assert_ohmypi_rpc_waits_for_agent_end_before_next_prompt()
     assert_ohmypi_rpc_process_blocks_fold_like_genericagent()
     assert_ohmypi_rpc_env_model_switch_and_error_mapping()
     assert_ohmypi_host_tool_bridge()

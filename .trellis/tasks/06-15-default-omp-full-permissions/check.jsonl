@@ -1,2 +1,3 @@
 {"file":".trellis/spec/backend/agent-control-protocol.md","reason":"Post-change contract check: OMP process normalization stays provider-owned, uses existing foldable renderer markers, bounds/redacts tool payloads, and keeps memory candidates final-reply-only."}
 {"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Post-change data-flow check: OMP frames become queue text, renderer-folded history, runtime traces, and memory-candidate input without a second UI protocol."}
+{"file":".trellis/spec/backend/agent-control-protocol.md","reason":"Live-smoke regression check: turn_end must not clear active state before agent_end, otherwise immediate next prompts race with real OMP finalization."}

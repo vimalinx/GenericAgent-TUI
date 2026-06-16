@@ -142,6 +142,9 @@ class _ActivePrompt:
     finished: bool = False
     process_turn_no: int = 0
     pending_thinking: str = ""
+    pending_terminal_text: str | None = None
+    pending_terminal_fallback_text: str = ""
+    terminal_grace_started: bool = False
 
 
 @dataclass(frozen=True)
@@ -368,6 +371,7 @@ class OhMyPiRpcAgent:
         configured_models: list[OhMyPiRuntimeModel] | None = None,
         startup_timeout: float = 10.0,
         stop_timeout: float = 3.0,
+        terminal_grace_timeout: float = 1.0,
     ) -> None:
         self.command = list(command or ohmypi_rpc_command())
         self.cwd = cwd or os.getcwd()
@@ -384,6 +388,7 @@ class OhMyPiRpcAgent:
         self.runtime_event_sink = runtime_event_sink
         self.startup_timeout = startup_timeout
         self.stop_timeout = stop_timeout
+        self.terminal_grace_timeout = terminal_grace_timeout
         self.task_queue = _TaskCounter()
         self.is_running = False
         self.log_path = ""
@@ -640,7 +645,13 @@ class OhMyPiRpcAgent:
                 self._remember_active_final_text(self._frame_visible_text(frame))
             return
         if frame_type in {"agent_end", "turn_end"}:
-            self._finish_active(self._frame_error_text(frame), fallback_text=self._frame_visible_text(frame))
+            error_text = self._frame_error_text(frame)
+            fallback_text = self._frame_visible_text(frame)
+            if frame_type == "turn_end":
+                self._defer_active_terminal(error_text, fallback_text=fallback_text)
+            else:
+                pending_text, pending_fallback = self._active_pending_terminal()
+                self._finish_active(error_text or pending_text, fallback_text=fallback_text or pending_fallback)
             return
         if frame_type == "extension_ui_request":
             self._answer_extension_ui(frame)
@@ -898,6 +909,38 @@ class OhMyPiRpcAgent:
             if active is None or active.finished:
                 return
             active.final_text = text
+
+    def _active_pending_terminal(self) -> tuple[str | None, str]:
+        with self._active_lock:
+            active = self._active
+            if active is None or active.finished:
+                return None, ""
+            return active.pending_terminal_text, active.pending_terminal_fallback_text
+
+    def _defer_active_terminal(self, text: str | None = None, *, fallback_text: str = "") -> None:
+        should_start_grace = False
+        with self._active_lock:
+            active = self._active
+            if active is None or active.finished:
+                return
+            if text is not None:
+                active.pending_terminal_text = text
+            if fallback_text:
+                active.pending_terminal_fallback_text = fallback_text
+            if not active.terminal_grace_started:
+                active.terminal_grace_started = True
+                should_start_grace = True
+        if should_start_grace:
+            self.thread_factory(target=self._finish_active_after_terminal_grace, daemon=True, name="ohmypi-rpc-terminal-grace").start()
+
+    def _finish_active_after_terminal_grace(self) -> None:
+        time.sleep(max(0.05, self.terminal_grace_timeout))
+        text, fallback_text = self._active_pending_terminal()
+        with self._active_lock:
+            active = self._active
+            if active is None or active.finished or not active.terminal_grace_started:
+                return
+        self._finish_active(text, fallback_text=fallback_text)
 
     def _finish_active(self, text: str | None = None, *, source: str = "ohmypi", fallback_text: str = "") -> None:
         if text is None:
