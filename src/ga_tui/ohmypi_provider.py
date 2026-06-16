@@ -620,6 +620,9 @@ class OhMyPiRpcAgent:
             self._register_host_tools()
             self._ready.set()
             return
+        if frame_type == "turn_start":
+            self._cancel_active_terminal_grace()
+            return
         if frame_type == "response":
             self._handle_response(frame)
             return
@@ -648,7 +651,11 @@ class OhMyPiRpcAgent:
             error_text = self._frame_error_text(frame)
             fallback_text = self._frame_visible_text(frame)
             if frame_type == "turn_end":
-                self._defer_active_terminal(error_text, fallback_text=fallback_text)
+                self._defer_active_terminal(
+                    error_text,
+                    fallback_text=fallback_text,
+                    start_grace=not self._turn_end_expects_followup(frame),
+                )
             else:
                 pending_text, pending_fallback = self._active_pending_terminal()
                 self._finish_active(error_text or pending_text, fallback_text=fallback_text or pending_fallback)
@@ -809,12 +816,38 @@ class OhMyPiRpcAgent:
         return "[Oh My Pi] " + ": ".join(parts)
 
     def _frame_visible_text(self, frame: dict[str, Any]) -> str:
+        messages = frame.get("messages")
+        if isinstance(messages, list):
+            for message in reversed(messages):
+                if not isinstance(message, dict):
+                    continue
+                if str(message.get("role") or "") != "assistant":
+                    continue
+                text = _visible_text_from_payload(message)
+                if text:
+                    return text
         parts: list[str] = []
-        for key in ("message", "assistantMessage", "assistantMessageEvent"):
+        message = frame.get("message")
+        if isinstance(message, dict) and str(message.get("role") or "") == "assistant":
+            text = _visible_text_from_payload(message)
+            if text:
+                parts.append(text)
+        for key in ("assistantMessage", "assistantMessageEvent"):
             text = _visible_text_from_payload(frame.get(key))
             if text:
                 parts.append(text)
         return "".join(parts)
+
+    def _turn_end_expects_followup(self, frame: dict[str, Any]) -> bool:
+        objects: list[dict[str, Any]] = [frame]
+        message = frame.get("message")
+        if isinstance(message, dict):
+            objects.append(message)
+        for item in objects:
+            stop_reason = str(item.get("stopReason") or item.get("stop_reason") or "")
+            if stop_reason == "toolUse":
+                return True
+        return bool(frame.get("toolResults"))
 
     def _append_active_process_block(self, summary: str, body: str) -> None:
         body_text = str(body or "").strip()
@@ -917,7 +950,16 @@ class OhMyPiRpcAgent:
                 return None, ""
             return active.pending_terminal_text, active.pending_terminal_fallback_text
 
-    def _defer_active_terminal(self, text: str | None = None, *, fallback_text: str = "") -> None:
+    def _cancel_active_terminal_grace(self) -> None:
+        with self._active_lock:
+            active = self._active
+            if active is None or active.finished:
+                return
+            active.pending_terminal_text = None
+            active.pending_terminal_fallback_text = ""
+            active.terminal_grace_started = False
+
+    def _defer_active_terminal(self, text: str | None = None, *, fallback_text: str = "", start_grace: bool = True) -> None:
         should_start_grace = False
         with self._active_lock:
             active = self._active
@@ -927,6 +969,9 @@ class OhMyPiRpcAgent:
                 active.pending_terminal_text = text
             if fallback_text:
                 active.pending_terminal_fallback_text = fallback_text
+            if not start_grace:
+                active.terminal_grace_started = False
+                return
             if not active.terminal_grace_started:
                 active.terminal_grace_started = True
                 should_start_grace = True
@@ -1301,6 +1346,21 @@ def _has_cli_flag(args: list[str], flag: str) -> bool:
     return any(item == flag or item.startswith(flag + "=") for item in args)
 
 
+def resolve_ohmypi_binary(binary: str | None = None) -> str:
+    explicit = str(binary or os.environ.get("GA_TUI_OHMYPI_BIN") or "").strip()
+    if explicit:
+        return explicit
+    discovered = shutil.which("omp")
+    if discovered:
+        return discovered
+    for candidate in (
+        os.path.join(os.path.expanduser("~"), ".bun", "bin", "omp"),
+    ):
+        if os.path.exists(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return "omp"
+
+
 def ohmypi_rpc_command(
     binary: str | None = None,
     extra_args: list[str] | None = None,
@@ -1308,7 +1368,7 @@ def ohmypi_rpc_command(
     model: str | None = None,
     approval_mode: str | None = None,
 ) -> list[str]:
-    binary = binary or os.environ.get("GA_TUI_OHMYPI_BIN", "omp")
+    binary = resolve_ohmypi_binary(binary)
     env_args = shlex.split(os.environ.get("GA_TUI_OHMYPI_ARGS", ""))
     appended_args = list(extra_args or env_args)
     approval_mode = normalized_ohmypi_approval_mode(approval_mode or os.environ.get("GA_TUI_OMP_APPROVAL_MODE") or "write")
@@ -1523,6 +1583,7 @@ __all__ = [
     "ohmypi_rpc_command",
     "ohmypi_runtime_root",
     "ohmypi_subprocess_env",
+    "resolve_ohmypi_binary",
     "write_ohmypi_runtime_files",
     "write_ohmypi_memory_prompt",
 ]

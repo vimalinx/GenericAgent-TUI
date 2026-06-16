@@ -511,6 +511,40 @@ def assert_ohmypi_memory_prompt_and_command() -> None:
     assert "/user/append.md" in command_with_user_append, command_with_user_append
 
 
+def assert_ohmypi_rpc_command_discovers_user_bun_binary() -> None:
+    temp_home = tempfile.mkdtemp(prefix="ga_tui_omp_home_")
+    bun_bin = Path(temp_home, ".bun", "bin")
+    bun_bin.mkdir(parents=True)
+    omp_binary = bun_bin / "omp"
+    omp_binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    omp_binary.chmod(0o755)
+    old_home = os.environ.get("HOME")
+    old_path = os.environ.get("PATH")
+    old_bin = os.environ.pop("GA_TUI_OHMYPI_BIN", None)
+    try:
+        os.environ["HOME"] = temp_home
+        os.environ["PATH"] = ""
+        command = omp.ohmypi_rpc_command()
+        assert command[0] == str(omp_binary), command
+
+        os.environ["GA_TUI_OHMYPI_BIN"] = "/custom/omp"
+        explicit_command = omp.ohmypi_rpc_command()
+        assert explicit_command[0] == "/custom/omp", explicit_command
+    finally:
+        if old_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = old_home
+        if old_path is None:
+            os.environ.pop("PATH", None)
+        else:
+            os.environ["PATH"] = old_path
+        if old_bin is None:
+            os.environ.pop("GA_TUI_OHMYPI_BIN", None)
+        else:
+            os.environ["GA_TUI_OHMYPI_BIN"] = old_bin
+
+
 def assert_ohmypi_isolated_runtime_settings() -> None:
     root = tempfile.mkdtemp(prefix="ga_tui_omp_isolated_")
     retarget_harness(root)
@@ -827,6 +861,70 @@ def assert_ohmypi_rpc_waits_for_agent_end_before_next_prompt() -> None:
     process.stdout.push({"type": "agent_end"})
     third_done, _third_streamed = wait_for_queue_done(third_q)
     assert third_done["done"] == "third done", third_done
+    agent.close()
+
+
+def assert_ohmypi_rpc_tool_use_turn_end_waits_for_final_answer() -> None:
+    processes: list[FakeRpcProcess] = []
+
+    def process_factory(*_args, **_kwargs):
+        process = FakeRpcProcess(auto_finish=False)
+        processes.append(process)
+        return process
+
+    agent = omp.OhMyPiRpcAgent(
+        command=["/fake/omp", "--mode", "rpc"],
+        cwd=str(ROOT),
+        process_factory=process_factory,
+        startup_timeout=1,
+        terminal_grace_timeout=0.05,
+    )
+    dq = agent.put_task("tool smoke", source="test")
+    process = wait_for_process(processes)
+    process.stdout.push({
+        "type": "tool_execution_start",
+        "toolCallId": "tool-read-1",
+        "toolName": "read",
+        "args": {"path": "README.md"},
+    })
+    process.stdout.push({
+        "type": "tool_execution_end",
+        "toolCallId": "tool-read-1",
+        "toolName": "read",
+        "result": {"content": [{"type": "text", "text": "tool output should not become the final answer"}]},
+    })
+    tool_use_message = {
+        "role": "assistant",
+        "content": [{"type": "text", "text": "."}],
+        "stopReason": "toolUse",
+    }
+    process.stdout.push({"type": "message_end", "message": tool_use_message})
+    process.stdout.push({
+        "type": "turn_end",
+        "message": tool_use_message,
+        "toolResults": [{"toolCallId": "tool-read-1", "content": "tool output should not become the final answer"}],
+    })
+
+    deadline = time.time() + 0.15
+    while time.time() < deadline:
+        try:
+            item = dq.get(timeout=0.02)
+        except queue.Empty:
+            continue
+        assert "done" not in item, item
+
+    process.stdout.push({
+        "type": "agent_end",
+        "messages": [
+            {"role": "toolResult", "content": [{"type": "text", "text": "tool output should not become the final answer"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "TOOL_FINAL_DONE"}], "stopReason": "stop"},
+        ],
+    })
+    done, _streamed = wait_for_queue_done(dq)
+    assert "TOOL_FINAL_DONE" in done["done"], done
+    assert done["done"].rstrip().endswith("TOOL_FINAL_DONE"), done
+    assert agent.is_running is False
+    assert agent.task_queue.unfinished_tasks == 0
     agent.close()
 
 
@@ -3509,12 +3607,14 @@ def run_checks() -> None:
     assert_shuheng_brand_entrypoints()
     assert_ohmypi_runtime_registry()
     assert_ohmypi_memory_prompt_and_command()
+    assert_ohmypi_rpc_command_discovers_user_bun_binary()
     assert_ohmypi_isolated_runtime_settings()
     assert_ohmypi_permission_profiles()
     assert_ohmypi_rpc_extension_approval_bridge()
     assert_ohmypi_rpc_queue_mapping()
     assert_ohmypi_rpc_final_text_fallback()
     assert_ohmypi_rpc_waits_for_agent_end_before_next_prompt()
+    assert_ohmypi_rpc_tool_use_turn_end_waits_for_final_answer()
     assert_ohmypi_rpc_process_blocks_fold_like_genericagent()
     assert_ohmypi_rpc_env_model_switch_and_error_mapping()
     assert_ohmypi_host_tool_bridge()

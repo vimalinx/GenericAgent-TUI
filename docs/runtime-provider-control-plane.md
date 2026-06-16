@@ -92,6 +92,14 @@ may auto-approve non-risky exec prompts; prompts that look like deletion,
 deployment, external send, secret access, spending, or policy modification are
 denied unless a future explicit approval bridge handles them. Operators can
 override the OMP mode with `GA_TUI_OMP_APPROVAL_MODE=always-ask|write|yolo`.
+OMP binary discovery is `GA_TUI_OHMYPI_BIN`, then `PATH` lookup for `omp`, then
+the user-local Bun install at `$HOME/.bun/bin/omp`; Shuheng does not mutate shell
+startup files to make this work.
+
+OMP RPC `turn_end` is a turn boundary, not always task completion. When a turn
+ends because of tool use, Shuheng waits for the later final assistant message or
+`agent_end` before releasing the active prompt, so folded tool output does not
+replace the visible final reply.
 
 ## Registry Surfaces
 
