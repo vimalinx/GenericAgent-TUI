@@ -72,6 +72,7 @@ Expose only `shuheng*` user commands and Shuheng/枢衡 UI strings, while preser
 - Generic fallback env override: `GA_TUI_DEFAULT_PERMISSION_PROFILE`.
 - OMP tool approval env override: `GA_TUI_OMP_APPROVAL_MODE=always-ask|write|yolo`.
 - Default OMP main-runtime profile: `full`.
+- Default OMP main-runtime role: `main_orchestrator`.
 - Default subagent profile: `standard`.
 - Default isolated OMP approval mode: `write`.
 
@@ -80,6 +81,7 @@ Expose only `shuheng*` user commands and Shuheng/枢衡 UI strings, while preser
 - `standard` means role-derived permissions from `ROLE_TEMPLATES`.
 - `read_only` means no write policy and no bash/browser/task write-capability expansion.
 - `full` means the main OMP runtime context pack advertises practical read/write/search/bash/browser/eval/git/LSP/host-tool/task/artifact/memory-candidate capabilities.
+- The main OMP context pack and runtime task request must identify the worker role as `main_orchestrator`, not `specialist`; bounded subagents keep their role-specific identities.
 - `full` must keep `memory_write:"candidate_only"` and must not enable direct long-term memory writes.
 - `full` must keep high-risk action classes in `approval_required_for`; it is not an approval bypass.
 - `build_main_runtime_context_pack()` must default to the OMP permission profile, which defaults to `full`.
@@ -91,7 +93,8 @@ Expose only `shuheng*` user commands and Shuheng/枢衡 UI strings, while preser
 
 ### 4. Validation & Error Matrix
 
-- No env override + main OMP context -> `permission_profile:"full"`, `write_policy:"single_writer"`, full tool list, and `memory_write:"candidate_only"`.
+- No env override + main OMP context -> `role:"main_orchestrator"`, `permission_profile:"full"`, `write_policy:"single_writer"`, full tool list, and `memory_write:"candidate_only"`.
+- No env override + main OMP runtime task request -> `role:"main_orchestrator"`, prompt contains `role: main_orchestrator` plus `permission_profile: full`, and the request carries the full permission set.
 - `GA_TUI_OMP_PERMISSION_PROFILE=read_only` + main OMP context -> `permission_profile:"read_only"`, `write_policy:"none"`, no bash in `tools_allowed`.
 - Subagent context without an explicit profile -> `permission_profile:"standard"` and role-bounded tools.
 - OMP isolated config generation -> `tools.approvalMode:"write"` and `PI_CODING_AGENT_DIR` under the GA-TUI harness.
@@ -101,7 +104,7 @@ Expose only `shuheng*` user commands and Shuheng/枢衡 UI strings, while preser
 
 ### 5. Good/Base/Bad Cases
 
-- Good: Main OMP runtime receives `permission_profile:"full"`, shows `write_policy:"single_writer"`, can use normal write/search/bash/browser capabilities, and still reports `memory_write:"candidate_only"`.
+- Good: Main OMP runtime receives `role:"main_orchestrator"` and `permission_profile:"full"`, shows `write_policy:"single_writer"`, can use normal write/search/bash/browser capabilities, and still reports `memory_write:"candidate_only"`.
 - Good: A role-bounded researcher subagent receives `permission_profile:"standard"` with `tools_allowed:["web","read"]` and `write_policy:"none"`.
 - Base: Operator sets `GA_TUI_OMP_PERMISSION_PROFILE=read_only`; OMP main runtime starts in compatibility mode and does not advertise bash/write tools.
 - Base: Operator sets `GA_TUI_OMP_APPROVAL_MODE=always-ask`; command/config generation preserves the override.
@@ -111,7 +114,7 @@ Expose only `shuheng*` user commands and Shuheng/枢衡 UI strings, while preser
 
 ### 6. Tests Required
 
-- `scripts/check_policy_gates.py` must assert default full main context, read-only env override, standard subagent context, isolated OMP approval mode, runtime provider metadata, and OMP RPC extension approval bridge behavior.
+- `scripts/check_policy_gates.py` must assert default full main context with `role:"main_orchestrator"`, main runtime task request role/permissions/prompt/output-contract wiring, read-only env override, standard subagent context, isolated OMP approval mode, runtime provider metadata, and OMP RPC extension approval bridge behavior.
 - `python3 -m compileall -q src scripts` must pass.
 - `python3 scripts/check_policy_gates.py` must pass.
 
@@ -129,6 +132,7 @@ tools_allowed: read, reason
 
 ```text
 permission_profile: full
+role: main_orchestrator
 write_policy: single_writer
 tools_allowed: read, reason, search, repo.read, repo.write, edit, write, test, bash, shell, browser, eval, python, javascript, web.search, web_search, git, lsp, artifact.read, artifact.write, host_tools, task, subagent.delegate, memory.candidate
 memory_write: candidate_only

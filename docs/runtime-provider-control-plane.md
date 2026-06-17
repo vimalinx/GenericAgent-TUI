@@ -55,10 +55,11 @@ remain Shuheng-owned.
 OMP main-runtime context packs use a Shuheng permission profile. The default is
 `full`, so the main OMP assistant can advertise practical read/write/search/bash/
 browser/eval/task capabilities instead of behaving like a read-only
-`specialist`. Role-bounded subagent context packs stay on `standard` unless a
-caller explicitly selects another profile. Operators can force compatibility
-mode with `GA_TUI_OMP_PERMISSION_PROFILE=read_only` or set a process-wide
-default with `GA_TUI_DEFAULT_PERMISSION_PROFILE`.
+`specialist`. The main OMP runtime role is `main_orchestrator`; role-bounded
+subagent context packs stay on `standard` unless a caller explicitly selects
+another profile. Operators can force compatibility mode with
+`GA_TUI_OMP_PERMISSION_PROFILE=read_only` or set a process-wide default with
+`GA_TUI_DEFAULT_PERMISSION_PROFILE`.
 
 ## Provider Contract
 

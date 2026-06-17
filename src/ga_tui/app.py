@@ -3233,6 +3233,16 @@ def artifact_path_from_uri(uri: str) -> str:
 
 
 ROLE_TEMPLATES: dict[str, dict[str, Any]] = {
+    "main_orchestrator": {
+        "description": "枢衡主编排器，负责规划、调度、执行协调、审批边界、artifact refs 和记忆候选治理。",
+        "write_policy": "single_writer",
+        "tools_allowed": [
+            "read", "reason", "search", "repo.read", "repo.write", "edit", "write", "test",
+            "bash", "shell", "browser", "eval", "web.search", "git", "lsp", "artifact.read",
+            "artifact.write", "host_tools", "task", "memory.candidate",
+        ],
+        "output_contract": ["summary", "actions_taken", "tool_results", "findings", "risks", "artifact_refs", "memory_candidates", "confidence"],
+    },
     "specialist": {
         "description": "受限专家子 agent，执行明确窄任务。",
         "write_policy": "none",
@@ -5443,7 +5453,7 @@ def build_main_runtime_context_pack(
         agent_id="orchestrator.main",
         name="Shuheng Main Orchestrator",
         home=AGENT_HARNESS_DIR,
-        role="specialist",
+        role="main_orchestrator",
         security_context="secret" if state.secret_vault.unlocked else "standard",
         owner_session=active_ui_session_key(state),
         persistent=False,
@@ -7680,7 +7690,7 @@ def start_main_agent_task(
     runtime_task_id = f"main-{task_id}"
     runtime_context_ref = ""
     runtime_permissions = permissions_for_role(
-        "specialist",
+        "main_orchestrator",
         security_context="standard",
         permission_profile=default_omp_permission_profile(),
     )
@@ -7709,12 +7719,12 @@ def start_main_agent_task(
                 prompt=runtime_prompt,
                 source=source,
                 agent_id="orchestrator.main",
-                role="orchestrator",
+                role="main_orchestrator",
                 objective=policy_relevant_subagent_prompt_text(text),
                 context_pack_ref=runtime_context_ref,
                 permissions=runtime_permissions,
                 approval_policy=approval_metadata(),
-                output_contract={"required_sections": role_output_contract("specialist")},
+                output_contract={"required_sections": role_output_contract("main_orchestrator")},
                 artifact_refs=[runtime_context_ref] if runtime_context_ref else [],
                 metadata={"runtime_lane": "main", "ui_task_id": task_id, "security_context": "standard"},
             )

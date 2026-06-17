@@ -627,14 +627,41 @@ def assert_ohmypi_permission_profiles() -> None:
         state = a.State(agent=FakeLLMAgent())
         pack, context_ref = a.build_main_runtime_context_pack(state, "Can you edit code?", "task_omp_full")
         assert context_ref.startswith("artifact://"), context_ref
+        assert pack["for_agent"]["role"] == "main_orchestrator", pack["for_agent"]
+        assert pack["role_template"]["write_policy"] == "single_writer", pack["role_template"]
+        assert "受限专家子 agent" not in str(pack["role_template"]), pack["role_template"]
         assert pack["permission_profile"] == "full", pack
         assert pack["permissions"]["permission_profile"] == "full", pack["permissions"]
         assert pack["permissions"]["write_policy"] == "single_writer", pack["permissions"]
         assert pack["permissions"]["memory_write"] == "candidate_only", pack["permissions"]
-        assert {"bash", "edit", "write", "browser", "task", "memory.candidate"} <= set(pack["permissions"]["tools_allowed"]), pack["permissions"]
+        assert {"bash", "edit", "write", "browser", "task", "host_tools", "subagent.delegate", "memory.candidate"} <= set(pack["permissions"]["tools_allowed"]), pack["permissions"]
         prompt = a.format_context_pack_for_prompt(pack)
         assert "permission_profile: full" in prompt, prompt
+        assert "role: main_orchestrator" in prompt, prompt
+        assert "role: specialist" not in prompt, prompt
         assert "tools_allowed: " in prompt and "bash" in prompt and "memory.candidate" in prompt, prompt
+        assert "output_contract: summary, actions_taken, tool_results" in prompt, prompt
+
+        runtime_agent = RuntimeCaptureFakeAgent()
+        runtime_state = a.State(agent=runtime_agent)
+        assert a.start_main_agent_task(
+            runtime_state,
+            "Test all available tools",
+            source="user",
+            visible_user_text="Test all available tools",
+        )
+        assert len(runtime_agent.runtime_requests) == 1, runtime_agent.runtime_requests
+        request = runtime_agent.runtime_requests[0]
+        request_tools = set(request.permissions.get("tools_allowed") or [])
+        assert request.role == "main_orchestrator", request
+        assert request.agent_id == "orchestrator.main", request
+        assert request.permissions["permission_profile"] == "full", request.permissions
+        assert request.permissions["write_policy"] == "single_writer", request.permissions
+        assert {"bash", "write", "host_tools", "subagent.delegate", "memory.candidate"} <= request_tools, request.permissions
+        assert "permission_profile: full" in request.prompt, request.prompt
+        assert "role: main_orchestrator" in request.prompt, request.prompt
+        assert "role: specialist" not in request.prompt, request.prompt
+        assert request.output_contract["required_sections"] == a.role_output_contract("main_orchestrator"), request.output_contract
 
         sub = a.create_subagent(state, "Role Bounded Researcher", role="researcher", persistent=False)
         sub_pack, _sub_ref = a.build_context_pack(state, sub, "Read only research", "task_sub_standard")
@@ -1619,6 +1646,19 @@ class FakeLLMAgent:
 
     def abort(self) -> None:
         return None
+
+
+class RuntimeCaptureFakeAgent(FakeLLMAgent):
+    def __init__(self) -> None:
+        super().__init__()
+        self.runtime_requests: list[a.RuntimeTaskRequest] = []
+        self._ga_tui_runtime_provider_id = "ohmypi"
+
+    def put_runtime_task(self, request: a.RuntimeTaskRequest) -> queue.Queue:
+        self.runtime_requests.append(request)
+        dq: queue.Queue = queue.Queue()
+        dq.put({"done": "runtime ok"})
+        return dq
 
 
 class AbortCountingFakeAgent(FakeLLMAgent):

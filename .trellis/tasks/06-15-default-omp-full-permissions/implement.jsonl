@@ -2,3 +2,7 @@
 {"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"Required reuse check before adding helpers; existing GA-TUI renderer should be reused instead of duplicating UI folding logic."}
 {"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Required because OMP RPC frames cross provider, queue, renderer, history, and memory-candidate boundaries."}
 {"file":".trellis/spec/backend/agent-control-protocol.md","reason":"Updated after live OMP smoke exposed that turn_end carries completed text but agent_end is the safe RPC-idle release point for the next prompt."}
+{"file":"src/ga_tui/app.py","reason":"2026-06-17: Main OMP runtime now uses role main_orchestrator for context packs, initial permissions, runtime task requests, and output contracts instead of inheriting specialist semantics."}
+{"file":"scripts/check_policy_gates.py","reason":"2026-06-17: Added regression coverage for main OMP context role, prompt role, full permissions, host tools, and RuntimeTaskRequest wiring."}
+{"file":".trellis/spec/backend/agent-control-protocol.md","reason":"2026-06-17: Documented that main OMP context packs and runtime task requests must be main_orchestrator/full while subagents remain role-bounded."}
+{"file":"docs/runtime-provider-control-plane.md","reason":"2026-06-17: Updated provider documentation to identify the main OMP runtime role as main_orchestrator."}
