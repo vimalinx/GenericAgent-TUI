@@ -5916,7 +5916,7 @@ def external_bridge_registry() -> dict[str, Any]:
             "name": "CLI",
             "status": "active",
             "transport": "local_process",
-            "entrypoints": ["shuheng", "ga-tui", "python -m ga_tui.app", "--gateway-daemon"],
+            "entrypoints": ["shuheng", "python -m ga_tui.app", "--gateway-daemon"],
             "policy_action": "read_only",
             "approval_required": False,
         },
@@ -6339,7 +6339,7 @@ def deliver_gateway_push_notification(event: dict[str, Any]) -> list[dict[str, A
             request = urllib.request.Request(
                 endpoint,
                 data=body,
-                headers={"Content-Type": "application/json", "User-Agent": "ga-tui-gateway/1"},
+                headers={"Content-Type": "application/json", "User-Agent": "shuheng-gateway/1"},
                 method="POST",
             )
             try:
@@ -8847,7 +8847,7 @@ def create_subagent(state: State, name: str, profile: str = "", role: str = "spe
         template = role_template(role)
         profile_text = (
             f"# {name}\n\n"
-            f"- 这是一个由 ga tui 管理的{'持久' if persistent else '临时会话'}子 agent。\n"
+            f"- 这是一个由枢衡管理的{'持久' if persistent else '临时会话'}子 agent。\n"
             f"- 角色：{role}。\n"
             f"- 安全上下文：{security_context}。\n"
             f"- 职责：{template.get('description', '')}\n"
@@ -18129,7 +18129,7 @@ def draw_exit_prompt(stdscr, state: State, labels: list[str], selected: int) -> 
         ]
         footer = "↑↓ 选择  Enter 确认  Ctrl+Q 确认退出  Esc/Ctrl+C 取消退出"
     else:
-        safe_add(stdscr, y0 + 2, x0 + 2, "当前没有未完成任务。确认退出 ga tui？", inner_w, cp(7) | curses.A_BOLD)
+        safe_add(stdscr, y0 + 2, x0 + 2, "当前没有未完成任务。确认退出枢衡？", inner_w, cp(7) | curses.A_BOLD)
         safe_add(stdscr, y0 + 4, x0 + 4, "Ctrl+Q 是退出快捷键；Ctrl+C 只用于中止任务。", inner_w - 4, cp(2))
         options = [
             ("取消退出", "回到 TUI。"),
@@ -18173,7 +18173,7 @@ def choose_exit_mode(stdscr, state: State, labels: list[str], selected: int = 0)
             return choices[selected]
 
 
-def request_exit(stdscr, state: State, reason: str = "已退出 ga tui。", selected: Optional[int] = None) -> None:
+def request_exit(stdscr, state: State, reason: str = "已退出枢衡。", selected: Optional[int] = None) -> None:
     process_ui_queue(state)
     labels = unfinished_task_labels(state)
     if not labels and selected == 1:
@@ -18194,10 +18194,10 @@ def request_exit(stdscr, state: State, reason: str = "已退出 ga tui。", sele
         return
     if choice == "terminate":
         state.exit_mode = "terminate"
-        state.exit_reason = "已退出 ga tui；未完成任务已请求终止。"
+        state.exit_reason = "已退出枢衡；未完成任务已请求终止。"
     else:
         state.exit_mode = "wait"
-        state.exit_reason = "已退出 ga tui；未完成任务将在后台跑完后自动结束进程。"
+        state.exit_reason = "已退出枢衡；未完成任务将在后台跑完后自动结束进程。"
     state.running = False
     mark_dirty(state)
 
@@ -19645,7 +19645,7 @@ def submit(state: State, text: str) -> None:
         add_system(state, "Secret Vault 已解锁：普通历史/普通 harness 面板已隔离。请先 /lock 再查看普通数据。")
         return
     if text in {"/quit", "/exit"}:
-        state.exit_reason = "已退出 ga tui。"
+        state.exit_reason = "已退出枢衡。"
         state.running = False
         return
     if handle_subagent_command(state, text):
@@ -21975,7 +21975,7 @@ def handle_key(stdscr, state: State, key) -> None:
         return
     if key == "\x11":
         labels = unfinished_task_labels(state)
-        request_exit(stdscr, state, "已退出 ga tui。", selected=0 if labels else 1)
+        request_exit(stdscr, state, "已退出枢衡。", selected=0 if labels else 1)
         return
     if key == "\x0e":
         active_sub = selected_subagent(state)
@@ -22308,10 +22308,10 @@ def read_terminal_key(stdscr):
 
 def run(stdscr) -> dict[str, Any]:
     os.makedirs(os.path.join(ROOT_DIR, "temp"), exist_ok=True)
-    log_path = os.path.join(ROOT_DIR, "temp", "ga-tui.log")
+    log_path = os.path.join(ROOT_DIR, "temp", "shuheng.log")
     old_stdout, old_stderr = sys.stdout, sys.stderr
     stdio_log = open(log_path, "a", encoding="utf-8", buffering=1)
-    stdio_log.write(f"\n--- ga tui {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+    stdio_log.write(f"\n--- Shuheng {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
     sys.stdout = stdio_log
     sys.stderr = stdio_log
     state: Optional[State] = None
@@ -22417,12 +22417,12 @@ def wait_for_unfinished_tasks_after_tui(state: Optional[State]) -> None:
     labels = unfinished_task_labels(state)
     if not labels:
         return
-    print(f"ga tui 已关闭；等待 {len(labels)} 个未完成任务跑完。")
+    print(f"枢衡已关闭；等待 {len(labels)} 个未完成任务跑完。")
     print("日志继续写入 GenericAgent 的 model_responses；任务完成后进程会自动退出。")
     old_stdout, old_stderr = sys.stdout, sys.stderr
-    log_path = os.path.join(ROOT_DIR, "temp", "ga-tui.log")
+    log_path = os.path.join(ROOT_DIR, "temp", "shuheng.log")
     wait_log = open(log_path, "a", encoding="utf-8", buffering=1)
-    wait_log.write(f"\n--- ga tui background wait {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+    wait_log.write(f"\n--- Shuheng background wait {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
     sys.stdout = wait_log
     sys.stderr = wait_log
     try:
@@ -22434,11 +22434,11 @@ def wait_for_unfinished_tasks_after_tui(state: Optional[State]) -> None:
         sys.stdout = old_stdout
         sys.stderr = old_stderr
         wait_log.close()
-    print("后台任务已完成，ga tui 进程退出。")
+    print("后台任务已完成，枢衡进程退出。")
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="GenericAgent stable curses TUI")
+    parser = argparse.ArgumentParser(description="Shuheng governed local-agent TUI")
     parser.add_argument("--serve-gateway", action="store_true", help="serve the A2A/MCP gateway over HTTP instead of starting curses")
     parser.add_argument("--gateway-daemon", choices=["start", "stop", "restart", "status"], help="manage the A2A/MCP gateway as a background service")
     parser.add_argument("--gateway-host", default=os.environ.get("GA_TUI_GATEWAY_HOST", "127.0.0.1"), help="gateway bind host")

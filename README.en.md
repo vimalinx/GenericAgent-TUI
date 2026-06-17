@@ -181,7 +181,7 @@ Run directly from source without installation:
 PYTHONPATH=src python -m ga_tui
 ```
 
-`ga_tui` remains the Python module name for compatibility. The official command is `shuheng`; the older `ga-tui` command remains as a compatibility alias.
+`ga_tui` remains the Python module name for compatibility. The official command is `shuheng`.
 
 ### 2. Point To GenericAgent Core
 
@@ -231,7 +231,7 @@ This lets the core `GenericAgent` project update normally while the TUI evolves 
 
 ## Optional Core Shim
 
-If you want `ga tui` inside the `GenericAgent` checkout to launch this external TUI, install a small launcher shim.
+If you want the `GenericAgent` checkout's core launcher to launch this external TUI, install a small launcher shim.
 
 Replace `frontends/tuiapp.py`:
 
@@ -258,8 +258,6 @@ Call integration utilities explicitly:
 shuheng-integration doctor --root /path/to/GenericAgent
 shuheng-integration install-core-shim --root /path/to/GenericAgent --target tuiapp-curses
 ```
-
-Compatibility entrypoints remain available: `ga-tui`, `ga-tui-check`, `ga-tui-install-core-shim`, and `ga-tui-integration`.
 
 ## Command Surface
 

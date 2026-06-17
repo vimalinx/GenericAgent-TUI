@@ -6,53 +6,56 @@
 
 ### 1. Scope / Trigger
 
-- Trigger: The user-facing product name is `Shuheng` / `枢衡`, while legacy `ga-tui` protocol and Python module names remain compatibility surfaces.
+- Trigger: The user-facing product name is `Shuheng` / `枢衡`; legacy `ga-tui` command aliases have been removed from public entry points while protocol and Python module compatibility identifiers remain internal surfaces.
 - Applies to: `pyproject.toml` console scripts, README command examples, integration doctor output, core shim help text, runtime prompts, and OMP/tool descriptions.
 - Non-goal: This does not rename `src/ga_tui`, `GA_TUI_*` environment variables, `ga-tui.*` schema versions, `ga_tui_query`, `ga_tui_propose`, existing JSONL context ids, or historical compatibility markers.
 
 ### 2. Signatures
 
 - Primary console scripts: `shuheng`, `shuheng-agent-bridge`, `shuheng-check`, `shuheng-install-core-shim`, and `shuheng-integration`.
-- Compatibility console scripts: `ga-tui`, `ga-tui-agent-bridge`, `ga-tui-check`, `ga-tui-install-core-shim`, and `ga-tui-integration`.
+- Public `ga-tui*` console scripts are not exported.
 - Python module entry remains `python -m ga_tui` / `python -m ga_tui.app`.
 - Distribution name in `pyproject.toml`: `shuheng`.
 
 ### 3. Contracts
 
 - User-facing docs and doctor output should prefer `Shuheng` and `shuheng*` commands.
-- Compatibility docs may mention `ga-tui*` as legacy aliases, not as the primary product name.
+- User-facing docs and doctor output must not advertise `ga-tui*` aliases.
 - Protocol-level identifiers keep their current stable values until an explicit migration task exists.
 - Core shim discovery should search both `Shuheng` and historical `GenericAgent-TUI` checkout directory names.
 
 ### 4. Validation & Error Matrix
 
 - Missing `shuheng*` console script in `pyproject.toml` -> packaging regression.
-- Missing `ga-tui*` compatibility script -> existing user scripts break.
+- Public `ga-tui*` console script in `pyproject.toml` -> brand regression.
 - Doctor output says primary launch is `ga-tui` -> brand regression.
+- Doctor output mentions a `ga-tui` compatibility alias -> brand regression.
 - Runtime strings identify the main orchestrator only as `GA-TUI` -> product identity regression.
+- Exit prompts or terminal shutdown messages mention `ga tui` -> brand regression.
 
 ### 5. Good/Base/Bad Cases
 
-- Good: `shuheng-check --root <GenericAgent>` reports `Shuheng root`, `Launch without core patches: shuheng`, and `Compatibility launch alias: ga-tui`.
-- Base: `ga-tui-check --root <GenericAgent>` still works and prints the same Shuheng-branded report.
+- Good: `shuheng-check --root <GenericAgent>` reports `Shuheng root` and `Launch without core patches: shuheng` without advertising a `ga-tui` alias.
 - Base: OMP host tools keep names such as `ga_tui_query` because they are protocol compatibility tool ids.
+- Bad: Re-adding public `ga-tui*` commands or exit messages while the product is Shuheng-only.
 - Bad: Renaming `ga_tui_query`, `GA_TUI_*`, or `ga-tui.query.v1` in a brand-only task, because that breaks external clients without a schema migration.
 
 ### 6. Tests Required
 
-- `scripts/check_policy_gates.py` must assert `pyproject.toml` contains all primary `shuheng*` scripts and all legacy `ga-tui*` aliases.
-- Tests must assert integration doctor report prefers `shuheng` while mentioning `ga-tui` as compatibility.
+- `scripts/check_policy_gates.py` must assert `pyproject.toml` contains all primary `shuheng*` scripts and no public `ga-tui*` scripts.
+- Tests must assert integration doctor report prefers `shuheng` and does not mention `ga-tui` as a compatibility command.
+- Tests must assert exit prompts, exit reasons, and terminal shutdown text use Shuheng/枢衡 instead of `ga tui`.
 - `python3 -m compileall -q src scripts`, `python3 scripts/check_policy_gates.py`, `git diff --check`, and `shuheng-check --root /home/vimalinx/Programs/GenericAgent` must pass.
 
 ### 7. Wrong vs Correct
 
 #### Wrong
 
-Rename every `ga-tui`, `ga_tui`, and `GA_TUI` token in one sweep.
+Keep advertising `ga-tui` as a user-facing compatibility command, or rename every `ga-tui`, `ga_tui`, and `GA_TUI` token in one sweep.
 
 #### Correct
 
-Rename user-visible brand surfaces to Shuheng first, add `shuheng*` entrypoints, and preserve legacy protocol/module/env names until a dedicated compatibility migration is designed.
+Expose only `shuheng*` user commands and Shuheng/枢衡 UI strings, while preserving legacy protocol/module/env names until a dedicated compatibility migration is designed.
 
 ## Scenario: OMP Runtime Permission Profiles
 
@@ -222,7 +225,7 @@ memory_write: candidate_only
 - `scripts/check_policy_gates.py` must assert `app.py` re-exports key protocol helpers from `ga_tui.control_protocol` and that the protocol module does not import curses.
 - `python3 -m py_compile src/ga_tui/app.py src/ga_tui/control_protocol.py scripts/check_policy_gates.py` must pass.
 - `python3 scripts/check_policy_gates.py` must pass.
-- `ga-tui-check --root /home/vimalinx/Programs/GenericAgent` must pass when the sibling GenericAgent checkout exists.
+- `shuheng-check --root /home/vimalinx/Programs/GenericAgent` must pass when the sibling GenericAgent checkout exists.
 
 ### 7. Wrong vs Correct
 
@@ -481,7 +484,7 @@ if text.strip().lower() in {"/llm", "/models", "/model"}:
 - Tests must assert `task_list` hides terminal tasks by default and includes them with `include_completed:true`.
 - Tests must assert `task_get` returns latest ledger details and approval references.
 - Tests must assert `approval_list` does not inline raw payload bodies.
-- `python3 -m py_compile src/ga_tui/app.py scripts/check_policy_gates.py`, `python3 scripts/check_policy_gates.py`, `python3 -m compileall -q src scripts`, `git diff --check`, and `ga-tui-check --root /home/vimalinx/Programs/GenericAgent` must pass.
+- `python3 -m py_compile src/ga_tui/app.py scripts/check_policy_gates.py`, `python3 scripts/check_policy_gates.py`, `python3 -m compileall -q src scripts`, `git diff --check`, and `shuheng-check --root /home/vimalinx/Programs/GenericAgent` must pass.
 
 ### 7. Wrong vs Correct
 
@@ -549,7 +552,7 @@ If the recommendation is create_new and the user asked for execution, create a b
 - Tests must assert `genericagent_provider.py` has no reverse import into `app.py` and no curses import.
 - Tests must assert `app.py` no longer locally defines the moved GenericAgent glue functions or adapter class.
 - Tests must preserve query/schedule schema idempotency, handler method presence, `StepOutcome(next_prompt:"\n")`, state-bound tool dispatch, and control-hint de-duplication checks.
-- `python3 -m py_compile src/ga_tui/app.py src/ga_tui/genericagent_provider.py scripts/check_policy_gates.py`, `python3 scripts/check_policy_gates.py`, `python3 -m compileall -q src scripts`, `git diff --check`, and `ga-tui-check --root /home/vimalinx/Programs/GenericAgent` must pass.
+- `python3 -m py_compile src/ga_tui/app.py src/ga_tui/genericagent_provider.py scripts/check_policy_gates.py`, `python3 scripts/check_policy_gates.py`, `python3 -m compileall -q src scripts`, `git diff --check`, and `shuheng-check --root /home/vimalinx/Programs/GenericAgent` must pass.
 
 ### 7. Wrong vs Correct
 
@@ -754,7 +757,7 @@ configure_genericagent_provider_runtime(
 - Tests must assert OMP terminal error frames surface `errorMessage` / `errorStatus` visibly instead of an empty done item.
 - Tests must assert system `~/.omp/agent/config.yml` hash remains unchanged when present.
 - Tests must assert missing binary failure and `abort()` cleanup decrement unfinished task state.
-- `python3 -m py_compile src/ga_tui/app.py src/ga_tui/ohmypi_provider.py scripts/check_policy_gates.py`, `python3 scripts/check_policy_gates.py`, `python3 -m compileall -q src scripts`, `git diff --check`, and `ga-tui-check --root /home/vimalinx/Programs/GenericAgent` must pass.
+- `python3 -m py_compile src/ga_tui/app.py src/ga_tui/ohmypi_provider.py scripts/check_policy_gates.py`, `python3 scripts/check_policy_gates.py`, `python3 -m compileall -q src scripts`, `git diff --check`, and `shuheng-check --root /home/vimalinx/Programs/GenericAgent` must pass.
 
 ### 7. Wrong vs Correct
 
@@ -1011,7 +1014,7 @@ agent.create includes continue_after:true -> Agent 控制结果 shows success ->
 - Tests must assert MCP/gateway registries include both schedule registry and schedule-run audit paths.
 - Tests must assert `app.py` re-exports key scheduler helpers from `ga_tui.scheduler` and that `src/ga_tui/scheduler.py` does not import curses, GenericAgent runtime classes, `StepOutcome`, mutable TUI `State`, or `ga_tui.app`.
 - Tests that retarget harness paths must reconfigure scheduler runtime paths in the same step, otherwise scheduler JSONL helpers can silently write to the previous harness directory.
-- `python3 -m py_compile src/ga_tui/app.py src/ga_tui/runtime.py scripts/check_policy_gates.py`, `python3 scripts/check_policy_gates.py`, `python3 -m compileall -q src scripts`, `git diff --check`, and `ga-tui-check --root /home/vimalinx/Programs/GenericAgent` must pass.
+- `python3 -m py_compile src/ga_tui/app.py src/ga_tui/runtime.py scripts/check_policy_gates.py`, `python3 scripts/check_policy_gates.py`, `python3 -m compileall -q src scripts`, `git diff --check`, and `shuheng-check --root /home/vimalinx/Programs/GenericAgent` must pass.
 
 ### 7. Wrong vs Correct
 
@@ -1105,13 +1108,13 @@ At 08:00, scheduler writes scheduledtask.run.v1 starting, converts the schedule 
 ### 1. Scope / Trigger
 
 - Trigger: Agent clients that are not directly launched by the TUI need GA-TUI-owned project context and governed proposal submission.
-- Applies to: `src/ga_tui/agent_bridge.py`, `ga-tui-agent-bridge`, `python -m ga_tui.agent_bridge`, repo-managed OMP plugin files under `integrations/omp-ga-tui-plugin`, OMP `--tool` loading, and future Codex/Claude Code adapters that consume the same bridge contract.
+- Applies to: `src/ga_tui/agent_bridge.py`, `shuheng-agent-bridge`, `python -m ga_tui.agent_bridge`, repo-managed OMP plugin files under `integrations/omp-ga-tui-plugin`, OMP `--tool` loading, and future Codex/Claude Code adapters that consume the same bridge contract.
 - Non-goal: This bridge does not make OMP, Codex, Claude Code, or any plugin the owner of long-term memory, approval queues, schedule registries, task ledgers, artifacts, or traces.
 
 ### 2. Signatures
 
 - Python module: `src/ga_tui/agent_bridge.py`.
-- Console script: `ga-tui-agent-bridge`.
+- Console script: `shuheng-agent-bridge`.
 - Module command: `python -m ga_tui.agent_bridge`.
 - Bridge schema: `ga-tui.agent_bridge.v1`.
 - Bridge actions: `metadata`, `query`, `memory_context_get`, `memory_candidate_submit`, and `proposal_submit`.
@@ -1196,5 +1199,5 @@ OMP plugin opens memory/subagents/researcher/memory.md and appends a learned fac
 #### Correct
 
 ```text
-OMP plugin calls ga-tui-agent-bridge memory-candidate-submit; GA-TUI builds a memory_candidate.v1 record, writes artifact refs, queues human approval, and only approved memory writes reach subagent memory.
+OMP plugin calls shuheng-agent-bridge memory-candidate-submit; Shuheng builds a memory_candidate.v1 record, writes artifact refs, queues human approval, and only approved memory writes reach subagent memory.
 ```

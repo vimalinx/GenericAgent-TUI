@@ -26,7 +26,7 @@ Runtime providers own narrow execution:
 Agent clients that are not launched directly by the TUI, such as OMP plugins,
 Codex adapters, or Claude Code adapters, must use a Shuheng-owned bridge instead
 of scraping files or writing ledgers. The local bridge entrypoint is
-`shuheng-agent-bridge` / `ga-tui-agent-bridge` / `python -m ga_tui.agent_bridge`; it exposes read-only
+`shuheng-agent-bridge` / `python -m ga_tui.agent_bridge`; it exposes read-only
 context retrieval and governed proposal submission while keeping approvals,
 memory, schedules, artifacts, and traces in the TUI control plane.
 

@@ -1,9 +1,9 @@
 """Integration helpers for keeping Shuheng outside GenericAgent core.
 
 The external TUI should normally be launched as ``shuheng``.  For users who want
-the upstream ``ga tui`` command to land in Shuheng, this module can
-install a tiny re-runnable shim into a GenericAgent checkout instead of carrying
-large local patches in upstream TUI files.
+the upstream TUI launcher to land in Shuheng, this module can install a tiny
+re-runnable shim into a GenericAgent checkout instead of carrying large local
+patches in upstream TUI files.
 """
 from __future__ import annotations
 
@@ -196,7 +196,6 @@ def _print_report(root: Path, failures: Iterable[str]) -> int:
     print("Status: OK")
     print("Core imports: agentmain, continue_cmd")
     print("Launch without core patches: shuheng")
-    print("Compatibility launch alias: ga-tui")
     print("Optional shim: shuheng-install-core-shim --target tuiapp")
     return 0
 
@@ -216,7 +215,7 @@ def install_core_shim_main(argv: list[str] | None = None) -> int:
         "--target",
         choices=("tuiapp-curses", "tuiapp"),
         default="tuiapp-curses",
-        help="tuiapp-curses writes an untracked sidecar; tuiapp makes upstream `ga tui` delegate here",
+        help="tuiapp-curses writes an untracked sidecar; tuiapp makes the upstream TUI launcher delegate here",
     )
     parser.add_argument("--overwrite", action="store_true", help="replace an existing non-generated target file")
     args = parser.parse_args(argv)
@@ -225,7 +224,7 @@ def install_core_shim_main(argv: list[str] | None = None) -> int:
     path = install_core_shim(root, target=target, overwrite=args.overwrite)
     print(f"Installed Shuheng shim: {path}")
     if args.target == "tuiapp":
-        print("Upstream `ga tui` should now delegate to the external TUI.")
+        print("The upstream TUI launcher should now delegate to Shuheng.")
     else:
         print("Sidecar installed. Run it with: python frontends/tuiapp_curses.py")
     return 0

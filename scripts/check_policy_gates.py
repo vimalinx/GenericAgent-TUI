@@ -421,20 +421,31 @@ def assert_shuheng_brand_entrypoints() -> None:
         "shuheng-check",
         "shuheng-install-core-shim",
         "shuheng-integration",
+    ):
+        assert f"{script} =" in pyproject, script
+    for removed_script in (
         "ga-tui",
         "ga-tui-agent-bridge",
         "ga-tui-check",
         "ga-tui-install-core-shim",
         "ga-tui-integration",
     ):
-        assert f"{script} =" in pyproject, script
+        assert f"{removed_script} =" not in pyproject, removed_script
     buffer = io.StringIO()
     with contextlib.redirect_stdout(buffer):
         assert integ._print_report(ROOT, []) == 0
     report = buffer.getvalue()
     assert "Shuheng root:" in report, report
     assert "Launch without core patches: shuheng" in report, report
-    assert "Compatibility launch alias: ga-tui" in report, report
+    assert "ga-tui" not in report, report
+    app_source = Path(a.__file__).read_text(encoding="utf-8")
+    for forbidden in (
+        "ga tui",
+        "GenericAgent stable curses TUI",
+    ):
+        assert forbidden not in app_source, forbidden
+    assert "已退出枢衡" in app_source, app_source
+    assert "确认退出枢衡" in app_source, app_source
 
 
 def assert_ohmypi_runtime_registry() -> None:

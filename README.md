@@ -181,7 +181,7 @@ python -m pip install -e .
 PYTHONPATH=src python -m ga_tui
 ```
 
-`ga_tui` 是保留的 Python 模块名；正式命令入口使用 `shuheng`，旧 `ga-tui` 命令仍作为兼容别名。
+`ga_tui` 是保留的 Python 模块名；正式命令入口使用 `shuheng`。
 
 ### 2. 指定 GenericAgent 主项目
 
@@ -231,7 +231,7 @@ shuheng
 
 ## 可选 Core Shim
 
-如果你希望在 `GenericAgent` 主项目里继续用 `ga tui` 进入这个外置 TUI，可以安装一个很小的 launcher shim。
+如果你希望在 `GenericAgent` 主项目里通过核心 launcher 进入这个外置 TUI，可以安装一个很小的 launcher shim。
 
 覆盖主项目 `frontends/tuiapp.py`：
 
@@ -258,8 +258,6 @@ python /path/to/GenericAgent/frontends/tuiapp_curses.py
 shuheng-integration doctor --root /path/to/GenericAgent
 shuheng-integration install-core-shim --root /path/to/GenericAgent --target tuiapp-curses
 ```
-
-兼容入口仍可用：`ga-tui`、`ga-tui-check`、`ga-tui-install-core-shim`、`ga-tui-integration`。
 
 ## 命令入口
 
