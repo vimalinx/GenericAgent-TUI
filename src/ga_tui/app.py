@@ -297,6 +297,7 @@ SECRET_VAULT_DIR = os.path.abspath(os.path.expanduser(os.environ.get("GA_TUI_SEC
 SECRET_VAULT_META_PATH = os.path.join(SECRET_VAULT_DIR, "vault.json")
 SECRET_VAULT_DATA_DIR = os.path.join(SECRET_VAULT_DIR, "data")
 SECRET_VAULT_SESSIONS_DIR = os.path.join(SECRET_VAULT_DATA_DIR, "sessions")
+_LEGACY_STATE_BOOTSTRAP_DONE = False
 SECRET_VAULT_SENTINEL = b"GenericAgent-TUI Secret Vault v1"
 SECRET_IMPORT_KEY_AAD = b"secret-vault:sealed-import-key:v1"
 SECRET_IMPORT_SEALED_SCHEMA = "secret.sealed_import.v1"
@@ -1807,6 +1808,141 @@ def write_text_atomic(path: str, text: str) -> None:
     with open(tmp, "w", encoding="utf-8") as fh:
         fh.write(text)
     os.replace(tmp, path)
+
+
+def legacy_import_marker_path() -> str:
+    return os.path.join(SHUHENG_HOME, ".legacy_import.json")
+
+
+def legacy_genericagent_history_dir() -> str:
+    return os.path.join(ROOT_DIR, "temp", "model_responses")
+
+
+def legacy_genericagent_memory_dir() -> str:
+    return os.path.join(ROOT_DIR, "memory")
+
+
+def env_flag_enabled(name: str) -> bool:
+    return str(os.environ.get(name) or "").strip().lower() in {"1", "true", "yes", "on", "y"}
+
+
+def env_flag_disabled(name: str) -> bool:
+    return str(os.environ.get(name) or "").strip().lower() in {"0", "false", "no", "off", "n"}
+
+
+def shuheng_legacy_import_allowed() -> bool:
+    if env_flag_enabled("SHUHENG_DISABLE_LEGACY_IMPORT") or env_flag_disabled("SHUHENG_IMPORT_LEGACY"):
+        return False
+    if env_flag_enabled("SHUHENG_IMPORT_LEGACY"):
+        return True
+    if os.environ.get("SHUHENG_HOME") or os.environ.get("GA_TUI_HOME"):
+        return False
+    return normalized_path(SHUHENG_HOME) == normalized_path("~/.shuheng")
+
+
+def read_json_dict_file(path: str) -> dict[str, Any]:
+    try:
+        with open(path, encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except Exception:
+        return {}
+    return dict(raw) if isinstance(raw, dict) else {}
+
+
+def merge_json_dict_file(src_path: str, dst_path: str) -> bool:
+    src = read_json_dict_file(src_path)
+    if not src:
+        return False
+    dst = read_json_dict_file(dst_path)
+    merged = dict(src)
+    merged.update(dst)
+    if merged == dst and os.path.exists(dst_path):
+        return False
+    os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+    tmp = f"{dst_path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(merged, fh, ensure_ascii=False, indent=2, sort_keys=True)
+    os.replace(tmp, dst_path)
+    return True
+
+
+def copy_file_if_missing(src_path: str, dst_path: str) -> bool:
+    if not os.path.isfile(src_path) or os.path.exists(dst_path):
+        return False
+    os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+    shutil.copy2(src_path, dst_path)
+    return True
+
+
+def copy_legacy_history_to_shuheng(src_dir: str, dst_dir: str) -> dict[str, int]:
+    copied = 0
+    merged = 0
+    if not os.path.isdir(src_dir):
+        return {"copied_files": copied, "merged_json": merged}
+    os.makedirs(dst_dir, exist_ok=True)
+    for src_path in glob.glob(os.path.join(src_dir, "model_responses*.txt")):
+        if copy_file_if_missing(src_path, os.path.join(dst_dir, os.path.basename(src_path))):
+            copied += 1
+    for sidecar in ("session_meta.json", "session_names.json", "session_token_usage.json"):
+        src_path = os.path.join(src_dir, sidecar)
+        dst_path = os.path.join(dst_dir, sidecar)
+        if not os.path.exists(dst_path):
+            if copy_file_if_missing(src_path, dst_path):
+                copied += 1
+        elif merge_json_dict_file(src_path, dst_path):
+            merged += 1
+    return {"copied_files": copied, "merged_json": merged}
+
+
+def copy_legacy_memory_to_shuheng(src_dir: str, dst_dir: str) -> dict[str, int]:
+    copied = 0
+    if not os.path.isdir(src_dir):
+        return {"copied_files": copied}
+    for root, dirs, files in os.walk(src_dir):
+        rel_root = os.path.relpath(root, src_dir)
+        if rel_root.startswith(os.path.join("agent_harness", "runtime")):
+            dirs[:] = []
+            continue
+        dirs[:] = [d for d in dirs if d not in {"__pycache__", ".git"}]
+        for name in files:
+            if name.endswith((".pyc", ".tmp")):
+                continue
+            src_path = os.path.join(root, name)
+            rel_path = name if rel_root == "." else os.path.join(rel_root, name)
+            dst_path = os.path.join(dst_dir, rel_path)
+            if copy_file_if_missing(src_path, dst_path):
+                copied += 1
+    return {"copied_files": copied}
+
+
+def maybe_bootstrap_shuheng_legacy_state() -> dict[str, Any]:
+    global _LEGACY_STATE_BOOTSTRAP_DONE
+    if _LEGACY_STATE_BOOTSTRAP_DONE:
+        return {}
+    _LEGACY_STATE_BOOTSTRAP_DONE = True
+    if not shuheng_legacy_import_allowed():
+        return {}
+    marker = legacy_import_marker_path()
+    if os.path.exists(marker):
+        return {}
+    history_src = legacy_genericagent_history_dir()
+    memory_src = legacy_genericagent_memory_dir()
+    history = copy_legacy_history_to_shuheng(history_src, MODEL_RESPONSES_DIR)
+    memory = copy_legacy_memory_to_shuheng(memory_src, SHUHENG_MEMORY_DIR)
+    report = {
+        "schema_version": "shuheng.legacy_import.v1",
+        "imported_at": now_iso(),
+        "source_root": ROOT_DIR,
+        "target_home": SHUHENG_HOME,
+        "history_source": history_src,
+        "memory_source": memory_src,
+        "history": history,
+        "memory": memory,
+        "mode": "copy_missing_only",
+    }
+    if os.path.isdir(history_src) or os.path.isdir(memory_src):
+        write_text_atomic(marker, json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+    return report
 
 
 def read_text_file(path: str, default: str = "") -> str:
@@ -11858,6 +11994,7 @@ def agent_runtime_registry(*, write_memory_prompt_file: bool = True) -> RuntimeR
         recent_models_path=LLM_RECENT_MODELS_PATH,
         schedules_path=AGENT_SCHEDULES_PATH,
     )))
+    maybe_bootstrap_shuheng_legacy_state()
     ohmypi_append_prompt_path = (
         write_ohmypi_memory_prompt(root_dir=SHUHENG_HOME, harness_dir=AGENT_HARNESS_DIR)
         if write_memory_prompt_file
@@ -12243,6 +12380,7 @@ def load_history(state: State, force: bool = False) -> bool:
         state.history_names = {}
         state.history_descriptions = {}
         return False
+    maybe_bootstrap_shuheng_legacy_state()
     now = time.time()
     if not force and now - state.history_loaded_at < 10:
         return False
@@ -17246,6 +17384,7 @@ def memory_entry_for(layer: str, path: str, note: str = "", *, root: str = "") -
 
 
 def memory_inventory() -> list[MemoryEntry]:
+    maybe_bootstrap_shuheng_legacy_state()
     memory_root = SHUHENG_MEMORY_DIR
     entries: list[MemoryEntry] = []
     for layer, filename, note in [

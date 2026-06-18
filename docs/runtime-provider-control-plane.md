@@ -47,6 +47,13 @@ internal `GA_TUI_HOME` compatibility override is still accepted. Targeted test
 or bridge runs may override `GA_TUI_HARNESS_DIR` or `GA_TUI_SECRET_VAULT_DIR`,
 but normal runtime state must not default back into the GenericAgent checkout.
 
+On the normal default home, Shuheng performs a one-time, non-destructive legacy
+bootstrap when old GenericAgent state exists: missing `model_responses*.txt`
+files, session sidecars, global memory files, and persistent subagent memories
+are copied into `~/.shuheng`. Existing Shuheng files win on conflict, stale
+`memory/agent_harness/runtime/**` files are skipped, and the old GenericAgent
+tree is left untouched. The marker is `~/.shuheng/.legacy_import.json`.
+
 ## Runtime Task Boundary
 
 New OMP-first orchestration paths use provider-neutral task records before they

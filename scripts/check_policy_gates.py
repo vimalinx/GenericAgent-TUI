@@ -486,6 +486,83 @@ def assert_shuheng_history_storage_owned() -> None:
     assert "GenericAgent 的 model_responses" not in Path(a.__file__).read_text(encoding="utf-8")
 
 
+def assert_shuheng_bootstraps_legacy_state_without_mutating_source() -> None:
+    root = tempfile.mkdtemp(prefix="ga_tui_legacy_bootstrap_")
+    legacy_root = os.path.join(root, "GenericAgent")
+    shuheng_root = os.path.join(root, "ShuhengHome")
+    legacy_history = os.path.join(legacy_root, "temp", "model_responses")
+    legacy_memory = os.path.join(legacy_root, "memory")
+    os.makedirs(legacy_history, exist_ok=True)
+    os.makedirs(os.path.join(legacy_memory, "subagents", "researcher"), exist_ok=True)
+    os.makedirs(os.path.join(legacy_memory, "agent_harness", "runtime", "ohmypi", "agent"), exist_ok=True)
+
+    legacy_session = os.path.join(legacy_history, "model_responses_legacy.txt")
+    a.write_text_atomic(
+        legacy_session,
+        "=== Prompt === 2026-06-18 09:00:00\n"
+        + json.dumps({"role": "user", "content": [{"type": "text", "text": "legacy question"}]}, ensure_ascii=False)
+        + "\n\n=== Response === 2026-06-18 09:00:01\n"
+        + repr([{"type": "text", "text": "legacy answer"}])
+        + "\n",
+    )
+    a.write_text_atomic(
+        os.path.join(legacy_history, "session_meta.json"),
+        json.dumps({
+            "model_responses_legacy.txt": {"preview": "legacy question"},
+            "model_responses_conflict.txt": {"preview": "old conflict"},
+        }, ensure_ascii=False),
+    )
+    a.write_text_atomic(
+        os.path.join(legacy_history, "session_names.json"),
+        json.dumps({"model_responses_legacy.txt": "Legacy Session"}, ensure_ascii=False),
+    )
+    a.write_text_atomic(os.path.join(legacy_memory, "global_mem.txt"), "legacy global memory\n")
+    a.write_text_atomic(os.path.join(legacy_memory, "global_mem_insight.txt"), "legacy index\n")
+    a.write_text_atomic(os.path.join(legacy_memory, "subagents", "researcher", "memory.md"), "legacy researcher memory\n")
+    a.write_text_atomic(os.path.join(legacy_memory, "agent_harness", "runtime", "ohmypi", "agent", "config.yml"), "stale runtime\n")
+
+    old_root = a.ROOT_DIR
+    old_import = os.environ.get("SHUHENG_IMPORT_LEGACY")
+    old_disable = os.environ.pop("SHUHENG_DISABLE_LEGACY_IMPORT", None)
+    old_done = a._LEGACY_STATE_BOOTSTRAP_DONE
+    try:
+        a.ROOT_DIR = legacy_root
+        retarget_harness(shuheng_root)
+        os.environ["SHUHENG_IMPORT_LEGACY"] = "1"
+        a._LEGACY_STATE_BOOTSTRAP_DONE = False
+        os.makedirs(a.SHUHENG_MEMORY_DIR, exist_ok=True)
+        a.write_text_atomic(os.path.join(a.SHUHENG_MEMORY_DIR, "global_mem.txt"), "new global memory wins\n")
+        a.save_session_meta_registry({
+            "model_responses_conflict.txt": {"preview": "new conflict wins"},
+        })
+
+        state = a.State(agent=None)
+        assert a.load_history(state, force=True) is True
+        imported_session = os.path.join(a.MODEL_RESPONSES_DIR, "model_responses_legacy.txt")
+        assert os.path.exists(imported_session), imported_session
+        assert any(path == imported_session for path, _mtime, _preview, _rounds in state.history), state.history
+        registry = a.load_session_meta_registry()
+        assert registry["model_responses_conflict.txt"]["preview"] == "new conflict wins", registry
+        assert os.path.exists(legacy_session), legacy_session
+        assert a.read_text_file(os.path.join(a.SHUHENG_MEMORY_DIR, "global_mem.txt")) == "new global memory wins\n"
+        assert a.read_text_file(os.path.join(a.SHUHENG_MEMORY_DIR, "global_mem_insight.txt")) == "legacy index\n"
+        assert "legacy researcher memory" in a.read_text_file(os.path.join(a.SUBAGENTS_DIR, "researcher", "memory.md"))
+        assert not os.path.exists(os.path.join(a.AGENT_HARNESS_DIR, "runtime", "ohmypi", "agent", "config.yml"))
+        marker = json.loads(a.read_text_file(a.legacy_import_marker_path()))
+        assert marker["mode"] == "copy_missing_only", marker
+        assert marker["history"]["copied_files"] >= 2, marker
+        assert marker["memory"]["copied_files"] >= 2, marker
+    finally:
+        a.ROOT_DIR = old_root
+        a._LEGACY_STATE_BOOTSTRAP_DONE = old_done
+        if old_import is None:
+            os.environ.pop("SHUHENG_IMPORT_LEGACY", None)
+        else:
+            os.environ["SHUHENG_IMPORT_LEGACY"] = old_import
+        if old_disable is not None:
+            os.environ["SHUHENG_DISABLE_LEGACY_IMPORT"] = old_disable
+
+
 def assert_ohmypi_runtime_registry() -> None:
     old = os.environ.pop("GA_TUI_RUNTIME_PROVIDER", None)
     try:
@@ -3742,6 +3819,7 @@ def run_checks() -> None:
     assert_ohmypi_provider_module_boundary()
     assert_shuheng_brand_entrypoints()
     assert_shuheng_history_storage_owned()
+    assert_shuheng_bootstraps_legacy_state_without_mutating_source()
     assert_ohmypi_runtime_registry()
     assert_ohmypi_memory_prompt_and_command()
     assert_ohmypi_rpc_command_discovers_user_bun_binary()

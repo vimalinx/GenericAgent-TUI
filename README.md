@@ -47,7 +47,7 @@
 会话管理器 + 多 Agent 调度台 + 任务看板 + 记忆/审批治理层 + 自动化控制面板
 ```
 
-它负责让 OMP、GenericAgent、Codex、Claude Code 等本地 agent runtime 在终端中更可控、更耐用、更适合长任务；会话历史、harness 账本、子 agent、Secret Vault 和 OMP 隔离运行时默认都由 Shuheng 自己维护在 `~/.shuheng`。
+它负责让 OMP、GenericAgent、Codex、Claude Code 等本地 agent runtime 在终端中更可控、更耐用、更适合长任务；会话历史、harness 账本、子 agent、Secret Vault 和 OMP 隔离运行时默认都由 Shuheng 自己维护在 `~/.shuheng`。如果本机已有旧 GenericAgent 历史和记忆，Shuheng 首次正常启动会把缺失文件非破坏性复制到 `~/.shuheng`，左侧历史只读取复制后的 Shuheng 数据。
 
 > Runtimes execute. Shuheng governs the control surface.
 

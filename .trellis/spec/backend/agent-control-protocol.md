@@ -1043,7 +1043,7 @@ At 08:00, scheduler writes scheduledtask.run.v1 starting, converts the schedule 
 
 - Trigger: Shuheng must own its state independently of the GenericAgent checkout while still using GenericAgent as an optional runtime/source dependency.
 - Applies to: Shuheng storage path selection, `load_history()`, `cached_session_rows()`, `continue_cmd`, `session_meta.json`, `session_names.json`, harness ledgers/artifacts/traces, persistent and temporary subagents, Secret Vault, isolated OMP runtime files, sidebar display, and history restore behavior.
-- Non-goal: This bridge must not migrate, unzip, or destructively modify legacy GenericAgent history files unless a separate explicit data-migration task exists.
+- Non-goal: This bridge must not delete, move, unzip, or destructively modify legacy GenericAgent history or memory files.
 
 ### 2. Signatures
 
@@ -1057,6 +1057,9 @@ At 08:00, scheduler writes scheduledtask.run.v1 starting, converts the schedule 
 - `TEMP_SUBAGENTS_DIR` defaults to `~/.shuheng/temp/subagents`.
 - `SECRET_VAULT_DIR` defaults to `~/.shuheng/memory/secret_vault`.
 - OMP isolated runtime files default to `~/.shuheng/memory/agent_harness/runtime/ohmypi/agent`.
+- Legacy bootstrap marker: `~/.shuheng/.legacy_import.json`.
+- `SHUHENG_IMPORT_LEGACY=1` forces a non-destructive legacy import for targeted runs.
+- `SHUHENG_DISABLE_LEGACY_IMPORT=1` disables the legacy import.
 - `continue_cmd` must be runtime-configured to use the same `MODEL_RESPONSES_DIR` and a Shuheng-owned rounds cache.
 - Missing-source archives live under `~/.shuheng/memory/L4_raw_sessions` by default.
 - Missing-source rows are synthesized from TUI metadata keys whose basename matches `model_responses*.txt` and whose source file is absent.
@@ -1079,6 +1082,11 @@ At 08:00, scheduler writes scheduledtask.run.v1 starting, converts the schedule 
 - Persistent subagent memory must live under Shuheng-owned `SUBAGENTS_DIR`; temporary subagents must live under Shuheng-owned `TEMP_SUBAGENTS_DIR`.
 - Secret Vault encrypted storage must live under Shuheng-owned `SECRET_VAULT_DIR` by default.
 - OMP memory append prompts must read Shuheng-owned memory sources, not GenericAgent `memory/`.
+- On normal first launch with the default `~/.shuheng` home, Shuheng may bootstrap existing GenericAgent state by copying missing files from `${ROOT_DIR}/temp/model_responses` and `${ROOT_DIR}/memory` into the Shuheng-owned tree.
+- Legacy bootstrap must be copy-missing-only: existing Shuheng files win over old GenericAgent files.
+- Legacy `session_meta.json`, `session_names.json`, and `session_token_usage.json` are merged as JSON objects when Shuheng sidecars already exist; Shuheng keys win on conflict.
+- Legacy bootstrap must not copy stale embedded runtime config from `memory/agent_harness/runtime/**`; isolated OMP runtime files are regenerated under Shuheng.
+- Legacy bootstrap writes `.legacy_import.json` so later launches do not repeatedly scan and copy the same source tree.
 - `restore_history()` must refuse direct restore when the source path is absent and must leave the active runtime untouched.
 - When a raw source file reappears, cached raw-session processing clears missing-source markers.
 
@@ -1088,6 +1096,10 @@ At 08:00, scheduler writes scheduledtask.run.v1 starting, converts the schedule 
 - Default import with no env override -> `AGENT_HARNESS_DIR`, `SUBAGENTS_DIR`, `TEMP_SUBAGENTS_DIR`, `SECRET_VAULT_DIR`, and isolated OMP runtime paths are all under `~/.shuheng`.
 - `SHUHENG_HOME=/tmp/shuheng-home` before import -> Shuheng history paths derive from `/tmp/shuheng-home`.
 - `GA_TUI_HOME=/tmp/compat-home` before import and no `SHUHENG_HOME` -> Shuheng history paths derive from `/tmp/compat-home`.
+- Normal default launch with old GenericAgent session files and empty Shuheng history -> copied Shuheng-owned session files appear in `load_history()` and the sidebar.
+- `SHUHENG_IMPORT_LEGACY=1` with a test/custom Shuheng home -> same non-destructive bootstrap runs against the custom target.
+- Existing Shuheng memory file conflicts with legacy GenericAgent memory file -> Shuheng file remains unchanged.
+- Legacy `memory/agent_harness/runtime/ohmypi/agent/config.yml` exists -> it is not copied into Shuheng's isolated runtime directory.
 - `continue_cmd` import -> `_LOG_DIR`, `_LOG_GLOB`, and `_ROUNDS_CACHE_PATH` are retargeted to the Shuheng-owned history tree.
 - `session_names` import -> `_LOG_DIR` and `_REG_PATH` are retargeted to the active Shuheng-owned `MODEL_RESPONSES_DIR`.
 - New main runtime agent -> agent, LLM client, and backend `log_path` all point at a normal `model_responses_*.txt` file under `MODEL_RESPONSES_DIR`.
@@ -1097,8 +1109,10 @@ At 08:00, scheduler writes scheduledtask.run.v1 starting, converts the schedule 
 ### 5. Good/Base/Bad Cases
 
 - Good: A fresh `shuheng` launch creates and reads sidebar history, harness ledgers, subagents, Secret Vault, and OMP isolated runtime files under `~/.shuheng` and leaves `/home/vimalinx/Programs/GenericAgent/memory` and `temp/model_responses` untouched.
+- Good: A user upgrades from old GenericAgent-backed storage; Shuheng copies missing sessions, global memory files, and persistent subagents into `~/.shuheng`, then the sidebar reads only the copied Shuheng-owned paths.
 - Good: `/rename`, AI title jobs, `/continue` parsing, and cached round counts all use Shuheng-owned sidecars.
 - Base: The GenericAgent checkout still supplies `continue_cmd.py` and `session_names.py` code, but their storage globals are retargeted at runtime.
+- Base: Operators can disable implicit bootstrap with `SHUHENG_DISABLE_LEGACY_IMPORT=1` or force it in custom-home tests with `SHUHENG_IMPORT_LEGACY=1`.
 - Base: Test harnesses may retarget `MODEL_RESPONSES_DIR` to a temp directory, but must call `configure_frontend_history_storage()` after changing the path constants.
 - Bad: Editing only `MODEL_RESPONSES_DIR` while leaving `continue_cmd._LOG_DIR` or `session_names._REG_PATH` on GenericAgent's default directory.
 - Bad: Moving session history but leaving harness ledgers, subagent memory, Secret Vault, or OMP isolated runtime under the GenericAgent checkout.
@@ -1109,6 +1123,7 @@ At 08:00, scheduler writes scheduledtask.run.v1 starting, converts the schedule 
 - `scripts/check_policy_gates.py` must assert default session history paths are inside Shuheng home and not inside `GenericAgent/temp/model_responses`.
 - Tests must assert `AGENT_HARNESS_DIR`, `SUBAGENTS_DIR`, `TEMP_SUBAGENTS_DIR`, `SECRET_VAULT_DIR`, and isolated OMP runtime paths are inside Shuheng home and not inside the GenericAgent checkout.
 - Tests must assert `continue_cmd` and `session_names` are retargeted to the active `MODEL_RESPONSES_DIR`.
+- Tests must assert legacy bootstrap copies old GenericAgent history and memory into Shuheng, preserves existing Shuheng conflicts, skips stale OMP runtime files, writes a marker, and does not delete source files.
 - Tests must assert `new_agent()` starts with a normal `model_responses_*.txt` log path under the active Shuheng history directory.
 - `scripts/check_policy_gates.py` must assert `load_history()` includes a missing-source row from `session_meta.json`.
 - Tests must assert the row is marked `source_missing:true` and `archive_backed:true`.
@@ -1132,6 +1147,7 @@ MODEL_RESPONSES_DIR = os.path.join(SHUHENG_HOME, "model_responses")
 SUBAGENTS_DIR = os.path.join(SHUHENG_MEMORY_DIR, "subagents")
 AGENT_HARNESS_DIR = os.path.join(SHUHENG_MEMORY_DIR, "agent_harness")
 configure_frontend_history_storage()
+maybe_bootstrap_shuheng_legacy_state()
 ```
 
 ## Scenario: Temporary Non-Persistent Main Sessions
