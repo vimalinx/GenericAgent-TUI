@@ -87,7 +87,7 @@ Expose only `shuheng*` user commands and Shuheng/枢衡 UI strings, while preser
 - `build_main_runtime_context_pack()` must default to the OMP permission profile, which defaults to `full`.
 - `build_context_pack()` for subagents must default to `standard` unless explicitly passed another profile.
 - `format_context_pack_for_prompt()` must include `permission_profile` so OMP can answer capability questions without claiming read-only mode.
-- OMP isolated runtime config must be written under the GA-TUI harness runtime directory and must not mutate the user's system OMP config.
+- OMP isolated runtime config must be written under the Shuheng-owned harness runtime directory and must not mutate the user's system OMP config.
 - OMP isolated runtime config defaults `tools.approvalMode` to `yolo`, so OMP runtime tools do not stop for OMP approval prompts.
 - If OMP still emits an RPC extension-UI approval prompt, it may be auto-approved when the active runtime request has `permission_profile:"full"` and the requested tool maps to an allowed capability.
 
@@ -97,7 +97,7 @@ Expose only `shuheng*` user commands and Shuheng/枢衡 UI strings, while preser
 - No env override + main OMP runtime task request -> `role:"main_orchestrator"`, prompt contains `role: main_orchestrator` plus `permission_profile: full`, and the request carries the same full permission set.
 - `GA_TUI_OMP_PERMISSION_PROFILE=read_only` + main OMP context -> `permission_profile:"read_only"`, `write_policy:"none"`, no bash in `tools_allowed`.
 - Subagent context without an explicit profile -> `permission_profile:"standard"` and role-bounded tools.
-- OMP isolated config generation -> `tools.approvalMode:"yolo"` and `PI_CODING_AGENT_DIR` under the GA-TUI harness.
+- OMP isolated config generation -> `tools.approvalMode:"yolo"` and `PI_CODING_AGENT_DIR` under the Shuheng-owned harness.
 - OMP RPC approval select for safe `bash` under full profile -> respond `Approve`.
 - OMP RPC approval select for risky `rm -rf` under full profile -> respond `Approve`.
 - OMP RPC approval select under `standard` profile -> respond `Deny`.
@@ -313,7 +313,7 @@ memory_write: candidate_only
 
 ### 5. Good/Base/Bad Cases
 
-- Good: `/agent new --temp reviewer:TUI-Smoke | ...` creates `tmp-tui-smoke-...` under `temp/ga-tui-subagents/current/...`; `/agent ask tmp-tui-smoke-... ...` starts the subagent in the same TUI session.
+- Good: `/agent new --temp reviewer:TUI-Smoke | ...` creates `tmp-tui-smoke-...` under `TEMP_SUBAGENTS_DIR/current/...`; `/agent ask tmp-tui-smoke-... ...` starts the subagent in the same TUI session.
 - Base: A persistent subagent continues to load from `SUBAGENTS_DIR` regardless of session key.
 - Bad: Creation writes to `current` but reload only scans keyed owner directories, causing `/agent ask` to report `找不到子 agent` immediately after creation.
 
@@ -472,7 +472,7 @@ if text.strip().lower() in {"/llm", "/models", "/model"}:
 - `task_get` without `task_id` or unknown task -> `status:"error"`.
 - Repeated `install_tui_query_runtime()` calls -> no duplicate tool schemas and no duplicate handler side effects.
 - GenericAgent model switch or `load_tool_schema()` reload -> query schemas are re-appended exactly once.
-- Secret Vault unlocked -> subagent query refresh uses Secret subagents instead of normal `memory/subagents/`.
+- Secret Vault unlocked -> subagent query refresh uses Secret subagents instead of normal `SUBAGENTS_DIR`.
 
 ### 5. Good/Base/Bad Cases
 
@@ -588,7 +588,7 @@ configure_genericagent_provider_runtime(
 ### 1. Scope / Trigger
 
 - Trigger: GenericAgent-TUI integrates Oh My Pi as the experiment-branch default local runtime provider.
-- Applies to: `src/ga_tui/ohmypi_provider.py`, runtime provider registration in `src/ga_tui/app.py`, runtime registry records, provider selection, GA/TUI memory prompt injection, app-injected TUI host tool registration, typed host-tool routing, governed proposal routing, memory candidate signaling, runtime task request/event records, and RPC queue/event mapping.
+- Applies to: `src/ga_tui/ohmypi_provider.py`, runtime provider registration in `src/ga_tui/app.py`, runtime registry records, provider selection, Shuheng memory prompt injection, app-injected TUI host tool registration, typed host-tool routing, governed proposal routing, memory candidate signaling, runtime task request/event records, and RPC queue/event mapping.
 - Non-goal: This provider must not own curses rendering, mutable TUI `State`, GenericAgent tool schema injection, TUI approval storage, scheduler registries, or first-class TUI subagent ledger mutation.
 
 ### 2. Signatures
@@ -613,12 +613,13 @@ configure_genericagent_provider_runtime(
 - Combined host tool callback helper: `ohmypi_tui_host_tool_handler(state=None)`.
 - Backward-compatible query callback helper: `ohmypi_tui_query_host_tool_handler(state=None)`.
 - Environment keys:
+  - `SHUHENG_HOME` overrides the Shuheng-owned storage root; legacy internal `GA_TUI_HOME` remains an accepted compatibility override.
   - unset `GA_TUI_RUNTIME_PROVIDER` selects `ohmypi` on this experiment branch.
   - `GA_TUI_RUNTIME_PROVIDER=genericagent` selects the fallback GenericAgent adapter.
   - `GA_TUI_OHMYPI_BIN` overrides the executable.
   - `GA_TUI_OHMYPI_ARGS` appends shell-split extra CLI arguments.
 - OMP subprocess environment:
-  - `PI_CODING_AGENT_DIR` must point to the GA-TUI-owned isolated OMP agent directory under `${AGENT_HARNESS_DIR}/runtime/ohmypi/agent`.
+  - `PI_CODING_AGENT_DIR` must point to the Shuheng-owned isolated OMP agent directory under `${AGENT_HARNESS_DIR}/runtime/ohmypi/agent`.
   - Generated per-process API key env vars use `GA_TUI_OMP_API_KEY_<digest>` and must be passed only through the OMP child process env.
 - Default RPC command shape: `<resolved-omp> --mode rpc --no-title --approval-mode yolo --append-system-prompt <generated-memory-file>`.
 
@@ -647,8 +648,8 @@ configure_genericagent_provider_runtime(
 - The only allowed host tool bridge is app-injected TUI governance querying, typed read-only control-plane tools, and governed proposal routing: `capabilities.tui_readonly_host_tools:true`, `capabilities.tui_governed_proposal_tools:true`, and `capabilities.tui_typed_host_tools:true`.
 - Provider metadata must advertise `capabilities.runtime_task_requests:true` and `capabilities.runtime_task_events:true` once OMP execution is wrapped by `runtime.task_request.v1` and `runtime.task_event.v1`.
 - `OhMyPiRpcAgent` may register host tools through `set_host_tools` only from definitions injected by `app.py`; provider code must not invent writable tools or import TUI `State`.
-- Embedded OMP must use a GA-TUI-owned runtime root and must not read or write system-level `~/.omp/agent/config.yml`, `~/.omp/agent/models.yml`, sessions, auth storage, or cache as its active agent directory.
-- Embedded OMP must run with the GenericAgent-TUI repository root as its subprocess `cwd`, while GA-TUI harness paths, memory, ledgers, isolated OMP runtime files, and provider metadata continue to use the GenericAgent root / `${AGENT_HARNESS_DIR}` ownership boundary.
+- Embedded OMP must use a Shuheng-owned runtime root and must not read or write system-level `~/.omp/agent/config.yml`, `~/.omp/agent/models.yml`, sessions, auth storage, or cache as its active agent directory.
+- Embedded OMP must run with the GenericAgent-TUI repository root as its subprocess `cwd`, while Shuheng harness paths, memory, ledgers, isolated OMP runtime files, and provider metadata use the `SHUHENG_HOME` / `${AGENT_HARNESS_DIR}` ownership boundary.
 - `app.py` owns translation from GA-TUI `/model` entries to isolated OMP `config.yml` and `models.yml`; `ohmypi_provider.py` owns only generic runtime file writing, subprocess env, OMP binary discovery, command construction, and RPC behavior.
 - OMP binary discovery order is explicit `binary` argument, `GA_TUI_OHMYPI_BIN`, `PATH` lookup for `omp`, then user-local Bun install at `$HOME/.bun/bin/omp`. A still-missing executable remains a visible startup error instead of mutating user shell configuration.
 - Generated OMP `config.yml` must set `modelRoles.default` to the GA-TUI default model selector when a complete matching `/model` entry exists.
@@ -661,7 +662,7 @@ configure_genericagent_provider_runtime(
 - `ga_tui_propose` with `proposal_type:"memory_candidate"` must resolve the target subagent from the bound TUI `State` and call `queue_curated_memory_candidate(...)`; direct long-term memory writes remain forbidden.
 - `ga_tui_propose` results use `schema_version:"ga-tui.proposal.v1"` and return JSON-safe `status`, `kind`, result lines/messages, ids, and artifact refs where available.
 - Typed read-only tools must call the same app-layer query functions as the compatibility query endpoint. They must not mutate sessions, tasks, approvals, long-term memory, or ledgers.
-- `memory_context_get` may generate a GA-TUI-owned context-pack artifact and return `context_pack_ref` plus a JSON-safe pack. This is the allowed way for OMP to hydrate memory/context; it is not a long-term memory write.
+- `memory_context_get` may generate a Shuheng-owned context-pack artifact and return `context_pack_ref` plus a JSON-safe pack. This is the allowed way for OMP to hydrate memory/context; it is not a long-term memory write.
 - `memory_candidate_submit` must call the same governed memory-candidate path as `ga_tui_propose` with `proposal_type:"memory_candidate"`.
 - `proposal_submit` must call the same governed proposal path as `ga_tui_propose`.
 - `schedule_create` may create a TUI-owned schedule through the scheduler service; it must use the existing schedule registry and must not call OMP or any runtime directly.
@@ -674,7 +675,7 @@ configure_genericagent_provider_runtime(
 - Host URI schemes and TUI approval mapping remain disabled until a separate explicit task designs those governance contracts.
 - On this experiment branch, Oh My Pi is the default runtime provider when `GA_TUI_RUNTIME_PROVIDER` is unset.
 - GenericAgent must remain selectable with `GA_TUI_RUNTIME_PROVIDER=genericagent`.
-- The TUI should generate a bounded `GA/TUI Memory Guidance` append prompt from GA/TUI memory sources and pass it through `--append-system-prompt`.
+- The TUI should generate a bounded `GA/TUI Memory Guidance` append prompt from Shuheng-owned memory sources under `${SHUHENG_HOME}/memory` and pass it through `--append-system-prompt`.
 - Oh My Pi completion output may emit memory candidate signals, and `ga_tui_propose` may submit curated memory candidates, but long-term memory writes remain governed by TUI memory candidate records and human approval.
 - Main OMP tasks and worker/subagent OMP tasks should include generated GA-TUI context pack artifacts when using the structured runtime request path.
 - OMP runtime events for requested tasks, host tool calls/results, completion, failure, and abort must be normalized into `runtime.task_event.v1` records and appended to GA-TUI traces when a concrete task id exists.
@@ -705,7 +706,7 @@ configure_genericagent_provider_runtime(
 - Incomplete GA-TUI model entry -> omitted from isolated OMP `models.yml`; no invalid OMP provider is generated.
 - Selected GA-TUI default model -> OMP command may include `--model <isolated-provider>/<model-id>` and isolated `config.yml` carries the same `modelRoles.default`.
 - User system OMP config exists -> policy checks must verify its hash remains unchanged across embedded OMP runtime setup.
-- OMP adapter registration -> subprocess `cwd` is the GenericAgent-TUI app root so relative repo paths such as `AGENTS.md` resolve to the TUI project while isolated runtime files still live under the GA-TUI-owned harness directory.
+- OMP adapter registration -> subprocess `cwd` is the GenericAgent-TUI app root so relative repo paths such as `AGENTS.md` resolve to the TUI project while isolated runtime files still live under the Shuheng-owned harness directory.
 - OMP error frame with `stopReason:"error"` and `errorMessage` -> active TUI queue receives a visible `[Oh My Pi] ...` done item.
 - OMP `turn_end` followed by an immediate next `put_task()` before `agent_end` -> wrapper rejects the next prompt as concurrent instead of sending it to OMP and surfacing `Agent is already processing`.
 - OMP `turn_end` followed by `agent_end` -> active queue receives the done item and the next prompt can then be sent normally.
@@ -1036,19 +1037,26 @@ At 08:00, scheduler calls agent.put_task("Generate daily digest") directly and s
 At 08:00, scheduler writes scheduledtask.run.v1 starting, converts the schedule to agenttask.v2 delegate.create, calls start_subagent_task(), then appends the final run status and relies on task ledger/artifact refs for execution evidence.
 ```
 
-## Scenario: TUI Session Registry And Archive-Backed Sidebar Rows
+## Scenario: Shuheng-Owned Storage And Archive-Backed Sidebar Rows
 
 ### 1. Scope / Trigger
 
-- Trigger: The TUI sidebar needs to show known history sessions even when the raw `model_responses*.txt` source file has been physically archived or is missing.
-- Applies to: Shuheng history path selection, `load_history()`, `cached_session_rows()`, `continue_cmd`, `session_meta.json`, `session_names.json`, sidebar display, and history restore behavior.
-- Non-goal: This bridge must not migrate, unzip, or destructively modify legacy GenericAgent history files.
+- Trigger: Shuheng must own its state independently of the GenericAgent checkout while still using GenericAgent as an optional runtime/source dependency.
+- Applies to: Shuheng storage path selection, `load_history()`, `cached_session_rows()`, `continue_cmd`, `session_meta.json`, `session_names.json`, harness ledgers/artifacts/traces, persistent and temporary subagents, Secret Vault, isolated OMP runtime files, sidebar display, and history restore behavior.
+- Non-goal: This bridge must not migrate, unzip, or destructively modify legacy GenericAgent history files unless a separate explicit data-migration task exists.
 
 ### 2. Signatures
 
 - Shuheng history home defaults to `~/.shuheng`; `SHUHENG_HOME` overrides it, and legacy internal `GA_TUI_HOME` remains an accepted override.
+- `SHUHENG_MEMORY_DIR` defaults to `~/.shuheng/memory`.
+- `SHUHENG_TEMP_DIR` defaults to `~/.shuheng/temp`.
 - Raw session rows are read from `MODEL_RESPONSES_DIR/model_responses*.txt`, where `MODEL_RESPONSES_DIR` defaults to `~/.shuheng/model_responses`.
 - `session_meta.json`, `session_token_usage.json`, `.trash`, and `session_names.json` live under the Shuheng-owned history tree, not `GenericAgent/temp/model_responses`.
+- `AGENT_HARNESS_DIR` defaults to `~/.shuheng/memory/agent_harness`.
+- `SUBAGENTS_DIR` defaults to `~/.shuheng/memory/subagents`.
+- `TEMP_SUBAGENTS_DIR` defaults to `~/.shuheng/temp/subagents`.
+- `SECRET_VAULT_DIR` defaults to `~/.shuheng/memory/secret_vault`.
+- OMP isolated runtime files default to `~/.shuheng/memory/agent_harness/runtime/ohmypi/agent`.
 - `continue_cmd` must be runtime-configured to use the same `MODEL_RESPONSES_DIR` and a Shuheng-owned rounds cache.
 - Missing-source archives live under `~/.shuheng/memory/L4_raw_sessions` by default.
 - Missing-source rows are synthesized from TUI metadata keys whose basename matches `model_responses*.txt` and whose source file is absent.
@@ -1062,16 +1070,22 @@ At 08:00, scheduler writes scheduledtask.run.v1 starting, converts the schedule 
 ### 3. Contracts
 
 - Physical archival must not remove a known sidebar row when TUI metadata still knows the session.
+- GenericAgent `ROOT_DIR` remains only a runtime/source discovery root, not a Shuheng state root.
 - Missing-source rows may use metadata preview, description, rounds, last-user timestamp, and display name to remain visible.
 - Missing-source rows must not pretend to be normal raw sessions.
 - New main-agent sessions must bind their agent/client/backend log path to the Shuheng-owned `MODEL_RESPONSES_DIR` before runtime work starts.
 - Session naming must persist through the same Shuheng-owned `session_names.json` registry; it must not use GenericAgent's default `frontends/session_names.py` storage path.
+- Harness writes for tasks, approvals, artifacts, traces, schedules, gateway metadata, runtime provider metadata, and memory candidates must live under the Shuheng-owned `AGENT_HARNESS_DIR` by default.
+- Persistent subagent memory must live under Shuheng-owned `SUBAGENTS_DIR`; temporary subagents must live under Shuheng-owned `TEMP_SUBAGENTS_DIR`.
+- Secret Vault encrypted storage must live under Shuheng-owned `SECRET_VAULT_DIR` by default.
+- OMP memory append prompts must read Shuheng-owned memory sources, not GenericAgent `memory/`.
 - `restore_history()` must refuse direct restore when the source path is absent and must leave the active runtime untouched.
 - When a raw source file reappears, cached raw-session processing clears missing-source markers.
 
 ### 4. Validation & Error Matrix
 
 - Default import with no env override -> `MODEL_RESPONSES_DIR` is `~/.shuheng/model_responses`.
+- Default import with no env override -> `AGENT_HARNESS_DIR`, `SUBAGENTS_DIR`, `TEMP_SUBAGENTS_DIR`, `SECRET_VAULT_DIR`, and isolated OMP runtime paths are all under `~/.shuheng`.
 - `SHUHENG_HOME=/tmp/shuheng-home` before import -> Shuheng history paths derive from `/tmp/shuheng-home`.
 - `GA_TUI_HOME=/tmp/compat-home` before import and no `SHUHENG_HOME` -> Shuheng history paths derive from `/tmp/compat-home`.
 - `continue_cmd` import -> `_LOG_DIR`, `_LOG_GLOB`, and `_ROUNDS_CACHE_PATH` are retargeted to the Shuheng-owned history tree.
@@ -1082,17 +1096,18 @@ At 08:00, scheduler writes scheduledtask.run.v1 starting, converts the schedule 
 
 ### 5. Good/Base/Bad Cases
 
-- Good: A fresh `shuheng` launch creates and reads sidebar history from `~/.shuheng/model_responses` and leaves `/home/vimalinx/Programs/GenericAgent/temp/model_responses` untouched.
+- Good: A fresh `shuheng` launch creates and reads sidebar history, harness ledgers, subagents, Secret Vault, and OMP isolated runtime files under `~/.shuheng` and leaves `/home/vimalinx/Programs/GenericAgent/memory` and `temp/model_responses` untouched.
 - Good: `/rename`, AI title jobs, `/continue` parsing, and cached round counts all use Shuheng-owned sidecars.
 - Base: The GenericAgent checkout still supplies `continue_cmd.py` and `session_names.py` code, but their storage globals are retargeted at runtime.
 - Base: Test harnesses may retarget `MODEL_RESPONSES_DIR` to a temp directory, but must call `configure_frontend_history_storage()` after changing the path constants.
 - Bad: Editing only `MODEL_RESPONSES_DIR` while leaving `continue_cmd._LOG_DIR` or `session_names._REG_PATH` on GenericAgent's default directory.
+- Bad: Moving session history but leaving harness ledgers, subagent memory, Secret Vault, or OMP isolated runtime under the GenericAgent checkout.
 - Bad: Migrating, deleting, or mutating old GenericAgent history files without an explicit migration task.
-- Bad: Moving task ledgers, approvals, subagent homes, or isolated OMP runtime config as part of a session-history-only task.
 
 ### 6. Tests Required
 
 - `scripts/check_policy_gates.py` must assert default session history paths are inside Shuheng home and not inside `GenericAgent/temp/model_responses`.
+- Tests must assert `AGENT_HARNESS_DIR`, `SUBAGENTS_DIR`, `TEMP_SUBAGENTS_DIR`, `SECRET_VAULT_DIR`, and isolated OMP runtime paths are inside Shuheng home and not inside the GenericAgent checkout.
 - Tests must assert `continue_cmd` and `session_names` are retargeted to the active `MODEL_RESPONSES_DIR`.
 - Tests must assert `new_agent()` starts with a normal `model_responses_*.txt` log path under the active Shuheng history directory.
 - `scripts/check_policy_gates.py` must assert `load_history()` includes a missing-source row from `session_meta.json`.
@@ -1104,14 +1119,18 @@ At 08:00, scheduler writes scheduledtask.run.v1 starting, converts the schedule 
 #### Wrong
 
 ```python
-MODEL_RESPONSES_DIR = os.path.join(ROOT_DIR, "temp", "model_responses")
+SUBAGENTS_DIR = os.path.join(ROOT_DIR, "memory", "subagents")
+AGENT_HARNESS_DIR = os.path.join(ROOT_DIR, "memory", "agent_harness")
 ```
 
 #### Correct
 
 ```python
 SHUHENG_HOME = default_shuheng_home()
+SHUHENG_MEMORY_DIR = os.path.join(SHUHENG_HOME, "memory")
 MODEL_RESPONSES_DIR = os.path.join(SHUHENG_HOME, "model_responses")
+SUBAGENTS_DIR = os.path.join(SHUHENG_MEMORY_DIR, "subagents")
+AGENT_HARNESS_DIR = os.path.join(SHUHENG_MEMORY_DIR, "agent_harness")
 configure_frontend_history_storage()
 ```
 
@@ -1159,7 +1178,7 @@ configure_frontend_history_storage()
 
 ### 1. Scope / Trigger
 
-- Trigger: Agent clients that are not directly launched by the TUI need GA-TUI-owned project context and governed proposal submission.
+- Trigger: Agent clients that are not directly launched by the TUI need Shuheng-owned project context and governed proposal submission.
 - Applies to: `src/ga_tui/agent_bridge.py`, `shuheng-agent-bridge`, `python -m ga_tui.agent_bridge`, repo-managed OMP plugin files under `integrations/omp-ga-tui-plugin`, OMP `--tool` loading, and future Codex/Claude Code adapters that consume the same bridge contract.
 - Non-goal: This bridge does not make OMP, Codex, Claude Code, or any plugin the owner of long-term memory, approval queues, schedule registries, task ledgers, artifacts, or traces.
 
@@ -1226,7 +1245,7 @@ configure_frontend_history_storage()
 - Good: OMP calls `ga_tui_memory_candidate_submit`; GA-TUI validates the target, builds a memory-candidate artifact, appends a pending candidate row, queues a human approval, and records provenance.
 - Base: A user links the plugin persistently with `omp plugin link` only after explicitly choosing to let OMP remember the repo-managed plugin.
 - Base: Codex or Claude Code later calls the same bridge action names and gets the same schemas without OMP-specific contract names.
-- Bad: A plugin writes directly to `memory/subagents/*/memory.md` or `memory_candidates.jsonl`.
+- Bad: A plugin writes directly to `${SUBAGENTS_DIR}/*/memory.md` or `memory_candidates.jsonl`.
 - Bad: A plugin scrapes `context_packs/` or `subagents/` files directly instead of calling the bridge.
 - Bad: The bridge adds a second memory-candidate schema instead of reusing `queue_curated_memory_candidate(...)`.
 
@@ -1245,7 +1264,7 @@ configure_frontend_history_storage()
 #### Wrong
 
 ```text
-OMP plugin opens memory/subagents/researcher/memory.md and appends a learned fact directly.
+OMP plugin opens `${SUBAGENTS_DIR}/researcher/memory.md` and appends a learned fact directly.
 ```
 
 #### Correct

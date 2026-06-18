@@ -246,21 +246,23 @@ def default_shuheng_home() -> str:
 
 
 SHUHENG_HOME = default_shuheng_home()
+SHUHENG_MEMORY_DIR = os.path.join(SHUHENG_HOME, "memory")
+SHUHENG_TEMP_DIR = os.path.join(SHUHENG_HOME, "temp")
 SHUHENG_LOG_DIR = os.path.join(SHUHENG_HOME, "logs")
 SHUHENG_LOG_PATH = os.path.join(SHUHENG_LOG_DIR, "shuheng.log")
 MODEL_RESPONSES_DIR = os.path.join(SHUHENG_HOME, "model_responses")
 TOKEN_USAGE_PATH = os.path.join(MODEL_RESPONSES_DIR, "session_token_usage.json")
 SESSION_META_PATH = os.path.join(MODEL_RESPONSES_DIR, "session_meta.json")
-L4_RAW_SESSIONS_DIR = os.path.join(SHUHENG_HOME, "memory", "L4_raw_sessions")
+L4_RAW_SESSIONS_DIR = os.path.join(SHUHENG_MEMORY_DIR, "L4_raw_sessions")
 UI_DURABLE_SYSTEM_MESSAGES_KEY = "ui_durable_system_messages"
 UI_DURABLE_SYSTEM_MESSAGE_LIMIT = 200
 SUBAGENT_CONTEXT_REPLY_LIMIT = 2200
 SUBAGENT_CONTEXT_UPDATE_LIMIT = 20
 SUBAGENT_CONTEXT_TOTAL_LIMIT = 12000
 SESSION_TRASH_DIR = os.path.join(MODEL_RESPONSES_DIR, ".trash")
-SUBAGENTS_DIR = os.path.join(ROOT_DIR, "memory", "subagents")
-TEMP_SUBAGENTS_DIR = os.path.join(ROOT_DIR, "temp", "ga-tui-subagents")
-AGENT_HARNESS_DIR = os.path.abspath(os.path.expanduser(os.environ.get("GA_TUI_HARNESS_DIR") or os.path.join(ROOT_DIR, "memory", "agent_harness")))
+SUBAGENTS_DIR = os.path.join(SHUHENG_MEMORY_DIR, "subagents")
+TEMP_SUBAGENTS_DIR = os.path.join(SHUHENG_TEMP_DIR, "subagents")
+AGENT_HARNESS_DIR = os.path.abspath(os.path.expanduser(os.environ.get("GA_TUI_HARNESS_DIR") or os.path.join(SHUHENG_MEMORY_DIR, "agent_harness")))
 AGENT_TASK_LEDGER_PATH = os.path.join(AGENT_HARNESS_DIR, "tasks.jsonl")
 AGENT_MAIL_PATH = os.path.join(AGENT_HARNESS_DIR, "messages.jsonl")
 AGENT_APPROVALS_PATH = os.path.join(AGENT_HARNESS_DIR, "approvals.jsonl")
@@ -291,7 +293,7 @@ AGENT_GATEWAY_DAEMON_STATUS_PATH = os.path.join(AGENT_HARNESS_DIR, "gateway_daem
 AGENT_GATEWAY_DAEMON_LOG_PATH = os.path.join(AGENT_HARNESS_DIR, "gateway_daemon.log")
 AGENT_BRIDGE_REGISTRY_PATH = os.path.join(AGENT_HARNESS_DIR, "bridge_registry.json")
 LLM_RECENT_MODELS_PATH = os.path.join(AGENT_HARNESS_DIR, "recent_models.json")
-SECRET_VAULT_DIR = os.path.abspath(os.path.expanduser(os.environ.get("GA_TUI_SECRET_VAULT_DIR") or os.path.join(ROOT_DIR, "memory", "secret_vault")))
+SECRET_VAULT_DIR = os.path.abspath(os.path.expanduser(os.environ.get("GA_TUI_SECRET_VAULT_DIR") or os.path.join(SHUHENG_MEMORY_DIR, "secret_vault")))
 SECRET_VAULT_META_PATH = os.path.join(SECRET_VAULT_DIR, "vault.json")
 SECRET_VAULT_DATA_DIR = os.path.join(SECRET_VAULT_DIR, "data")
 SECRET_VAULT_SESSIONS_DIR = os.path.join(SECRET_VAULT_DATA_DIR, "sessions")
@@ -11857,7 +11859,7 @@ def agent_runtime_registry(*, write_memory_prompt_file: bool = True) -> RuntimeR
         schedules_path=AGENT_SCHEDULES_PATH,
     )))
     ohmypi_append_prompt_path = (
-        write_ohmypi_memory_prompt(root_dir=ROOT_DIR, harness_dir=AGENT_HARNESS_DIR)
+        write_ohmypi_memory_prompt(root_dir=SHUHENG_HOME, harness_dir=AGENT_HARNESS_DIR)
         if write_memory_prompt_file
         else ohmypi_memory_prompt_path(AGENT_HARNESS_DIR)
     )
@@ -17234,26 +17236,28 @@ def restore_main_poll_timeout(stdscr) -> None:
         pass
 
 
-def memory_entry_for(layer: str, path: str, note: str = "") -> Optional[MemoryEntry]:
+def memory_entry_for(layer: str, path: str, note: str = "", *, root: str = "") -> Optional[MemoryEntry]:
     try:
         st = os.stat(path)
     except OSError:
         return None
-    label = os.path.relpath(path, os.path.join(ROOT_DIR, "memory"))
+    label = os.path.relpath(path, root or SHUHENG_MEMORY_DIR)
     return MemoryEntry(layer=layer, label=label, path=path, size=int(st.st_size), mtime=float(st.st_mtime), note=note)
 
 
 def memory_inventory() -> list[MemoryEntry]:
-    memory_root = os.path.join(ROOT_DIR, "memory")
+    memory_root = SHUHENG_MEMORY_DIR
     entries: list[MemoryEntry] = []
     for layer, filename, note in [
         ("L1", "global_mem_insight.txt", "启动自动注入的极简索引"),
         ("L2", "global_mem.txt", "全局事实库"),
         ("L0", "memory_management_sop.md", "记忆写入规则"),
     ]:
-        item = memory_entry_for(layer, os.path.join(memory_root, filename), note)
+        item = memory_entry_for(layer, os.path.join(memory_root, filename), note, root=memory_root)
         if item:
             entries.append(item)
+    if not os.path.isdir(memory_root):
+        return entries
     for root, dirs, files in os.walk(memory_root):
         dirs[:] = [d for d in dirs if d not in {"__pycache__"} and not d.startswith(".")]
         rel_root = os.path.relpath(root, memory_root)
@@ -17278,7 +17282,7 @@ def memory_inventory() -> list[MemoryEntry]:
             else:
                 layer = "L3"
                 note = "SOP 或复用工具"
-            item = memory_entry_for(layer, path, note)
+            item = memory_entry_for(layer, path, note, root=memory_root)
             if item:
                 entries.append(item)
     order = {"L1": 0, "L2": 1, "L0": 2, "L3": 3, "Agent": 4, "Harness": 5, "L4": 6}

@@ -33,13 +33,18 @@ from ga_tui import scheduler as sched  # noqa: E402
 
 
 def retarget_harness(root: str) -> None:
+    a.SHUHENG_HOME = root
+    a.SHUHENG_MEMORY_DIR = os.path.join(root, "memory")
+    a.SHUHENG_TEMP_DIR = os.path.join(root, "temp")
+    a.SHUHENG_LOG_DIR = os.path.join(root, "logs")
+    a.SHUHENG_LOG_PATH = os.path.join(a.SHUHENG_LOG_DIR, "shuheng.log")
     a.MODEL_RESPONSES_DIR = os.path.join(root, "model_responses")
     a.TOKEN_USAGE_PATH = os.path.join(a.MODEL_RESPONSES_DIR, "session_token_usage.json")
     a.SESSION_META_PATH = os.path.join(a.MODEL_RESPONSES_DIR, "session_meta.json")
-    a.L4_RAW_SESSIONS_DIR = os.path.join(root, "memory", "L4_raw_sessions")
+    a.L4_RAW_SESSIONS_DIR = os.path.join(a.SHUHENG_MEMORY_DIR, "L4_raw_sessions")
     a.SESSION_TRASH_DIR = os.path.join(a.MODEL_RESPONSES_DIR, ".trash")
     a.configure_frontend_history_storage()
-    a.AGENT_HARNESS_DIR = os.path.join(root, "harness")
+    a.AGENT_HARNESS_DIR = os.path.join(a.SHUHENG_MEMORY_DIR, "agent_harness")
     a.AGENT_TASK_LEDGER_PATH = os.path.join(a.AGENT_HARNESS_DIR, "tasks.jsonl")
     a.AGENT_MAIL_PATH = os.path.join(a.AGENT_HARNESS_DIR, "messages.jsonl")
     a.AGENT_APPROVALS_PATH = os.path.join(a.AGENT_HARNESS_DIR, "approvals.jsonl")
@@ -70,12 +75,12 @@ def retarget_harness(root: str) -> None:
     a.AGENT_GATEWAY_DAEMON_LOG_PATH = os.path.join(a.AGENT_HARNESS_DIR, "gateway_daemon.log")
     a.AGENT_BRIDGE_REGISTRY_PATH = os.path.join(a.AGENT_HARNESS_DIR, "bridge_registry.json")
     a.LLM_RECENT_MODELS_PATH = os.path.join(a.AGENT_HARNESS_DIR, "recent_models.json")
-    a.SECRET_VAULT_DIR = os.path.join(root, "secret_vault")
+    a.SECRET_VAULT_DIR = os.path.join(a.SHUHENG_MEMORY_DIR, "secret_vault")
     a.SECRET_VAULT_META_PATH = os.path.join(a.SECRET_VAULT_DIR, "vault.json")
     a.SECRET_VAULT_DATA_DIR = os.path.join(a.SECRET_VAULT_DIR, "data")
     a.SECRET_VAULT_SESSIONS_DIR = os.path.join(a.SECRET_VAULT_DATA_DIR, "sessions")
-    a.SUBAGENTS_DIR = os.path.join(root, "subagents")
-    a.TEMP_SUBAGENTS_DIR = os.path.join(root, "temp-subagents")
+    a.SUBAGENTS_DIR = os.path.join(a.SHUHENG_MEMORY_DIR, "subagents")
+    a.TEMP_SUBAGENTS_DIR = os.path.join(a.SHUHENG_TEMP_DIR, "subagents")
     os.makedirs(a.AGENT_HARNESS_DIR, exist_ok=True)
     os.makedirs(a.SUBAGENTS_DIR, exist_ok=True)
     os.makedirs(a.TEMP_SUBAGENTS_DIR, exist_ok=True)
@@ -453,13 +458,25 @@ def assert_shuheng_brand_entrypoints() -> None:
 def assert_shuheng_history_storage_owned() -> None:
     expected_home = os.path.abspath(os.path.expanduser(os.environ.get("SHUHENG_HOME") or os.environ.get("GA_TUI_HOME") or "~/.shuheng"))
     assert a.SHUHENG_HOME == expected_home, a.SHUHENG_HOME
+    assert a.SHUHENG_MEMORY_DIR == os.path.join(a.SHUHENG_HOME, "memory"), a.SHUHENG_MEMORY_DIR
+    assert a.SHUHENG_TEMP_DIR == os.path.join(a.SHUHENG_HOME, "temp"), a.SHUHENG_TEMP_DIR
     assert a.path_is_within(a.MODEL_RESPONSES_DIR, a.SHUHENG_HOME), a.MODEL_RESPONSES_DIR
     assert a.path_is_within(a.TOKEN_USAGE_PATH, a.SHUHENG_HOME), a.TOKEN_USAGE_PATH
     assert a.path_is_within(a.SESSION_META_PATH, a.SHUHENG_HOME), a.SESSION_META_PATH
     assert a.path_is_within(a.L4_RAW_SESSIONS_DIR, a.SHUHENG_HOME), a.L4_RAW_SESSIONS_DIR
     assert a.path_is_within(a.SESSION_TRASH_DIR, a.SHUHENG_HOME), a.SESSION_TRASH_DIR
+    assert a.path_is_within(a.AGENT_HARNESS_DIR, a.SHUHENG_HOME), a.AGENT_HARNESS_DIR
+    assert a.path_is_within(a.SUBAGENTS_DIR, a.SHUHENG_HOME), a.SUBAGENTS_DIR
+    assert a.path_is_within(a.TEMP_SUBAGENTS_DIR, a.SHUHENG_HOME), a.TEMP_SUBAGENTS_DIR
+    assert a.path_is_within(a.SECRET_VAULT_DIR, a.SHUHENG_HOME), a.SECRET_VAULT_DIR
+    assert a.path_is_within(omp.ohmypi_isolated_agent_dir(a.AGENT_HARNESS_DIR), a.SHUHENG_HOME)
+    assert a.path_is_within(omp.ohmypi_memory_prompt_path(a.AGENT_HARNESS_DIR), a.SHUHENG_HOME)
     genericagent_history = os.path.join(a.ROOT_DIR, "temp", "model_responses")
+    genericagent_memory = os.path.join(a.ROOT_DIR, "memory")
     assert not a.path_is_within(a.MODEL_RESPONSES_DIR, genericagent_history), a.MODEL_RESPONSES_DIR
+    assert not a.path_is_within(a.AGENT_HARNESS_DIR, genericagent_memory), a.AGENT_HARNESS_DIR
+    assert not a.path_is_within(a.SUBAGENTS_DIR, genericagent_memory), a.SUBAGENTS_DIR
+    assert not a.path_is_within(a.SECRET_VAULT_DIR, genericagent_memory), a.SECRET_VAULT_DIR
     assert a.continue_cmd_module._LOG_DIR == a.MODEL_RESPONSES_DIR
     assert a.continue_cmd_module._LOG_GLOB == os.path.join(a.MODEL_RESPONSES_DIR, "model_responses_*.txt")
     assert a.path_is_within(a.continue_cmd_module._ROUNDS_CACHE_PATH, a.SHUHENG_HOME), a.continue_cmd_module._ROUNDS_CACHE_PATH
@@ -1436,6 +1453,13 @@ def assert_agent_bridge_contract_and_omp_plugin() -> None:
     assert metadata["owner"] == "ga-tui.control_plane", metadata
     assert "memory_context_get" in metadata["supported_actions"], metadata
     assert metadata["policy"]["provider_direct_writes"] is False, metadata
+    assert metadata["paths"]["shuheng_home"] == a.SHUHENG_HOME, metadata
+    assert metadata["paths"]["shuheng_memory_dir"] == a.SHUHENG_MEMORY_DIR, metadata
+    assert metadata["paths"]["harness_dir"] == a.AGENT_HARNESS_DIR, metadata
+    assert metadata["paths"]["subagents_dir"] == a.SUBAGENTS_DIR, metadata
+    assert metadata["paths"]["secret_vault_dir"] == a.SECRET_VAULT_DIR, metadata
+    assert a.path_is_within(metadata["paths"]["harness_dir"], a.SHUHENG_HOME), metadata
+    assert a.path_is_within(metadata["paths"]["subagents_dir"], a.SHUHENG_HOME), metadata
 
     context = service.handle({
         "action": "memory_context_get",
@@ -2964,7 +2988,7 @@ def assert_agent_create_respects_explicit_lifecycle_and_reuse_policy() -> None:
     assert "不要在示例、教程或解释中包含可执行 `<ga-control>` 标签" in a.TUI_AGENT_CONTROL_HINT
     assert "回复末尾隐藏块" in a.TUI_AGENT_CONTROL_HINT
     assert "secret_subagents" in a.TUI_AGENT_CONTROL_HINT
-    assert "memory/subagents/" in a.TUI_AGENT_CONTROL_HINT
+    assert "Shuheng `SUBAGENTS_DIR`" in a.TUI_AGENT_CONTROL_HINT
     assert "agent_list" in a.TUI_AGENT_CONTROL_HINT
     assert "task_get" in a.TUI_AGENT_CONTROL_HINT
     assert_retired_control_vocabulary_is_quarantined(state)

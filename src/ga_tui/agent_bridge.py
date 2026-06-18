@@ -92,10 +92,14 @@ def bridge_metadata(app: Any | None = None) -> dict[str, Any]:
         },
         "paths": {
             "root_dir": getattr(app, "ROOT_DIR", ""),
+            "shuheng_home": getattr(app, "SHUHENG_HOME", ""),
+            "shuheng_memory_dir": getattr(app, "SHUHENG_MEMORY_DIR", ""),
             "harness_dir": getattr(app, "AGENT_HARNESS_DIR", ""),
             "runtime_registry": getattr(app, "AGENT_RUNTIME_REGISTRY_PATH", ""),
             "memory_candidates": getattr(app, "AGENT_MEMORY_CANDIDATES_PATH", ""),
             "approvals": getattr(app, "AGENT_APPROVALS_PATH", ""),
+            "subagents_dir": getattr(app, "SUBAGENTS_DIR", ""),
+            "secret_vault_dir": getattr(app, "SECRET_VAULT_DIR", ""),
         },
         "policy": {
             "long_term_memory_write": "candidate_only",

@@ -47,7 +47,7 @@
 会话管理器 + 多 Agent 调度台 + 任务看板 + 记忆/审批治理层 + 自动化控制面板
 ```
 
-它负责让 OMP、GenericAgent、Codex、Claude Code 等本地 agent runtime 在终端中更可控、更耐用、更适合长任务；会话历史、命名、token usage 和侧栏 registry 默认由 Shuheng 自己维护在 `~/.shuheng`。
+它负责让 OMP、GenericAgent、Codex、Claude Code 等本地 agent runtime 在终端中更可控、更耐用、更适合长任务；会话历史、harness 账本、子 agent、Secret Vault 和 OMP 隔离运行时默认都由 Shuheng 自己维护在 `~/.shuheng`。
 
 > Runtimes execute. Shuheng governs the control surface.
 
@@ -368,10 +368,10 @@ shuheng-integration install-core-shim --root /path/to/GenericAgent --target tuia
 当前仍复用主项目中的核心模块：
 
 - `agentmain.py`：主 agent runtime。
-- `frontends/continue_cmd.py`：历史恢复和 transcript 解析，运行时会被 Shuheng 重定向到自己的历史目录。
+- `frontends/continue_cmd.py`：历史恢复和 transcript 解析，运行时会被 Shuheng 重定向到自己的 `~/.shuheng/model_responses`。
 - `frontends/session_names.py`：可选会话命名能力，运行时会被 Shuheng 重定向到自己的 `session_names.json`。
 
-这个边界让主项目可以继续跟随上游更新，TUI 可以独立测试、发布和演进。后续可以继续把这些依赖抽象成 adapter，让外置边界更干净。
+这个边界让主项目可以继续跟随上游更新，Shuheng 的会话、记忆、审批和运行时状态则独立存储和演进。后续可以继续把这些依赖抽象成 adapter，让外置边界更干净。
 
 ## 架构方向
 
