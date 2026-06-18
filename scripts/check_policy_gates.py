@@ -38,6 +38,7 @@ def retarget_harness(root: str) -> None:
     a.SESSION_META_PATH = os.path.join(a.MODEL_RESPONSES_DIR, "session_meta.json")
     a.L4_RAW_SESSIONS_DIR = os.path.join(root, "memory", "L4_raw_sessions")
     a.SESSION_TRASH_DIR = os.path.join(a.MODEL_RESPONSES_DIR, ".trash")
+    a.configure_frontend_history_storage()
     a.AGENT_HARNESS_DIR = os.path.join(root, "harness")
     a.AGENT_TASK_LEDGER_PATH = os.path.join(a.AGENT_HARNESS_DIR, "tasks.jsonl")
     a.AGENT_MAIL_PATH = os.path.join(a.AGENT_HARNESS_DIR, "messages.jsonl")
@@ -441,11 +442,31 @@ def assert_shuheng_brand_entrypoints() -> None:
     app_source = Path(a.__file__).read_text(encoding="utf-8")
     for forbidden in (
         "ga tui",
+        "GenericAgent stable TUI",
         "GenericAgent stable curses TUI",
     ):
         assert forbidden not in app_source, forbidden
     assert "已退出枢衡" in app_source, app_source
     assert "确认退出枢衡" in app_source, app_source
+
+
+def assert_shuheng_history_storage_owned() -> None:
+    expected_home = os.path.abspath(os.path.expanduser(os.environ.get("SHUHENG_HOME") or os.environ.get("GA_TUI_HOME") or "~/.shuheng"))
+    assert a.SHUHENG_HOME == expected_home, a.SHUHENG_HOME
+    assert a.path_is_within(a.MODEL_RESPONSES_DIR, a.SHUHENG_HOME), a.MODEL_RESPONSES_DIR
+    assert a.path_is_within(a.TOKEN_USAGE_PATH, a.SHUHENG_HOME), a.TOKEN_USAGE_PATH
+    assert a.path_is_within(a.SESSION_META_PATH, a.SHUHENG_HOME), a.SESSION_META_PATH
+    assert a.path_is_within(a.L4_RAW_SESSIONS_DIR, a.SHUHENG_HOME), a.L4_RAW_SESSIONS_DIR
+    assert a.path_is_within(a.SESSION_TRASH_DIR, a.SHUHENG_HOME), a.SESSION_TRASH_DIR
+    genericagent_history = os.path.join(a.ROOT_DIR, "temp", "model_responses")
+    assert not a.path_is_within(a.MODEL_RESPONSES_DIR, genericagent_history), a.MODEL_RESPONSES_DIR
+    assert a.continue_cmd_module._LOG_DIR == a.MODEL_RESPONSES_DIR
+    assert a.continue_cmd_module._LOG_GLOB == os.path.join(a.MODEL_RESPONSES_DIR, "model_responses_*.txt")
+    assert a.path_is_within(a.continue_cmd_module._ROUNDS_CACHE_PATH, a.SHUHENG_HOME), a.continue_cmd_module._ROUNDS_CACHE_PATH
+    if a.session_names is not None:
+        assert a.session_names._LOG_DIR == a.MODEL_RESPONSES_DIR
+        assert a.session_names._REG_PATH == os.path.join(a.MODEL_RESPONSES_DIR, "session_names.json")
+    assert "GenericAgent 的 model_responses" not in Path(a.__file__).read_text(encoding="utf-8")
 
 
 def assert_ohmypi_runtime_registry() -> None:
@@ -3285,6 +3306,7 @@ def assert_historical_subagent_result_quarantine_backfill() -> None:
     finally:
         a.MODEL_RESPONSES_DIR = old_model_dir
         a.SESSION_META_PATH = old_session_meta
+        a.configure_frontend_history_storage()
 
 
 def assert_recent_sessions_use_last_message_activity() -> None:
@@ -3655,11 +3677,47 @@ def assert_temp_session_is_non_persistent() -> None:
     assert os.path.basename(a.agent_log_path(state.agent)).startswith("model_responses_")
 
 
+def assert_new_agent_uses_shuheng_history_dir() -> None:
+    root = tempfile.mkdtemp(prefix="ga_tui_new_agent_history_")
+    retarget_harness(root)
+    old_registry = a.agent_runtime_registry
+
+    class FakeAdapter:
+        provider_id = "fake"
+
+        def create_agent(self) -> FakeLLMAgent:
+            return FakeLLMAgent()
+
+        def prepare_agent(self, agent: FakeLLMAgent, *, state=None) -> None:
+            del agent, state
+
+        def start_agent(self, agent: FakeLLMAgent, *, thread_name: str = "") -> None:
+            del agent, thread_name
+
+    def fake_registry(*, write_memory_prompt_file: bool = True) -> a.RuntimeRegistry:
+        del write_memory_prompt_file
+        registry = a.RuntimeRegistry(default_provider_id="fake")
+        registry.register(FakeAdapter())
+        return registry
+
+    try:
+        a.agent_runtime_registry = fake_registry
+        agent = a.new_agent()
+    finally:
+        a.agent_runtime_registry = old_registry
+    path = a.agent_log_path(agent)
+    assert a.path_is_within(path, a.MODEL_RESPONSES_DIR), path
+    assert os.path.basename(path).startswith("model_responses_"), path
+    assert agent.llmclient.log_path == path
+    assert agent.llmclient.backend.log_path == path
+
+
 def run_checks() -> None:
     assert_scheduler_module_boundary()
     assert_genericagent_provider_module_boundary()
     assert_ohmypi_provider_module_boundary()
     assert_shuheng_brand_entrypoints()
+    assert_shuheng_history_storage_owned()
     assert_ohmypi_runtime_registry()
     assert_ohmypi_memory_prompt_and_command()
     assert_ohmypi_rpc_command_discovers_user_bun_binary()
@@ -3700,6 +3758,7 @@ def run_checks() -> None:
     assert_self_intro_does_not_consume_mutual_chat_step()
     assert_control_result_continues_intermediate_workflow_step()
     assert_temp_session_is_non_persistent()
+    assert_new_agent_uses_shuheng_history_dir()
 
     root = tempfile.mkdtemp(prefix="ga_tui_policy_check_")
     retarget_harness(root)

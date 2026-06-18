@@ -1041,12 +1041,16 @@ At 08:00, scheduler writes scheduledtask.run.v1 starting, converts the schedule 
 ### 1. Scope / Trigger
 
 - Trigger: The TUI sidebar needs to show known history sessions even when the raw `model_responses*.txt` source file has been physically archived or is missing.
-- Applies to: `load_history()`, `cached_session_rows()`, `session_meta.json`, `session_names.json`, sidebar display, and history restore behavior.
-- Non-goal: This bridge must not unzip archives, reconstruct raw logs, or perform destructive filesystem changes.
+- Applies to: Shuheng history path selection, `load_history()`, `cached_session_rows()`, `continue_cmd`, `session_meta.json`, `session_names.json`, sidebar display, and history restore behavior.
+- Non-goal: This bridge must not migrate, unzip, or destructively modify legacy GenericAgent history files.
 
 ### 2. Signatures
 
-- Raw session rows are still read from `MODEL_RESPONSES_DIR/model_responses*.txt`.
+- Shuheng history home defaults to `~/.shuheng`; `SHUHENG_HOME` overrides it, and legacy internal `GA_TUI_HOME` remains an accepted override.
+- Raw session rows are read from `MODEL_RESPONSES_DIR/model_responses*.txt`, where `MODEL_RESPONSES_DIR` defaults to `~/.shuheng/model_responses`.
+- `session_meta.json`, `session_token_usage.json`, `.trash`, and `session_names.json` live under the Shuheng-owned history tree, not `GenericAgent/temp/model_responses`.
+- `continue_cmd` must be runtime-configured to use the same `MODEL_RESPONSES_DIR` and a Shuheng-owned rounds cache.
+- Missing-source archives live under `~/.shuheng/memory/L4_raw_sessions` by default.
 - Missing-source rows are synthesized from TUI metadata keys whose basename matches `model_responses*.txt` and whose source file is absent.
 - Missing-source metadata fields:
   - `source_missing:true`
@@ -1060,14 +1064,56 @@ At 08:00, scheduler writes scheduledtask.run.v1 starting, converts the schedule 
 - Physical archival must not remove a known sidebar row when TUI metadata still knows the session.
 - Missing-source rows may use metadata preview, description, rounds, last-user timestamp, and display name to remain visible.
 - Missing-source rows must not pretend to be normal raw sessions.
+- New main-agent sessions must bind their agent/client/backend log path to the Shuheng-owned `MODEL_RESPONSES_DIR` before runtime work starts.
+- Session naming must persist through the same Shuheng-owned `session_names.json` registry; it must not use GenericAgent's default `frontends/session_names.py` storage path.
 - `restore_history()` must refuse direct restore when the source path is absent and must leave the active runtime untouched.
 - When a raw source file reappears, cached raw-session processing clears missing-source markers.
 
-### 4. Tests Required
+### 4. Validation & Error Matrix
 
+- Default import with no env override -> `MODEL_RESPONSES_DIR` is `~/.shuheng/model_responses`.
+- `SHUHENG_HOME=/tmp/shuheng-home` before import -> Shuheng history paths derive from `/tmp/shuheng-home`.
+- `GA_TUI_HOME=/tmp/compat-home` before import and no `SHUHENG_HOME` -> Shuheng history paths derive from `/tmp/compat-home`.
+- `continue_cmd` import -> `_LOG_DIR`, `_LOG_GLOB`, and `_ROUNDS_CACHE_PATH` are retargeted to the Shuheng-owned history tree.
+- `session_names` import -> `_LOG_DIR` and `_REG_PATH` are retargeted to the active Shuheng-owned `MODEL_RESPONSES_DIR`.
+- New main runtime agent -> agent, LLM client, and backend `log_path` all point at a normal `model_responses_*.txt` file under `MODEL_RESPONSES_DIR`.
+- Missing-source row restore without an L4 match -> user-visible restore error and no active runtime log-path switch.
+- Missing-source row restore with an L4 match -> source file is reconstructed under `MODEL_RESPONSES_DIR` and normal restore continues.
+
+### 5. Good/Base/Bad Cases
+
+- Good: A fresh `shuheng` launch creates and reads sidebar history from `~/.shuheng/model_responses` and leaves `/home/vimalinx/Programs/GenericAgent/temp/model_responses` untouched.
+- Good: `/rename`, AI title jobs, `/continue` parsing, and cached round counts all use Shuheng-owned sidecars.
+- Base: The GenericAgent checkout still supplies `continue_cmd.py` and `session_names.py` code, but their storage globals are retargeted at runtime.
+- Base: Test harnesses may retarget `MODEL_RESPONSES_DIR` to a temp directory, but must call `configure_frontend_history_storage()` after changing the path constants.
+- Bad: Editing only `MODEL_RESPONSES_DIR` while leaving `continue_cmd._LOG_DIR` or `session_names._REG_PATH` on GenericAgent's default directory.
+- Bad: Migrating, deleting, or mutating old GenericAgent history files without an explicit migration task.
+- Bad: Moving task ledgers, approvals, subagent homes, or isolated OMP runtime config as part of a session-history-only task.
+
+### 6. Tests Required
+
+- `scripts/check_policy_gates.py` must assert default session history paths are inside Shuheng home and not inside `GenericAgent/temp/model_responses`.
+- Tests must assert `continue_cmd` and `session_names` are retargeted to the active `MODEL_RESPONSES_DIR`.
+- Tests must assert `new_agent()` starts with a normal `model_responses_*.txt` log path under the active Shuheng history directory.
 - `scripts/check_policy_gates.py` must assert `load_history()` includes a missing-source row from `session_meta.json`.
 - Tests must assert the row is marked `source_missing:true` and `archive_backed:true`.
 - Tests must assert direct restore of a missing-source row reports a clear error and does not bind the active agent log path to the missing file.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```python
+MODEL_RESPONSES_DIR = os.path.join(ROOT_DIR, "temp", "model_responses")
+```
+
+#### Correct
+
+```python
+SHUHENG_HOME = default_shuheng_home()
+MODEL_RESPONSES_DIR = os.path.join(SHUHENG_HOME, "model_responses")
+configure_frontend_history_storage()
+```
 
 ## Scenario: Temporary Non-Persistent Main Sessions
 
@@ -1091,7 +1137,7 @@ At 08:00, scheduler writes scheduledtask.run.v1 starting, converts the schedule 
 - Temporary sessions must not write `session_meta.json`, session names, automatic title/description/category metadata, durable UI system messages, token usage registry rows, memory candidates, or direct subagent memory updates.
 - If a normal task is running, `/temp` may park it as a background session and then open a temporary active session.
 - If a temporary session is parked in the background and later restored, it remains temporary and keeps `os.devnull` as its backend log path.
-- `/new` exits temporary mode and creates a normal persistent session log path.
+- `/new` exits temporary mode and creates a normal persistent session log path under the Shuheng-owned `MODEL_RESPONSES_DIR`.
 - Secret Vault mode blocks `/temp`; the user must lock Secret Vault before opening a normal temporary session.
 
 ### 4. Validation & Error Matrix

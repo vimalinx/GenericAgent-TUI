@@ -1,4 +1,4 @@
-"""Stable curses TUI for GenericAgent.
+"""Stable curses TUI for Shuheng.
 
 This intentionally avoids Textual's any-motion mouse mode, which can leak
 SGR mouse packets into the input stream on some terminal/Wayland combinations.
@@ -239,10 +239,19 @@ def find_genericagent_root() -> str:
 
 ROOT_DIR = find_genericagent_root()
 FRONTENDS_DIR = os.path.join(ROOT_DIR, "frontends")
-MODEL_RESPONSES_DIR = os.path.join(ROOT_DIR, "temp", "model_responses")
+
+
+def default_shuheng_home() -> str:
+    return os.path.abspath(os.path.expanduser(os.environ.get("SHUHENG_HOME") or os.environ.get("GA_TUI_HOME") or "~/.shuheng"))
+
+
+SHUHENG_HOME = default_shuheng_home()
+SHUHENG_LOG_DIR = os.path.join(SHUHENG_HOME, "logs")
+SHUHENG_LOG_PATH = os.path.join(SHUHENG_LOG_DIR, "shuheng.log")
+MODEL_RESPONSES_DIR = os.path.join(SHUHENG_HOME, "model_responses")
 TOKEN_USAGE_PATH = os.path.join(MODEL_RESPONSES_DIR, "session_token_usage.json")
 SESSION_META_PATH = os.path.join(MODEL_RESPONSES_DIR, "session_meta.json")
-L4_RAW_SESSIONS_DIR = os.path.join(ROOT_DIR, "memory", "L4_raw_sessions")
+L4_RAW_SESSIONS_DIR = os.path.join(SHUHENG_HOME, "memory", "L4_raw_sessions")
 UI_DURABLE_SYSTEM_MESSAGES_KEY = "ui_durable_system_messages"
 UI_DURABLE_SYSTEM_MESSAGE_LIMIT = 200
 SUBAGENT_CONTEXT_REPLY_LIMIT = 2200
@@ -314,6 +323,7 @@ for path in (ROOT_DIR, FRONTENDS_DIR):
 import agentmain
 from agent_loop import StepOutcome
 from agentmain import GenericAgent
+import continue_cmd as continue_cmd_module
 from continue_cmd import (
     _format_response_segment,
     _pairs,
@@ -329,6 +339,27 @@ try:
     import session_names
 except Exception:
     session_names = None
+
+
+def configure_frontend_history_storage() -> None:
+    history_state_root = os.path.dirname(os.path.abspath(os.path.expanduser(MODEL_RESPONSES_DIR))) or SHUHENG_HOME
+    try:
+        continue_cmd_module._LOG_DIR = MODEL_RESPONSES_DIR
+        continue_cmd_module._LOG_GLOB = os.path.join(MODEL_RESPONSES_DIR, "model_responses_*.txt")
+        continue_cmd_module._ROUNDS_CACHE_PATH = os.path.join(history_state_root, "continue_rounds_cache.json")
+        continue_cmd_module._rounds_cache = None
+        continue_cmd_module._rounds_cache_dirty = False
+    except Exception:
+        pass
+    if session_names is not None:
+        try:
+            session_names._LOG_DIR = MODEL_RESPONSES_DIR
+            session_names._REG_PATH = os.path.join(MODEL_RESPONSES_DIR, "session_names.json")
+        except Exception:
+            pass
+
+
+configure_frontend_history_storage()
 
 try:
     import cost_tracker
@@ -9013,13 +9044,14 @@ def install_subagent_prompt(agent: Any, sub: SubAgentRuntime) -> None:
 
 def ensure_subagent_agent(state: State, sub: SubAgentRuntime) -> Any:
     if sub.agent is None:
-        sub.agent = new_agent()
-        install_interaction_hook(state, sub.agent)
         if sub.security_context == "secret":
-            set_agent_log_path(sub.agent, os.devnull)
+            target_log_path = os.devnull
         else:
             os.makedirs(sub.home, exist_ok=True)
-            set_agent_log_path(sub.agent, os.path.join(sub.home, "model_responses.txt"))
+            target_log_path = os.path.join(sub.home, "model_responses.txt")
+        sub.agent = new_agent(log_path=target_log_path)
+        install_interaction_hook(state, sub.agent)
+        set_agent_log_path(sub.agent, target_log_path)
         if sub.messages:
             restore_backend_from_secret_messages(sub.agent, sub.messages)
         bind_agent_token_session(state, sub.agent)
@@ -11890,7 +11922,7 @@ def browse_input_history(state: State, direction: int) -> bool:
     return True
 
 
-def new_agent() -> Any:
+def new_agent(log_path: Optional[str] = None) -> Any:
     adapter = agent_runtime_registry().default()
     agent = adapter.create_agent()
     try:
@@ -11900,7 +11932,10 @@ def new_agent() -> Any:
     agent_no = next(_AGENT_COUNTER)
     thread_name = f"ga-tui-agent-{agent_no}"
     adapter.prepare_agent(agent)
+    target_log_path = log_path or new_session_log_path()
+    set_agent_log_path(agent, target_log_path)
     adapter.start_agent(agent, thread_name=thread_name)
+    set_agent_log_path(agent, target_log_path)
     return agent
 
 
@@ -22321,8 +22356,8 @@ def read_terminal_key(stdscr):
 
 
 def run(stdscr) -> dict[str, Any]:
-    os.makedirs(os.path.join(ROOT_DIR, "temp"), exist_ok=True)
-    log_path = os.path.join(ROOT_DIR, "temp", "shuheng.log")
+    os.makedirs(SHUHENG_LOG_DIR, exist_ok=True)
+    log_path = SHUHENG_LOG_PATH
     old_stdout, old_stderr = sys.stdout, sys.stderr
     stdio_log = open(log_path, "a", encoding="utf-8", buffering=1)
     stdio_log.write(f"\n--- Shuheng {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
@@ -22347,7 +22382,7 @@ def run(stdscr) -> dict[str, Any]:
         load_subagents(state)
         if load_history(state, force=True):
             state.dirty = True
-        add_system(state, "GenericAgent stable TUI. 左侧每一项是会话，点击历史会话恢复，输入 / 可选命令补全。")
+        add_system(state, "Shuheng stable TUI. 左侧每一项是会话，点击历史会话恢复，输入 / 可选命令补全。")
         next_history_refresh = time.monotonic() + 30
         next_token_persist = time.monotonic() + 10
         next_clock_refresh = time.monotonic() + 1
@@ -22432,9 +22467,10 @@ def wait_for_unfinished_tasks_after_tui(state: Optional[State]) -> None:
     if not labels:
         return
     print(f"枢衡已关闭；等待 {len(labels)} 个未完成任务跑完。")
-    print("日志继续写入 GenericAgent 的 model_responses；任务完成后进程会自动退出。")
+    print(f"日志继续写入 Shuheng 历史目录：{MODEL_RESPONSES_DIR}；任务完成后进程会自动退出。")
     old_stdout, old_stderr = sys.stdout, sys.stderr
-    log_path = os.path.join(ROOT_DIR, "temp", "shuheng.log")
+    os.makedirs(SHUHENG_LOG_DIR, exist_ok=True)
+    log_path = SHUHENG_LOG_PATH
     wait_log = open(log_path, "a", encoding="utf-8", buffering=1)
     wait_log.write(f"\n--- Shuheng background wait {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
     sys.stdout = wait_log
