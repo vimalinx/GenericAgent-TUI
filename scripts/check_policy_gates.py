@@ -496,13 +496,11 @@ def assert_shuheng_history_storage_owned() -> None:
 def assert_shuheng_workspace_memory_context() -> None:
     root = tempfile.mkdtemp(prefix="ga_tui_workspaces_")
     retarget_harness(root)
-    state = a.State(agent=FakeLLMAgent())
-    pack_without, _ref_without = a.build_main_runtime_context_pack(state, "read project memory", "task_workspace_none")
-    assert pack_without["workspace_context"]["included"] is False, pack_without["workspace_context"]
-    assert "No Shuheng workspace is manually selected" in pack_without["workspace_context"]["reason"], pack_without["workspace_context"]
-    assert any(row.get("scope") == "workspace.project" for row in pack_without["memory_pack"]["excluded"]), pack_without["memory_pack"]
-    prompt_without = a.format_context_pack_for_prompt(pack_without)
-    assert "Workspace context:" in prompt_without and "none" in prompt_without, prompt_without
+    old_cwd = os.getcwd()
+    project_root = os.path.join(root, "Project Alpha")
+    project_child = os.path.join(project_root, "nested")
+    os.makedirs(os.path.join(project_root, ".git"), exist_ok=True)
+    os.makedirs(project_child, exist_ok=True)
 
     os.makedirs(a.L4_RAW_SESSIONS_DIR, exist_ok=True)
     archive_path = os.path.join(a.L4_RAW_SESSIONS_DIR, "2026-06.zip")
@@ -510,50 +508,59 @@ def assert_shuheng_workspace_memory_context() -> None:
         zf.writestr("0619_1200-session.txt", "archived session")
     before = Path(archive_path).read_bytes()
 
-    manifest = a.create_workspace("Demo Project", "workspace memory test")
-    assert manifest["workspace_id"] == "demo-project", manifest
-    assert a.selected_workspace_id() == "", a.selected_workspace_id()
-    selected = a.set_selected_workspace(manifest["workspace_id"])
-    assert selected["workspace_id"] == manifest["workspace_id"], selected
-    assert a.selected_workspace_id() == manifest["workspace_id"], a.selected_workspace_id()
-    assert any(row[0] == "/workspace" for row in a.command_matches("/work", state)), a.command_matches("/work", state)
-    assert any(row[0] == "/workspace select demo-project" for row in a.command_matches("/workspace select d", state)), a.command_matches("/workspace select d", state)
-    assert a.handle_workspace_command(state, "/workspace current") is True
-    assert a.handle_workspace_command(state, "/workspace list") is True
-    a.write_text_atomic(a.workspace_memory_path(manifest["workspace_id"]), "# Demo Project\n\nUse this project-specific fact.\n")
+    try:
+        os.chdir(project_child)
+        state = a.State(agent=FakeLLMAgent())
+        expected_id = a.workspace_id_for_root(project_root)
+        assert a.current_workspace_root() == project_root, a.current_workspace_root()
+        assert not os.path.exists(a.SHUHENG_WORKSPACE_STATE_PATH)
 
-    pack_with, _ref_with = a.build_main_runtime_context_pack(state, "use project memory", "task_workspace_selected")
-    assert pack_with["workspace_context"]["included"] is True, pack_with["workspace_context"]
-    assert pack_with["workspace_context"]["workspace"]["workspace_id"] == manifest["workspace_id"], pack_with["workspace_context"]
-    assert "Use this project-specific fact." in str(pack_with["layers"]["L2_project_memory"]["items"]), pack_with["layers"]["L2_project_memory"]
-    workspace_memory_entries = [row for row in pack_with["memory_pack"]["included"] if row.get("scope") == "workspace.project"]
-    assert workspace_memory_entries, pack_with["memory_pack"]
-    assert workspace_memory_entries[-1]["refs"], workspace_memory_entries[-1]
-    l4_index = a.read_json_dict_file(a.workspace_l4_index_path(manifest["workspace_id"]))
-    assert l4_index["refs_count"] == 1, l4_index
-    assert l4_index["refs"][0]["ref"] == "l4://2026-06.zip/0619_1200-session.txt", l4_index
-    assert Path(archive_path).read_bytes() == before, "L4 indexing must not rewrite archive content"
+        pack, _context_ref = a.build_main_runtime_context_pack(state, "read project memory", "task_workspace_auto")
+        assert pack["workspace_context"]["included"] is True, pack["workspace_context"]
+        assert pack["workspace_context"]["workspace"]["workspace_id"] == expected_id, pack["workspace_context"]
+        assert pack["workspace_context"]["workspace"]["selection_mode"] == "auto", pack["workspace_context"]
+        assert project_root in pack["workspace_context"]["workspace"]["root_aliases"], pack["workspace_context"]
+        prompt = a.format_context_pack_for_prompt(pack)
+        assert "Workspace context:" in prompt and expected_id in prompt, prompt
 
-    inventory = a.memory_inventory()
-    workspace_entries = [row for row in inventory if row.layer == "Workspace"]
-    assert any(row.label.endswith("manifest.json") for row in workspace_entries), workspace_entries
-    assert any(row.label.endswith("memory.md") for row in workspace_entries), workspace_entries
+        state_file = a.read_json_dict_file(a.SHUHENG_WORKSPACE_STATE_PATH)
+        assert state_file["active_workspace_id"] == expected_id, state_file
+        assert state_file["selection_mode"] == "auto", state_file
+        manifest = a.load_workspace_manifest(expected_id)
+        assert manifest["selection_mode"] == "auto", manifest
+        assert project_root in manifest["root_aliases"], manifest
+        a.write_text_atomic(a.workspace_memory_path(expected_id), "# Project Alpha\n\nUse this auto project fact.\n")
 
-    a.clear_selected_workspace()
-    assert a.selected_workspace_id() == "", a.selected_workspace_id()
-    pack_cleared, _ref_cleared = a.build_main_runtime_context_pack(state, "cleared", "task_workspace_cleared")
-    assert pack_cleared["workspace_context"]["included"] is False, pack_cleared["workspace_context"]
-    a.write_text_atomic(
-        a.SHUHENG_WORKSPACE_STATE_PATH,
-        json.dumps({
-            "schema_version": "shuheng.workspace_state.v1",
-            "active_workspace_id": "missing-workspace",
-            "selection_mode": "manual",
-        }, ensure_ascii=False),
-    )
-    pack_missing, _ref_missing = a.build_main_runtime_context_pack(state, "missing", "task_workspace_missing")
-    assert pack_missing["workspace_context"]["included"] is False, pack_missing["workspace_context"]
-    assert "manifest is missing" in pack_missing["workspace_context"]["reason"], pack_missing["workspace_context"]
+        pack_with_memory, _ref_with_memory = a.build_main_runtime_context_pack(state, "use project memory", "task_workspace_auto_memory")
+        assert "Use this auto project fact." in str(pack_with_memory["layers"]["L2_project_memory"]["items"]), pack_with_memory["layers"]["L2_project_memory"]
+        workspace_memory_entries = [row for row in pack_with_memory["memory_pack"]["included"] if row.get("scope") == "workspace.project"]
+        assert workspace_memory_entries, pack_with_memory["memory_pack"]
+        assert workspace_memory_entries[-1]["refs"], workspace_memory_entries[-1]
+
+        l4_index = a.read_json_dict_file(a.workspace_l4_index_path(expected_id))
+        assert l4_index["refs_count"] == 1, l4_index
+        assert l4_index["refs"][0]["ref"] == "l4://2026-06.zip/0619_1200-session.txt", l4_index
+        assert Path(archive_path).read_bytes() == before, "L4 indexing must not rewrite archive content"
+
+        assert any(row[0] == "/workspace" for row in a.command_matches("/work", state)), a.command_matches("/work", state)
+        assert any(row[0] == "/workspace refresh" for row in a.command_matches("/workspace r", state)), a.command_matches("/workspace r", state)
+        assert not any("select" in row[0] for row in a.command_matches("/workspace s", state)), a.command_matches("/workspace s", state)
+        assert a.handle_workspace_command(state, "/workspace current") is True
+        assert a.handle_workspace_command(state, "/workspace list") is True
+        assert a.handle_workspace_command(state, "/workspace refresh") is True
+
+        inventory = a.memory_inventory()
+        workspace_entries = [row for row in inventory if row.layer == "Workspace"]
+        assert any(row.label.endswith("manifest.json") for row in workspace_entries), workspace_entries
+        assert any(row.label.endswith("memory.md") for row in workspace_entries), workspace_entries
+
+        secret_state = a.State(agent=FakeLLMAgent())
+        secret_state.secret_vault.unlocked = True
+        secret_pack, _secret_ref = a.build_main_runtime_context_pack(secret_state, "secret", "task_workspace_secret")
+        assert secret_pack["workspace_context"]["included"] is False, secret_pack["workspace_context"]
+        assert "Secret context" in secret_pack["workspace_context"]["reason"], secret_pack["workspace_context"]
+    finally:
+        os.chdir(old_cwd)
 
 
 def assert_shuheng_bootstraps_legacy_state_without_mutating_source() -> None:

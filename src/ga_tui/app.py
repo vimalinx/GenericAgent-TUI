@@ -1969,6 +1969,13 @@ def workspace_slug(value: str) -> str:
     return slug or "workspace"
 
 
+def workspace_id_for_root(root: str) -> str:
+    normalized = os.path.abspath(os.path.expanduser(root or os.getcwd()))
+    slug = workspace_slug(os.path.basename(normalized.rstrip(os.sep)) or "workspace")
+    digest = hashlib.sha1(normalized.encode("utf-8", errors="replace")).hexdigest()[:8]
+    return f"{slug}-{digest}"
+
+
 def workspace_dir(workspace_id: str) -> str:
     workspace_id = normalized_workspace_id(workspace_id)
     return os.path.join(SHUHENG_WORKSPACES_DIR, workspace_id)
@@ -2027,61 +2034,35 @@ def list_workspaces() -> list[dict[str, Any]]:
     return rows
 
 
-def active_workspace_id_from_state() -> str:
-    state = read_json_dict_file(SHUHENG_WORKSPACE_STATE_PATH)
-    return normalized_workspace_id(str(state.get("active_workspace_id") or ""))
+def git_workspace_root(path: str) -> str:
+    start = os.path.abspath(os.path.expanduser(path or os.getcwd()))
+    try:
+        result = subprocess.run(
+            ["git", "-C", start, "rev-parse", "--show-toplevel"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2,
+        )
+        root = (result.stdout or "").strip()
+        if result.returncode == 0 and root:
+            return os.path.abspath(root)
+    except Exception:
+        pass
+    current = start if os.path.isdir(start) else os.path.dirname(start)
+    while current:
+        if os.path.exists(os.path.join(current, ".git")):
+            return current
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+    return start
 
 
-def selected_workspace_id() -> str:
-    workspace_id = active_workspace_id_from_state()
-    if workspace_id and load_workspace_manifest(workspace_id):
-        return workspace_id
-    return ""
-
-
-def selected_workspace_manifest() -> dict[str, Any]:
-    workspace_id = selected_workspace_id()
-    return load_workspace_manifest(workspace_id) if workspace_id else {}
-
-
-def set_selected_workspace(workspace_id: str) -> dict[str, Any]:
-    manifest = load_workspace_manifest(workspace_id)
-    if not manifest:
-        raise ValueError(f"workspace not found: {workspace_id}")
-    state = {
-        "schema_version": "shuheng.workspace_state.v1",
-        "active_workspace_id": manifest["workspace_id"],
-        "selected_at": now_iso(),
-        "selection_mode": "manual",
-    }
-    write_text_atomic(SHUHENG_WORKSPACE_STATE_PATH, json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
-    return manifest
-
-
-def clear_selected_workspace() -> None:
-    state = {
-        "schema_version": "shuheng.workspace_state.v1",
-        "active_workspace_id": "",
-        "selected_at": now_iso(),
-        "selection_mode": "manual",
-    }
-    write_text_atomic(SHUHENG_WORKSPACE_STATE_PATH, json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
-
-
-def resolve_workspace(query: str) -> Optional[dict[str, Any]]:
-    needle = (query or "").strip()
-    if not needle:
-        return None
-    normalized = normalized_workspace_id(needle)
-    direct = load_workspace_manifest(normalized)
-    if direct:
-        return direct
-    lowered = needle.lower()
-    matches = [
-        row for row in list_workspaces()
-        if str(row.get("name") or "").lower() == lowered or str(row.get("workspace_id") or "").lower().startswith(lowered)
-    ]
-    return matches[0] if len(matches) == 1 else None
+def current_workspace_root() -> str:
+    return git_workspace_root(os.getcwd())
 
 
 def l4_zip_member_modified_at(info: zipfile.ZipInfo) -> str:
@@ -2135,11 +2116,19 @@ def refresh_workspace_l4_index(workspace_id: str) -> dict[str, Any]:
     return data
 
 
-def create_workspace(name: str, description: str = "") -> dict[str, Any]:
+def create_workspace(
+    name: str,
+    description: str = "",
+    *,
+    workspace_id: str = "",
+    root_aliases: Optional[list[str]] = None,
+    source: str = "auto.cwd_git_root",
+) -> dict[str, Any]:
     clean_name = clean_text(name).strip() or "Workspace"
-    workspace_id = unique_workspace_id(clean_name)
+    workspace_id = normalized_workspace_id(workspace_id) or unique_workspace_id(clean_name)
     directory = workspace_dir(workspace_id)
     now = now_iso()
+    aliases = [os.path.abspath(os.path.expanduser(item)) for item in (root_aliases or []) if str(item or "").strip()]
     manifest = {
         "schema_version": "shuheng.workspace.v1",
         "workspace_id": workspace_id,
@@ -2147,22 +2136,73 @@ def create_workspace(name: str, description: str = "") -> dict[str, Any]:
         "description": clean_text(description).strip(),
         "created_at": now,
         "updated_at": now,
-        "selection_mode": "manual",
+        "selection_mode": "auto",
         "workspace_dir": directory,
         "memory_path": workspace_memory_path(workspace_id),
         "index_path": workspace_index_path(workspace_id),
         "l4_index_path": workspace_l4_index_path(workspace_id),
-        "root_aliases": [],
-        "source": "tui.slash_command",
+        "root_aliases": aliases,
+        "source": source,
     }
     os.makedirs(directory, exist_ok=True)
     write_text_atomic(workspace_manifest_path(workspace_id), json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
     if not os.path.exists(workspace_memory_path(workspace_id)):
         write_text_atomic(
             workspace_memory_path(workspace_id),
-            f"# {clean_name}\n\nThis workspace memory is manually selected by Shuheng before context hydration.\n",
+            f"# {clean_name}\n\nThis workspace memory is automatically inferred by Shuheng before context hydration.\n",
         )
     build_workspace_index(workspace_id)
+    return manifest
+
+
+def write_auto_workspace_state(manifest: dict[str, Any], root: str) -> None:
+    state = {
+        "schema_version": "shuheng.workspace_state.v1",
+        "active_workspace_id": manifest.get("workspace_id", ""),
+        "workspace_root": root,
+        "detected_at": now_iso(),
+        "selection_mode": "auto",
+        "source": "auto.cwd_git_root",
+    }
+    write_text_atomic(SHUHENG_WORKSPACE_STATE_PATH, json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+
+
+def ensure_auto_workspace(root: str = "") -> dict[str, Any]:
+    workspace_root = os.path.abspath(os.path.expanduser(root or current_workspace_root()))
+    workspace_id = workspace_id_for_root(workspace_root)
+    name = os.path.basename(workspace_root.rstrip(os.sep)) or "Workspace"
+    manifest = load_workspace_manifest(workspace_id)
+    if not manifest:
+        manifest = create_workspace(
+            name,
+            f"Auto workspace for {workspace_root}",
+            workspace_id=workspace_id,
+            root_aliases=[workspace_root],
+            source="auto.cwd_git_root",
+        )
+    else:
+        aliases = list(manifest.get("root_aliases") or [])
+        if workspace_root not in aliases:
+            aliases.append(workspace_root)
+        manifest.update({
+            "name": manifest.get("name") or name,
+            "updated_at": now_iso(),
+            "selection_mode": "auto",
+            "source": manifest.get("source") or "auto.cwd_git_root",
+            "root_aliases": aliases,
+            "workspace_dir": workspace_dir(workspace_id),
+            "memory_path": workspace_memory_path(workspace_id),
+            "index_path": workspace_index_path(workspace_id),
+            "l4_index_path": workspace_l4_index_path(workspace_id),
+        })
+        write_text_atomic(workspace_manifest_path(workspace_id), json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        if not os.path.exists(workspace_memory_path(workspace_id)):
+            write_text_atomic(
+                workspace_memory_path(workspace_id),
+                f"# {manifest.get('name') or name}\n\nThis workspace memory is automatically inferred by Shuheng before context hydration.\n",
+            )
+        build_workspace_index(workspace_id)
+    write_auto_workspace_state(manifest, workspace_root)
     return manifest
 
 
@@ -2196,8 +2236,9 @@ def build_workspace_index(workspace_id: str) -> dict[str, Any]:
         "workspace": {
             "workspace_id": workspace_id,
             "name": manifest.get("name", workspace_id),
-            "selection_mode": "manual",
+            "selection_mode": manifest.get("selection_mode") or "auto",
             "manifest_path": workspace_manifest_path(workspace_id),
+            "root_aliases": list(manifest.get("root_aliases") or []),
         },
         "memory_files": memory_files,
         "l4": {
@@ -2226,20 +2267,21 @@ def workspace_context_payload(*, security_context: str = "standard") -> dict[str
             "items": [],
             "refs": [],
         }
-    workspace_id = active_workspace_id_from_state()
-    if not workspace_id:
+    try:
+        manifest = ensure_auto_workspace()
+    except Exception as exc:
         return {
             "included": False,
-            "reason": "No Shuheng workspace is manually selected.",
+            "reason": f"Unable to infer Shuheng workspace: {type(exc).__name__}: {exc}",
             "workspace": None,
             "items": [],
             "refs": [],
         }
-    manifest = load_workspace_manifest(workspace_id)
+    workspace_id = str(manifest.get("workspace_id") or "")
     if not manifest:
         return {
             "included": False,
-            "reason": "Selected Shuheng workspace manifest is missing.",
+            "reason": "Unable to infer Shuheng workspace.",
             "workspace": {"workspace_id": workspace_id},
             "items": [],
             "refs": [],
@@ -2251,12 +2293,13 @@ def workspace_context_payload(*, security_context: str = "standard") -> dict[str
     refs = [workspace_manifest_path(workspace_id), workspace_memory_path(workspace_id), workspace_index_path(workspace_id), workspace_l4_index_path(workspace_id)]
     return {
         "included": True,
-        "reason": "Manual Shuheng workspace is selected for this context pack.",
+        "reason": "Automatic Shuheng workspace is inferred for this context pack.",
         "workspace": {
             "workspace_id": workspace_id,
             "name": manifest.get("name", workspace_id),
             "description": manifest.get("description", ""),
-            "selection_mode": "manual",
+            "selection_mode": "auto",
+            "root_aliases": list(manifest.get("root_aliases") or []),
         },
         "items": memory_items or ["(workspace memory is empty)"],
         "refs": refs,
@@ -5735,7 +5778,7 @@ def memory_hydration_pack(
         workspace_items.append(f"L4 cold archive refs indexed: {int(l4.get('refs_count') or 0)}")
         included.append({
             "scope": "workspace.project",
-            "reason": "Manual Shuheng workspace selection hydrates project-scoped memory.",
+            "reason": "Automatic Shuheng workspace inference hydrates project-scoped memory.",
             "items": workspace_items,
             "refs": [str(ref) for ref in (workspace_context.get("refs") or []) if ref],
         })
@@ -5759,7 +5802,7 @@ def memory_hydration_pack(
             {"scope": "unrelated_project_memory", "reason": "Avoid context pollution across unrelated projects."},
             {
                 "scope": "workspace.project",
-                "reason": str(workspace_context.get("reason") or "Workspace memory is included only after manual selection."),
+                "reason": str(workspace_context.get("reason") or "Workspace memory is included after automatic inference."),
             } if not workspace_context.get("included") else {},
             {"scope": "secrets", "reason": "No secret access without an explicit approval gate."},
         ],
@@ -13610,10 +13653,8 @@ AGENT_SUBCOMMANDS_REQUIRING_AGENT = {
 AGENT_SUBCOMMANDS_SEND_AFTER_AGENT = {"memory", "profile", "info", "settings", "model", "stop", "delete"}
 WORKSPACE_SUBCOMMANDS: list[tuple[str, str, str, bool]] = [
     ("list", "", "列出工作区", True),
-    ("current", "", "显示当前工作区", True),
-    ("new", "<name> [| description]", "创建并选择工作区", False),
-    ("select", "<workspace>", "选择工作区", False),
-    ("clear", "", "清除当前选择", True),
+    ("current", "", "显示自动推断的当前工作区", True),
+    ("refresh", "", "刷新自动工作区索引", True),
 ]
 
 
@@ -13746,19 +13787,7 @@ def workspace_command_matches(text: str) -> list[tuple[str, str, str, bool]]:
             for cmd, args, desc, sendable in WORKSPACE_SUBCOMMANDS
             if cmd.startswith(sub_prefix)
         ]
-    if sub_prefix not in {"select", "use", "switch"}:
-        return []
-    if len(parts) > 2:
-        return []
-    target_prefix = parts[1].lower() if len(parts) == 2 else ""
-    rows: list[tuple[str, str, str, bool]] = []
-    for workspace in list_workspaces():
-        workspace_id = str(workspace.get("workspace_id") or "")
-        name = str(workspace.get("name") or workspace_id)
-        if target_prefix and not (workspace_id.lower().startswith(target_prefix) or name.lower().startswith(target_prefix)):
-            continue
-        rows.append((f"/workspace select {workspace_id}", "", name, True))
-    return rows
+    return []
 
 
 def approval_command_matches(text: str, state: Optional[State] = None) -> list[tuple[str, str, str, bool]]:
@@ -20255,18 +20284,15 @@ def apply_subagent_control(
 
 
 def format_current_workspace() -> str:
-    manifest = selected_workspace_manifest()
-    if not manifest:
-        return (
-            "当前没有选择 Shuheng 工作区。\n"
-            "用法：/workspace new <name> 或 /workspace select <workspace_id|name>"
-        )
+    root = current_workspace_root()
+    manifest = ensure_auto_workspace(root)
     index = build_workspace_index(str(manifest.get("workspace_id") or ""))
     l4 = index.get("l4") or {}
     return (
-        "当前 Shuheng 工作区：\n"
+        "当前自动 Shuheng 工作区：\n"
         f"- id: {manifest.get('workspace_id')}\n"
         f"- name: {manifest.get('name')}\n"
+        f"- root: {root}\n"
         f"- memory: {manifest.get('memory_path')}\n"
         f"- index: {manifest.get('index_path')}\n"
         f"- L4 refs: {int(l4.get('refs_count') or 0)}"
@@ -20275,19 +20301,19 @@ def format_current_workspace() -> str:
 
 def format_workspace_list() -> str:
     rows = list_workspaces()
-    active = selected_workspace_id()
+    current_id = workspace_id_for_root(current_workspace_root())
     if not rows:
         return (
             "还没有 Shuheng 工作区。\n"
-            "用法：/workspace new <name> 创建并选择一个工作区。"
+            "用法：/workspace refresh 自动创建当前工作区。"
         )
-    lines = [f"Shuheng 工作区（当前: {active or '未选择'}）："]
+    lines = [f"Shuheng 工作区（当前自动推断: {current_id}）："]
     for row in rows:
-        marker = "*" if row.get("workspace_id") == active else " "
+        marker = "*" if row.get("workspace_id") == current_id else " "
         desc = str(row.get("description") or "").strip()
         suffix = f" - {desc}" if desc else ""
         lines.append(f"{marker} {row.get('workspace_id')} · {row.get('name')}{suffix}")
-    lines.append("用法：/workspace select <workspace_id|name>；/workspace current；/workspace clear")
+    lines.append("用法：/workspace current；/workspace refresh；/workspace list")
     return "\n".join(lines)
 
 
@@ -20302,43 +20328,14 @@ def handle_workspace_command(state: State, text: str) -> bool:
     if arg.lower() in {"current", "show", "status"}:
         add_system(state, format_current_workspace())
         return True
-    if arg.lower() in {"clear", "none", "off"}:
-        clear_selected_workspace()
-        add_system(state, "已清除当前 Shuheng 工作区；后续 context pack 不会注入项目工作区记忆。")
-        return True
-    new_match = re.match(r"^(?:new|create)\s+(.+)$", arg, re.I | re.S)
-    if new_match:
-        payload = new_match.group(1).strip()
-        if not payload:
-            add_system(state, "用法：/workspace new <name> [| description]")
-            return True
-        if "|" in payload:
-            name, description = [part.strip() for part in payload.split("|", 1)]
-        else:
-            name, description = payload, ""
-        manifest = create_workspace(name, description)
-        set_selected_workspace(str(manifest.get("workspace_id") or ""))
-        add_system(
-            state,
-            "已创建并选择 Shuheng 工作区："
-            f"{manifest.get('name')} ({manifest.get('workspace_id')})\n"
-            f"memory: {manifest.get('memory_path')}",
-        )
-        return True
-    select_match = re.match(r"^(?:select|use|switch)\s+(.+)$", arg, re.I | re.S)
-    if select_match:
-        target = select_match.group(1).strip()
-        manifest = resolve_workspace(target)
-        if not manifest:
-            add_system(state, f"找不到唯一工作区：{target}\n" + format_workspace_list())
-            return True
-        set_selected_workspace(str(manifest.get("workspace_id") or ""))
-        add_system(state, f"已选择 Shuheng 工作区：{manifest.get('name')} ({manifest.get('workspace_id')})")
+    if arg.lower() in {"refresh", "sync", "ensure"}:
+        manifest = ensure_auto_workspace()
+        add_system(state, f"已刷新自动 Shuheng 工作区：{manifest.get('name')} ({manifest.get('workspace_id')})")
         return True
     add_system(
         state,
         "未知 /workspace 命令。\n"
-        "用法：/workspace list、/workspace current、/workspace new <name>、/workspace select <id|name>、/workspace clear",
+        "用法：/workspace list、/workspace current、/workspace refresh",
     )
     return True
 
