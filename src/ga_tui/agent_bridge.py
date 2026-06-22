@@ -22,6 +22,9 @@ SUPPORTED_ACTIONS = (
     "memory_context_get",
     "memory_candidate_submit",
     "proposal_submit",
+    "delegate",
+    "studio_state",
+    "studio_update",
 )
 
 
@@ -145,6 +148,61 @@ class AgentBridgeService:
             payload.setdefault("evidence_ref", "runtime://provider/ohmypi/plugin")
         return self.app.ohmypi_tui_propose_host_tool_handler(self.state, payload)
 
+    def delegate(self, args: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Delegate work to a professional subagent via ga-control v2.
+
+        Args:
+            agent_role: Target agent role (e.g., "novelist")
+            objective: Task objective
+            workdir: Optional workspace root
+            success_criteria: Optional list of success criteria
+            stop_condition: Optional stop condition
+
+        Returns:
+            ga-control delegate.create result or error.
+        """
+        payload = dict(args or {})
+        agent_role = str(payload.get("agent_role") or "").strip()
+        objective = str(payload.get("objective") or "").strip()
+        if not agent_role or not objective:
+            return bridge_error("delegate requires agent_role and objective.")
+        # Use the TUI's ga-control dispatch to create a delegation
+        return self.query("delegate_create", payload)
+
+    def studio_state(self, args: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Get a professional agent's Studio state (blocks for managed regions).
+
+        Args:
+            agent_role: Target agent role
+
+        Returns:
+            Studio blocks grouped by managed region.
+        """
+        payload = dict(args or {})
+        agent_role = str(payload.get("agent_role") or "").strip()
+        if not agent_role:
+            return bridge_error("studio_state requires agent_role.")
+        return self.query("studio_state", payload)
+
+    def studio_update(self, args: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Write a human-initiated UI update into a professional agent's memory.
+
+        Args:
+            agent_role: Target agent role
+            region: Managed region name
+            block: Block data { type, data }
+
+        Returns:
+            Confirmation of the memory write.
+        """
+        payload = dict(args or {})
+        agent_role = str(payload.get("agent_role") or "").strip()
+        region = str(payload.get("region") or "").strip()
+        if not agent_role or not region:
+            return bridge_error("studio_update requires agent_role and region.")
+        return self.query("studio_update", payload)
+
+
     def handle(self, payload: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(payload, dict):
             return bridge_error("Bridge payload must be a JSON object.")
@@ -164,6 +222,12 @@ class AgentBridgeService:
             return self.memory_candidate_submit(args)
         if action == "proposal_submit":
             return self.proposal_submit(args)
+        if action == "delegate":
+            return self.delegate(args)
+        if action == "studio_state":
+            return self.studio_state(args)
+        if action == "studio_update":
+            return self.studio_update(args)
         return bridge_error("Unsupported action.", action=action, supported_actions=list(SUPPORTED_ACTIONS))
 
 

@@ -115,6 +115,7 @@ try:
         ohmypi_provider_spec,
         ohmypi_rpc_command,
         ohmypi_subprocess_env,
+        redact_memory_text,
         write_ohmypi_runtime_files,
         write_ohmypi_memory_prompt,
     )
@@ -190,6 +191,7 @@ except Exception:
         ohmypi_provider_spec,
         ohmypi_rpc_command,
         ohmypi_subprocess_env,
+        redact_memory_text,
         write_ohmypi_runtime_files,
         write_ohmypi_memory_prompt,
     )
@@ -260,6 +262,10 @@ WORKSPACE_MEMORY_FILENAME = "memory.md"
 WORKSPACE_INDEX_FILENAME = "index.json"
 WORKSPACE_L4_INDEX_FILENAME = "l4_index.json"
 L4_RAW_SESSIONS_DIR = os.path.join(SHUHENG_MEMORY_DIR, "L4_raw_sessions")
+SHUHENG_L1_FILENAME = "global_mem_insight.txt"
+SHUHENG_L2_FILENAME = "global_mem.txt"
+SHUHENG_L0_FILENAME = "memory_management_sop.md"
+SHUHENG_L4_INDEX_FILENAME = "index.json"
 UI_DURABLE_SYSTEM_MESSAGES_KEY = "ui_durable_system_messages"
 UI_DURABLE_SYSTEM_MESSAGE_LIMIT = 200
 SUBAGENT_CONTEXT_REPLY_LIMIT = 2200
@@ -421,6 +427,7 @@ TURN_MARKER_RE = re.compile(r"(?m)(^[ \t]*\**LLM Running \(Turn \d+\) \.\.\.\**[
 TURN_NO_RE = re.compile(r"Turn\s+(\d+)")
 LINE_NUMBERED_FILE_RE = re.compile(r"^[ \t]*\d+\|")
 META_BLOCK_RE = re.compile(r"<(?:summary|thinking|think)>[\s\S]*?</(?:summary|thinking|think)>", re.IGNORECASE)
+THINKING_BLOCK_RE = re.compile(r"<(?:thinking|think)>\s*([\s\S]*?)\s*</(?:thinking|think)>", re.IGNORECASE)
 TOOL_CALL_RE = re.compile(r"🛠️\s*Tool:\s*`([^`]+)`")
 TOOL_USE_NAME_RE = re.compile(r"<tool_use>\s*\{[\s\S]*?\"name\"\s*:\s*\"([^\"]+)\"[\s\S]*?</tool_use>")
 TOOL_USE_BLOCK_RE = re.compile(r"<tool_use>[\s\S]*?</tool_use>", re.IGNORECASE)
@@ -463,6 +470,7 @@ _SESSION_LOG_COUNTER = itertools.count(1)
 COMMANDS: list[tuple[str, str, str, bool]] = [
     ("/continue", "[n]", "列出或恢复历史会话", True),
     ("/sessions", "", "列出历史会话", True),
+    ("/curate-history", "[scope]", "用历史策展 skill 总结分类/记忆候选/子代理建议", True),
     ("/clear", "", "清空当前屏幕", True),
     ("/new", "", "新建空会话", True),
     ("/temp", "", "新建不落盘临时会话", True),
@@ -475,8 +483,8 @@ COMMANDS: list[tuple[str, str, str, bool]] = [
     ("/model", "", "管理模型配置/切换/提取/验活/默认", True),
     ("/agents", "", "列出持久子 agent", True),
     ("/agent", "<cmd>", "管理/运行持久子 agent", False),
-    ("/workspace", "<cmd>", "管理项目工作区记忆", False),
-    ("/workspaces", "", "列出项目工作区", True),
+    ("/workspace", "<cmd>", "查看项目工作区 provenance", False),
+    ("/workspaces", "", "列出项目工作区 provenance", True),
     ("/tasks", "", "查看共享任务账本", True),
     ("/bus", "", "查看 agent mail", True),
     ("/approvals", "", "查看待审批事项", True),
@@ -840,6 +848,7 @@ class State:
     description_signatures: dict[str, str] = field(default_factory=dict)
     category_jobs: set[str] = field(default_factory=set)
     category_signatures: dict[str, str] = field(default_factory=dict)
+    token_usage_registry_signature: tuple[float, int] = (0.0, -1)
 
 
 def cp(index: int) -> int:
@@ -1432,7 +1441,7 @@ def compact_ui_preview_messages_from_pairs(
         user = _user_text(prompt)
         if user:
             messages.append({"role": "user", "content": user})
-        summary = process_summary_text(response) or process_preview(response)
+        summary = session_response_preview_text(response)
         if summary and summary != "执行中":
             messages.append({"role": "assistant", "content": f"（预览）{summary}"})
     return messages, loaded_rounds, total_rounds, len(messages)
@@ -1592,8 +1601,10 @@ def cached_session_rows(state: State, exclude_pid: Optional[int] = None) -> tupl
                 state.session_meta[key] = entry
                 changed = True
             continue
+        refresh_process_cache = history_cache_has_process_only_preview(meta)
         cache_ok = (
-            float(meta.get("cache_mtime") or 0) == float(stat.st_mtime)
+            not refresh_process_cache
+            and float(meta.get("cache_mtime") or 0) == float(stat.st_mtime)
             and int(meta.get("cache_size") or -1) == int(stat.st_size)
             and "preview" in meta
             and "rounds" in meta
@@ -1617,10 +1628,10 @@ def cached_session_rows(state: State, exclude_pid: Optional[int] = None) -> tupl
         pairs = _pairs(content)
         if not pairs:
             continue
-        preview = _preview_text(pairs)
+        preview = session_preview_from_pairs(pairs) or _preview_text(pairs)
         rounds = len(pairs)
         last_user_at = session_last_user_time_from_content(content, stat.st_mtime)
-        desc = compact_description(str(meta.get("description") or ""))
+        desc = "" if refresh_process_cache else compact_description(str(meta.get("description") or ""))
         if not desc:
             desc = session_description_from_pairs(pairs, preview)
         preview_messages, preview_loaded, preview_total, preview_message_count = compact_ui_preview_messages_from_pairs(pairs)
@@ -1786,6 +1797,68 @@ def set_agent_log_path(agent: Any, path: str) -> None:
                 backend.log_path = path
             except Exception:
                 pass
+
+
+def agent_requires_transcript_bridge(agent: Any) -> bool:
+    provider_id = agent_runtime_provider_id(agent)
+    if provider_id == "genericagent":
+        return False
+    if provider_id == "ohmypi":
+        return True
+    module = str(getattr(type(agent), "__module__", "") or "")
+    if module.endswith("ohmypi_provider"):
+        return True
+    return hasattr(agent, "put_runtime_task")
+
+
+def latest_user_message_text(messages: list[Message]) -> str:
+    for msg in reversed(messages or []):
+        if msg.role == "user" and str(msg.content or "").strip():
+            return str(msg.content or "").strip()
+    return ""
+
+
+def append_model_response_transcript_turn(path: str, user_text: str, assistant_text: str) -> bool:
+    user_text = clean_text(user_text).strip()
+    if not user_text or not is_normal_session_log_path(path):
+        return False
+    response_text = clean_text(assistant_text)
+    prompt = {"role": "user", "content": [{"type": "text", "text": user_text}]}
+    response = [{"type": "text", "text": response_text}]
+    now = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a", encoding="utf-8", errors="replace") as fh:
+        fh.write(f"=== Prompt === {now}\n")
+        fh.write(json.dumps(prompt, ensure_ascii=False, indent=2))
+        fh.write(f"\n\n=== Response === {now}\n")
+        fh.write(repr(response))
+        fh.write("\n\n")
+    try:
+        os.utime(path, None)
+    except OSError:
+        pass
+    return True
+
+
+def persist_transcript_bridge_turn(
+    agent: Any,
+    messages: list[Message],
+    assistant_text: str,
+    *,
+    source: str,
+    temporary_session: bool = False,
+) -> bool:
+    if temporary_session or not str(source or "").startswith("user"):
+        return False
+    if agent is None or agent_log_path_is_devnull(agent) or not agent_requires_transcript_bridge(agent):
+        return False
+    path = agent_log_path(agent)
+    if not is_normal_session_log_path(path):
+        return False
+    user_text = latest_user_message_text(messages)
+    if not user_text:
+        return False
+    return append_model_response_transcript_turn(path, user_text, assistant_text)
 
 
 def reset_agent_runtime_context_no_snapshot(agent: Any, history: Optional[list[dict[str, Any]]] = None) -> None:
@@ -2149,7 +2222,7 @@ def create_workspace(
     if not os.path.exists(workspace_memory_path(workspace_id)):
         write_text_atomic(
             workspace_memory_path(workspace_id),
-            f"# {clean_name}\n\nThis workspace memory is automatically inferred by Shuheng before context hydration.\n",
+            f"# {clean_name}\n\nThis workspace file is secondary project provenance. Primary memory lives in Shuheng L0-L4 layered memory.\n",
         )
     build_workspace_index(workspace_id)
     return manifest
@@ -2199,7 +2272,7 @@ def ensure_auto_workspace(root: str = "") -> dict[str, Any]:
         if not os.path.exists(workspace_memory_path(workspace_id)):
             write_text_atomic(
                 workspace_memory_path(workspace_id),
-                f"# {manifest.get('name') or name}\n\nThis workspace memory is automatically inferred by Shuheng before context hydration.\n",
+                f"# {manifest.get('name') or name}\n\nThis workspace file is secondary project provenance. Primary memory lives in Shuheng L0-L4 layered memory.\n",
             )
         build_workspace_index(workspace_id)
     write_auto_workspace_state(manifest, workspace_root)
@@ -2262,7 +2335,7 @@ def workspace_context_payload(*, security_context: str = "standard") -> dict[str
     if normalized_security_context(security_context) == "secret":
         return {
             "included": False,
-            "reason": "Secret context does not hydrate normal Shuheng workspace memory.",
+            "reason": "Secret context does not hydrate Shuheng workspace provenance memory.",
             "workspace": None,
             "items": [],
             "refs": [],
@@ -2293,7 +2366,7 @@ def workspace_context_payload(*, security_context: str = "standard") -> dict[str
     refs = [workspace_manifest_path(workspace_id), workspace_memory_path(workspace_id), workspace_index_path(workspace_id), workspace_l4_index_path(workspace_id)]
     return {
         "included": True,
-        "reason": "Automatic Shuheng workspace is inferred for this context pack.",
+        "reason": "Automatic Shuheng workspace is inferred as project provenance for this context pack.",
         "workspace": {
             "workspace_id": workspace_id,
             "name": manifest.get("name", workspace_id),
@@ -2301,7 +2374,7 @@ def workspace_context_payload(*, security_context: str = "standard") -> dict[str
             "selection_mode": "auto",
             "root_aliases": list(manifest.get("root_aliases") or []),
         },
-        "items": memory_items or ["(workspace memory is empty)"],
+        "items": memory_items or ["(workspace provenance is empty)"],
         "refs": refs,
         "l4": {
             "refs_count": int(l4.get("refs_count") or 0),
@@ -2328,6 +2401,139 @@ def append_text_file(path: str, text: str) -> None:
 
 def now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime())
+
+
+def shuheng_memory_file_path(filename: str) -> str:
+    return os.path.join(SHUHENG_MEMORY_DIR, filename)
+
+
+def shuheng_l4_index_path() -> str:
+    return os.path.join(L4_RAW_SESSIONS_DIR, SHUHENG_L4_INDEX_FILENAME)
+
+
+def genericagent_asset_path(filename: str) -> str:
+    return os.path.join(ROOT_DIR, "assets", filename)
+
+
+def default_shuheng_l1_text() -> str:
+    template = read_text_file(genericagent_asset_path("global_mem_insight_template.txt"))
+    if template.strip():
+        return template
+    return (
+        "# [Global Memory Insight]\n"
+        "Read L2 or list L3 when needed.\n"
+        "L0(META-SOP): memory_management_sop\n"
+        "L2: global_mem.txt\n"
+        "L3: memory/*.md or *.py\n"
+        "L4: L4_raw_sessions/ historical sessions\n"
+    )
+
+
+def default_shuheng_l0_text() -> str:
+    source = read_text_file(os.path.join(ROOT_DIR, "memory", SHUHENG_L0_FILENAME))
+    if source.strip():
+        return source
+    return (
+        "# Memory Management SOP\n\n"
+        "## Core Axioms\n\n"
+        "1. No Execution, No Memory. Only action-verified facts may become long-term memory.\n"
+        "2. Existing verified memory must not be overwritten or deleted casually.\n"
+        "3. Do not store volatile state, secrets, or unverified assumptions.\n"
+        "4. Keep upper layers as short pointers to lower layers.\n\n"
+        "## Layers\n\n"
+        "- L1: global_mem_insight.txt, short routing/index prompt.\n"
+        "- L2: global_mem.txt, approved global facts.\n"
+        "- L3: memory/*.md or *.py, reusable SOPs/tools.\n"
+        "- L4: L4_raw_sessions/, historical raw sessions by reference only.\n"
+    )
+
+
+def refresh_shuheng_l4_index() -> dict[str, Any]:
+    data = build_l4_archive_index()
+    data["index_path"] = shuheng_l4_index_path()
+    write_text_atomic(shuheng_l4_index_path(), json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+    return data
+
+
+def ensure_shuheng_layered_memory_files() -> dict[str, str]:
+    maybe_bootstrap_shuheng_legacy_state()
+    os.makedirs(SHUHENG_MEMORY_DIR, exist_ok=True)
+    os.makedirs(L4_RAW_SESSIONS_DIR, exist_ok=True)
+    paths = {
+        "memory_dir": SHUHENG_MEMORY_DIR,
+        "l0": shuheng_memory_file_path(SHUHENG_L0_FILENAME),
+        "l1": shuheng_memory_file_path(SHUHENG_L1_FILENAME),
+        "l2": shuheng_memory_file_path(SHUHENG_L2_FILENAME),
+        "l3_dir": SHUHENG_MEMORY_DIR,
+        "l4_dir": L4_RAW_SESSIONS_DIR,
+        "l4_index": shuheng_l4_index_path(),
+    }
+    if not os.path.exists(paths["l2"]):
+        write_text_atomic(paths["l2"], "# [Global Memory - L2]\n")
+    if not os.path.exists(paths["l1"]):
+        write_text_atomic(paths["l1"], default_shuheng_l1_text())
+    if not os.path.exists(paths["l0"]):
+        write_text_atomic(paths["l0"], default_shuheng_l0_text())
+    refresh_shuheng_l4_index()
+    return paths
+
+
+def shuheng_memory_structure_text() -> str:
+    paths = ensure_shuheng_layered_memory_files()
+    return (
+        f"Facts(L2): {paths['l2']} | "
+        f"Shuheng CodeRoot: {APP_ROOT_DIR} | "
+        f"SOPs(L3): {paths['memory_dir']}/*.md or *.py | "
+        f"META-SOP(L0): {paths['l0']}\n"
+        f"L4: {paths['l4_dir']} historical sessions; index: {paths['l4_index']}\n"
+        "L1 Insight is the short routing index. Read L0 before proposing any long-term memory update. "
+        "Long-term writes are candidate-only through Shuheng governance."
+    )
+
+
+def shuheng_layered_memory_prompt(*, max_l1_chars: int = 3500) -> str:
+    paths = ensure_shuheng_layered_memory_files()
+    insight_raw = read_text_file(paths["l1"], "")[:max_l1_chars]
+    insight = redact_memory_text(insight_raw).strip() or "(empty L1 index)"
+    return "\n".join([
+        f"cwd = {os.path.join(AGENT_HARNESS_DIR, 'runtime')} (./)",
+        "",
+        f"[Memory] ({paths['memory_dir']})",
+        shuheng_memory_structure_text(),
+        f"{paths['l1']}:",
+        insight,
+    ])
+
+
+def shuheng_layered_memory_payload() -> dict[str, Any]:
+    paths = ensure_shuheng_layered_memory_files()
+    l4_index = read_json_dict_file(paths["l4_index"])
+    l1_items = compact_nonempty_lines(read_text_file(paths["l1"], ""), limit=6, width=220)
+    items = [
+        f"L0 META-SOP: {paths['l0']}",
+        f"L1 index: {paths['l1']}",
+        f"L2 facts: {paths['l2']}",
+        f"L3 SOP/tools root: {paths['l3_dir']}",
+        f"L4 raw sessions: {paths['l4_dir']} refs={int(l4_index.get('refs_count') or 0)}",
+    ]
+    if l1_items:
+        items.append("L1 preview: " + " | ".join(l1_items[:3]))
+    return {
+        "schema_version": "shuheng.layered_memory.v1",
+        "included": True,
+        "mode": "genericagent_l0_l4",
+        "reason": "GenericAgent-style Shuheng layered memory is the primary runtime memory context.",
+        "items": items,
+        "refs": [paths["l0"], paths["l1"], paths["l2"], paths["l3_dir"], paths["l4_dir"], paths["l4_index"]],
+        "paths": paths,
+        "prompt": shuheng_layered_memory_prompt(),
+        "l4": {
+            "refs_count": int(l4_index.get("refs_count") or 0),
+            "index_path": paths["l4_index"],
+            "mode": l4_index.get("mode", "non_destructive_index_only"),
+            "sample_refs": [row.get("ref", "") for row in (l4_index.get("refs") or [])[-8:] if row.get("ref")],
+        },
+    }
 
 
 def short_uid(prefix: str) -> str:
@@ -5741,12 +5947,20 @@ def memory_hydration_pack(
     profile: str,
     memory: str,
     recent_mail: list[dict[str, Any]],
+    layered_memory: Optional[dict[str, Any]] = None,
     workspace_context: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     profile_items = compact_nonempty_lines(profile, limit=8)
     memory_items = compact_nonempty_lines(memory, limit=12)
+    layered_memory = layered_memory or shuheng_layered_memory_payload()
     workspace_context = workspace_context or {}
     included: list[dict[str, Any]] = [
+        {
+            "scope": "shuheng.layered-memory",
+            "reason": "Primary GenericAgent-style L0-L4 memory context owned by Shuheng.",
+            "items": [str(item) for item in (layered_memory.get("items") or [])[:8]],
+            "refs": [str(ref) for ref in (layered_memory.get("refs") or []) if ref],
+        },
         {
             "scope": "project.agent-harness",
             "reason": "Defines the governed multi-agent baseline and approval/single-writer constraints.",
@@ -5773,12 +5987,12 @@ def memory_hydration_pack(
         workspace = workspace_context.get("workspace") or {}
         workspace_name = str(workspace.get("name") or workspace.get("workspace_id") or "selected workspace")
         l4 = workspace_context.get("l4") or {}
-        workspace_items = [f"Workspace: {workspace_name}"]
+        workspace_items = [f"Workspace provenance: {workspace_name}"]
         workspace_items.extend(str(item) for item in (workspace_context.get("items") or [])[:6])
-        workspace_items.append(f"L4 cold archive refs indexed: {int(l4.get('refs_count') or 0)}")
+        workspace_items.append(f"Workspace L4 refs indexed: {int(l4.get('refs_count') or 0)}")
         included.append({
-            "scope": "workspace.project",
-            "reason": "Automatic Shuheng workspace inference hydrates project-scoped memory.",
+            "scope": "workspace.project-provenance",
+            "reason": "Automatic workspace inference is secondary provenance, not the primary memory mode.",
             "items": workspace_items,
             "refs": [str(ref) for ref in (workspace_context.get("refs") or []) if ref],
         })
@@ -5801,7 +6015,7 @@ def memory_hydration_pack(
             {"scope": "raw_logs", "reason": "context_policy.include_raw_logs=false; use refs and previews instead."},
             {"scope": "unrelated_project_memory", "reason": "Avoid context pollution across unrelated projects."},
             {
-                "scope": "workspace.project",
+                "scope": "workspace.project-provenance",
                 "reason": str(workspace_context.get("reason") or "Workspace memory is included after automatic inference."),
             } if not workspace_context.get("included") else {},
             {"scope": "secrets", "reason": "No secret access without an explicit approval gate."},
@@ -5822,8 +6036,10 @@ def context_layers_for_task(
     recent_mail: list[dict[str, Any]],
     task_contract: dict[str, Any],
     memory_pack: dict[str, Any],
+    layered_memory: Optional[dict[str, Any]] = None,
     workspace_context: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
+    layered_memory = layered_memory or shuheng_layered_memory_payload()
     workspace_context = workspace_context or {}
     if sub.security_context == "secret":
         recent_tasks: list[dict[str, Any]] = []
@@ -5840,14 +6056,16 @@ def context_layers_for_task(
     project_items = [
         "Shuheng agent harness implementation follows docs/agent-harness-architecture.md.",
         "Program-level approval, task/mail schemas, artifact index, and single-writer are active implementation layers.",
+        "Primary memory mode is Shuheng-owned GenericAgent-style L0-L4 layered memory.",
     ]
     project_refs = ["docs/agent-harness-architecture.md", "goal-2/tasks.md"]
+    project_refs.extend(str(ref) for ref in (layered_memory.get("refs") or []) if ref)
     if workspace_context.get("included"):
         workspace = workspace_context.get("workspace") or {}
-        project_items.append(f"Active Shuheng workspace: {workspace.get('name') or workspace.get('workspace_id')}")
+        project_items.append(f"Shuheng workspace provenance: {workspace.get('name') or workspace.get('workspace_id')}")
         project_items.extend(str(item) for item in (workspace_context.get("items") or [])[:6])
         l4 = workspace_context.get("l4") or {}
-        project_items.append(f"L4 cold archive refs indexed for workspace: {int(l4.get('refs_count') or 0)}")
+        project_items.append(f"Workspace L4 refs indexed: {int(l4.get('refs_count') or 0)}")
         project_refs.extend(str(ref) for ref in (workspace_context.get("refs") or []) if ref)
     return {
         "L0_system_constitution": {
@@ -5871,6 +6089,7 @@ def context_layers_for_task(
                 "included": False,
                 "reason": "No Shuheng workspace context was provided.",
             },
+            "shuheng_layered_memory": layered_memory,
             "items": project_items,
             "refs": project_refs,
         },
@@ -5937,6 +6156,7 @@ def build_context_pack(
     task_contract = task_contract_for_role(sub.role, objective)
     context_policy = context_policy_for_task(objective, security_context=sub.security_context)
     permissions = permissions_for_role(sub.role, security_context=sub.security_context, permission_profile=permission_profile)
+    layered_memory = shuheng_layered_memory_payload()
     workspace_context = workspace_context_payload(security_context=sub.security_context)
     memory_pack = memory_hydration_pack(
         task_id=task_id,
@@ -5944,6 +6164,7 @@ def build_context_pack(
         profile=profile,
         memory=memory,
         recent_mail=recent_mail,
+        layered_memory=layered_memory,
         workspace_context=workspace_context,
     )
     layers = context_layers_for_task(
@@ -5956,6 +6177,7 @@ def build_context_pack(
         recent_mail=recent_mail,
         task_contract=task_contract,
         memory_pack=memory_pack,
+        layered_memory=layered_memory,
         workspace_context=workspace_context,
     )
     pack = {
@@ -5988,6 +6210,7 @@ def build_context_pack(
             "source_policy": source_policy_for_role(sub.role, security_context=sub.security_context),
         },
         "source_policy": source_policy_for_role(sub.role, security_context=sub.security_context),
+        "layered_memory": layered_memory,
         "memory_pack": memory_pack,
         "workspace_context": workspace_context,
         "layers": layers,
@@ -6119,6 +6342,7 @@ def format_context_pack_for_prompt(pack: dict[str, Any]) -> str:
     permissions = pack.get("permissions") or {}
     source_policy = pack.get("source_policy") or {}
     memory_pack = pack.get("memory_pack") or {}
+    layered_memory = pack.get("layered_memory") or {}
     layers = pack.get("layers") or {}
     boundaries = "\n".join(f"- {item}" for item in (task.get("boundaries") or []))
     success = "\n".join(f"- {item}" for item in (task.get("success_criteria") or []))
@@ -6138,6 +6362,7 @@ def format_context_pack_for_prompt(pack: dict[str, Any]) -> str:
         workspace_line = f"{workspace.get('name') or workspace.get('workspace_id')} ({workspace.get('workspace_id')})"
     else:
         workspace_line = f"none - {workspace_context.get('reason') or 'No Shuheng workspace is selected.'}"
+    layered_memory_prompt = str(layered_memory.get("prompt") or "").strip()
     artifact_items = []
     for item in ((layers.get("L7_artifacts") or {}).get("items") or [])[-5:]:
         artifact_items.append(f"- {item.get('uri', '')} {item.get('hash', '')} task={item.get('source_task_id', '')}")
@@ -6166,6 +6391,9 @@ Source policy:
 - forbidden: {", ".join(source_policy.get("forbidden_sources", []))}
 - artifact_policy: {source_policy.get("artifact_policy", "")}
 
+Layered Shuheng memory:
+{layered_memory_prompt or "- (empty)"}
+
 Memory hydration pack:
 {chr(10).join(memory_items) or "- (empty)"}
 
@@ -6173,7 +6401,7 @@ Memory excluded:
 {chr(10).join(memory_excluded) or "- (empty)"}
 
 Workspace context:
-- active: {workspace_line}
+- provenance: {workspace_line}
 
 Recent artifact refs:
 {chr(10).join(artifact_items) or "- (empty)"}
@@ -12426,6 +12654,7 @@ def agent_runtime_registry(*, write_memory_prompt_file: bool = True) -> RuntimeR
         schedules_path=AGENT_SCHEDULES_PATH,
     )))
     maybe_bootstrap_shuheng_legacy_state()
+    ensure_shuheng_layered_memory_files()
     ohmypi_append_prompt_path = (
         write_ohmypi_memory_prompt(root_dir=SHUHENG_HOME, harness_dir=AGENT_HARNESS_DIR)
         if write_memory_prompt_file
@@ -12570,18 +12799,29 @@ def empty_token_stats_dict() -> dict[str, int]:
     return {key: 0 for key in TOKEN_STAT_KEYS}
 
 
-def load_token_usage_registry() -> dict[str, dict[str, int]]:
+def token_usage_file_signature() -> tuple[float, int]:
     try:
-        with open(TOKEN_USAGE_PATH, encoding="utf-8") as fh:
-            raw = json.load(fh)
-    except Exception:
-        return {}
+        stat = os.stat(TOKEN_USAGE_PATH)
+        return (float(stat.st_mtime), int(stat.st_size))
+    except OSError:
+        return (0.0, -1)
+
+
+def clean_token_usage_registry(raw: Any) -> dict[str, dict[str, int]]:
     if not isinstance(raw, dict):
         return {}
+    session_meta = load_session_meta_registry()
     registry: dict[str, dict[str, int]] = {}
     for key, value in raw.items():
         if not isinstance(key, str) or not isinstance(value, dict):
             continue
+        if is_model_response_basename(key):
+            meta = session_meta.get(key, {})
+            if bool(meta.get("deleted")) or bool(meta.get("hidden_subagent_log")):
+                continue
+            path = os.path.join(MODEL_RESPONSES_DIR, key)
+            if not os.path.exists(path):
+                continue
         clean = empty_token_stats_dict()
         for stat_key in TOKEN_STAT_KEYS:
             try:
@@ -12592,12 +12832,59 @@ def load_token_usage_registry() -> dict[str, dict[str, int]]:
     return registry
 
 
+def load_token_usage_registry() -> dict[str, dict[str, int]]:
+    try:
+        with open(TOKEN_USAGE_PATH, encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except Exception:
+        return {}
+    return clean_token_usage_registry(raw)
+
+
 def save_token_usage_registry(registry: dict[str, dict[str, int]]) -> None:
     os.makedirs(os.path.dirname(TOKEN_USAGE_PATH), exist_ok=True)
     tmp = TOKEN_USAGE_PATH + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(registry, fh, ensure_ascii=False, indent=2)
     os.replace(tmp, TOKEN_USAGE_PATH)
+
+
+def save_state_token_usage_registry(state: State) -> None:
+    save_token_usage_registry(state.token_usage_registry)
+    state.token_usage_registry_signature = token_usage_file_signature()
+
+
+def prune_state_token_usage_registry(state: State) -> bool:
+    clean = clean_token_usage_registry(state.token_usage_registry)
+    if clean == state.token_usage_registry:
+        return False
+    state.token_usage_registry = clean
+    try:
+        save_state_token_usage_registry(state)
+    except Exception as exc:
+        state.last_error = f"token usage save: {type(exc).__name__}: {exc}"
+    return True
+
+
+def refresh_state_token_usage_registry(state: State) -> bool:
+    signature = token_usage_file_signature()
+    if signature == state.token_usage_registry_signature:
+        return False
+    state.token_usage_registry = load_token_usage_registry()
+    state.token_usage_registry_signature = signature
+    return True
+
+
+def remove_session_token_usage(state: State, path: str) -> None:
+    key = session_key(path)
+    if not key:
+        return
+    if key in state.token_usage_registry:
+        state.token_usage_registry.pop(key, None)
+        try:
+            save_state_token_usage_registry(state)
+        except Exception as exc:
+            state.last_error = f"token usage save: {type(exc).__name__}: {exc}"
 
 
 def token_session_key(agent: Any) -> str:
@@ -12659,7 +12946,21 @@ def bind_agent_token_session(state: State, agent: Any) -> None:
         state.token_live_offsets.setdefault(thread_name, empty_token_stats_dict())
 
 
+def reset_agent_token_session(state: State, agent: Any) -> None:
+    thread_name = token_thread_name(agent)
+    if thread_name and cost_tracker is not None and hasattr(cost_tracker, "reset"):
+        try:
+            cost_tracker.reset(thread_name)
+        except Exception:
+            pass
+    if thread_name:
+        state.token_live_offsets.pop(thread_name, None)
+    bind_agent_token_session(state, agent)
+
+
 def persist_agent_token_usage(state: State, agent: Any) -> bool:
+    refresh_state_token_usage_registry(state)
+    prune_state_token_usage_registry(state)
     key = token_session_key(agent)
     thread_name = token_thread_name(agent)
     if not thread_name or cost_tracker is None:
@@ -12678,7 +12979,7 @@ def persist_agent_token_usage(state: State, agent: Any) -> bool:
     state.token_usage_registry[key] = token_stats_add(state.token_usage_registry.get(key, empty_token_stats_dict()), delta)
     state.token_live_offsets[thread_name] = current
     try:
-        save_token_usage_registry(state.token_usage_registry)
+        save_state_token_usage_registry(state)
     except Exception as exc:
         state.last_error = f"token usage save: {type(exc).__name__}: {exc}"
         return False
@@ -12686,6 +12987,8 @@ def persist_agent_token_usage(state: State, agent: Any) -> bool:
 
 
 def persist_all_token_usage(state: State) -> None:
+    refresh_state_token_usage_registry(state)
+    prune_state_token_usage_registry(state)
     seen: set[int] = set()
     for agent in [
         state.agent,
@@ -12769,6 +13072,8 @@ def current_model_lines(state: State, width: int) -> list[tuple[str, int]]:
 def current_token_lines(state: State, width: int) -> list[tuple[str, int]]:
     if cost_tracker is None:
         return [("TOKEN USAGE", cp(7) | curses.A_BOLD), ("tracker unavailable", cp(5))]
+    refresh_state_token_usage_registry(state)
+    prune_state_token_usage_registry(state)
     stats = session_token_stats(state, state.agent)
     if stats is None:
         return [("TOKEN USAGE", cp(7) | curses.A_BOLD), ("no data", cp(1))]
@@ -12842,6 +13147,8 @@ def load_history(state: State, force: bool = False) -> bool:
                 registry = {}
             for path, _mtime, preview, _rounds in history:
                 name = registry.get(os.path.basename(path), "")
+                if is_process_only_session_title(name):
+                    name = ""
                 if not name:
                     name = preview
                 names[path] = compact_title(name, 80)
@@ -13039,6 +13346,192 @@ def format_category_counts(state: State) -> str:
     return "\n".join(lines)
 
 
+def parse_history_curator_args(raw: str) -> dict[str, Any]:
+    text = (raw or "").strip()
+    limit = 12
+    for pattern in (r"(?:--limit|limit|限制)\s*[=:]?\s*(\d+)", r"\b(\d{1,3})\s*$"):
+        match = re.search(pattern, text, re.I)
+        if match:
+            try:
+                limit = int(match.group(1))
+            except ValueError:
+                limit = 12
+            text = (text[:match.start()] + text[match.end():]).strip()
+            break
+    limit = max(1, min(40, limit))
+    lowered = text.lower()
+    if not text or lowered in {"recent", "最近"}:
+        return {"mode": "recent", "query": "", "limit": limit}
+    if lowered in {"all", "全部"}:
+        return {"mode": "all", "query": "", "limit": limit}
+    if lowered in {"pinned", "pin", "置顶"}:
+        return {"mode": "pinned", "query": "", "limit": limit}
+    cat_match = re.match(r"^(?:cat|category|分类)[:：\s]+(.+)$", text, re.I)
+    if cat_match:
+        return {"mode": "category", "query": category_filter_label(cat_match.group(1)), "limit": limit}
+    search_match = re.match(r"^(?:search|q|查找)[:：\s]+(.+)$", text, re.I)
+    if search_match:
+        return {"mode": "search", "query": clean_text(search_match.group(1)).strip(), "limit": limit}
+    return {"mode": "category", "query": category_filter_label(text), "limit": limit}
+
+
+def history_curator_rows(state: State, raw_args: str = "") -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    scope = parse_history_curator_args(raw_args)
+    load_history(state, force=True)
+    entries = list(enumerate(state.history, 1))
+    mode = str(scope.get("mode") or "recent")
+    query = str(scope.get("query") or "")
+    if mode == "category" and query:
+        entries = [
+            (idx, item)
+            for idx, item in entries
+            if category_key(session_category_label(session_meta_for(state, item[0]))) == category_key(query)
+        ]
+    elif mode == "pinned":
+        entries = [(idx, item) for idx, item in entries if session_meta_for(state, item[0]).get("pinned")]
+    elif mode == "search" and query:
+        needle = query.casefold()
+        entries = [
+            (idx, item)
+            for idx, item in entries
+            if needle in " ".join([
+                history_name(state, item[0]),
+                item[2],
+                state.history_descriptions.get(item[0], ""),
+                session_category_label(session_meta_for(state, item[0])),
+                os.path.basename(item[0]),
+            ]).casefold()
+        ]
+    limit = int(scope.get("limit") or 12)
+    if mode == "recent":
+        entries = entries[:limit]
+    else:
+        entries = entries[:limit]
+    rows: list[dict[str, Any]] = []
+    for idx, (path, mtime, preview, rounds) in entries:
+        meta = session_meta_for(state, path)
+        title = compact_title(history_name(state, path) or preview or os.path.basename(path), 90)
+        category = session_category_label(meta)
+        description = compact_description(state.history_descriptions.get(path, "") or str(meta.get("description") or ""), 220)
+        stable_id = session_stable_id(path)
+        source_path = str(meta.get("source_path") or path)
+        rows.append({
+            "index": idx,
+            "stable_id": stable_id,
+            "title": title,
+            "category": category,
+            "rounds": int(rounds or 0),
+            "age": rel_age(float(mtime or time.time())),
+            "activity_at": float(mtime or 0.0),
+            "pinned": bool(meta.get("pinned")),
+            "archived": bool(meta.get("archived")),
+            "source_missing": bool(meta.get("source_missing") or meta.get("archive_backed")),
+            "source_path": source_path,
+            "description": description,
+            "evidence_ref": f"session://{stable_id}",
+        })
+    return scope, rows
+
+
+def format_history_curator_index(scope: dict[str, Any], rows: list[dict[str, Any]]) -> str:
+    mode = str(scope.get("mode") or "recent")
+    query = str(scope.get("query") or "")
+    lines = [
+        "# Shuheng History Curation Index",
+        "",
+        f"- scope: {mode}{':' + query if query else ''}",
+        f"- returned_sessions: {len(rows)}",
+        "- disclosure_level: index+cached_summary_only",
+        "",
+        "## Sessions",
+    ]
+    for row in rows:
+        flags = []
+        if row.get("pinned"):
+            flags.append("pinned")
+        if row.get("archived"):
+            flags.append("archived")
+        if row.get("source_missing"):
+            flags.append("archive-backed")
+        flag_text = f" flags={','.join(flags)}" if flags else ""
+        lines.append(
+            f"- S{int(row['index']):02d} id:{row['stable_id']} "
+            f"category={row['category']} rounds={row['rounds']} age={row['age']}{flag_text}"
+        )
+        lines.append(f"  title: {row['title']}")
+        if row.get("description"):
+            lines.append(f"  cached_summary: {row['description']}")
+        lines.append(f"  evidence_ref: {row['evidence_ref']}")
+        lines.append(f"  source_path: {row['source_path']}")
+    return "\n".join(lines)
+
+
+def history_curator_skill_prompt(state: State, raw_args: str = "") -> tuple[str, str, list[dict[str, Any]]]:
+    scope, rows = history_curator_rows(state, raw_args)
+    index_text = format_history_curator_index(scope, rows)
+    artifact_ref = write_harness_artifact(
+        "history-curation-index",
+        f"{scope.get('mode', 'recent')}-{scope.get('query', '') or 'default'}",
+        index_text,
+        provenance={
+            "generated_by": "orchestrator.main",
+            "source": "history_curator_skill",
+            "scope": scope,
+            "disclosure_level": "index+cached_summary_only",
+        },
+    )
+    category_lines = [
+        f"- {label}: {count}{' - ' + compact_description(str(category_meta_for(state, label).get('description') or '')) if category_meta_for(state, label).get('description') else ''}"
+        for label, count in category_counts_for_view(state)
+    ]
+    prompt = f"""[Shuheng History Curator Skill]
+Objective: Curate Shuheng history into category digests, memory candidates, and long-term subagent recommendations using progressive disclosure.
+
+Progressive disclosure protocol:
+1. Start only from the index and cached summaries below. Do not assume raw session content has been read.
+2. If more evidence is needed, name at most 3 stable ids under "Needs Deeper Disclosure" with the reason. Only then should raw session files be opened in a later step.
+3. Treat raw sessions as L4 archive evidence. Do not copy long conversations into the answer.
+4. Do not write long-term memory directly. Output memory candidates only; they must later go through Shuheng's governed memory_candidate approval path.
+5. Do not create persistent subagents directly. Recommend them only when a repeated long-running responsibility is clear.
+
+Nested subskills to run mentally:
+- history-classifier: check whether existing categories fit; suggest category renames/descriptions if useful.
+- category-digest: summarize durable themes per category from cached summaries only.
+- memory-curator: extract stable facts/preferences/SOPs that would change future behavior; reject temporary chatter.
+- subagent-recommender: detect repeated responsibilities that deserve a persistent subagent; include role, profile, tools boundary, and why reuse beats one-off chat.
+
+Output format:
+1. Category Digest
+2. Memory Candidates (candidate only, with type, target scope, statement, evidence_refs, confidence)
+3. Archive Only / Do Not Memorize
+4. Persistent Subagent Recommendations (recommendation only, no creation)
+5. Needs Deeper Disclosure
+
+Current category counts:
+{chr(10).join(category_lines) or "- (none)"}
+
+Index artifact: {artifact_ref}
+
+{index_text}
+[/Shuheng History Curator Skill]"""
+    return prompt, artifact_ref, rows
+
+
+def start_history_curator_skill(state: State, raw_args: str, visible_text: str) -> bool:
+    prompt, _artifact_ref, rows = history_curator_skill_prompt(state, raw_args)
+    if not rows:
+        add_system(state, "没有可策展的历史会话；可以先退出筛选或切换 /archived。")
+        return False
+    return start_main_agent_task(
+        state,
+        prompt,
+        source="user:history_curator_skill",
+        visible_user_text=visible_text,
+        remember_user=True,
+        clear_history=True,
+    )
+
+
 def rename_category(state: State, old: str, new: str) -> str:
     old_label = category_filter_label(old)
     new_label = category_filter_label(new)
@@ -13138,11 +13631,12 @@ def reset_backend_memory_no_snapshot(agent: Any) -> None:
     reset_agent_runtime_context_no_snapshot(agent)
 
 
-def clear_active_session_after_meta_action(state: State, message: str) -> None:
-    persist_agent_token_usage(state, state.agent)
+def clear_active_session_after_meta_action(state: State, message: str, *, persist_current_tokens: bool = True) -> None:
+    if persist_current_tokens:
+        persist_agent_token_usage(state, state.agent)
     reset_backend_memory_no_snapshot(state.agent)
     set_agent_log_path(state.agent, new_session_log_path())
-    bind_agent_token_session(state, state.agent)
+    reset_agent_token_session(state, state.agent)
     state.messages.clear()
     state.current_title = "main"
     state.selected_session = "main"
@@ -13365,6 +13859,7 @@ def apply_session_operation(
             return "当前会话还在运行，不能删除；先 Ctrl+C 中止或等它完成。"
         if not os.path.exists(path):
             set_session_meta_fields(state, path, deleted=True, deleted_at=time.time())
+            remove_session_token_usage(state, path)
             load_history(state, force=True)
             return f"会话文件不存在，已从列表隐藏：{title}"
         trash_path = unique_trash_path(path)
@@ -13373,13 +13868,14 @@ def apply_session_operation(
         except Exception as exc:
             return f"删除失败: {type(exc).__name__}: {exc}"
         set_session_meta_fields(state, path, deleted=True, archived=True, trash_path=trash_path, deleted_at=time.time())
+        remove_session_token_usage(state, path)
         if session_names is not None:
             try:
                 session_names.set_name(path, "")
             except Exception:
                 pass
         if is_current_session_path(state, path):
-            clear_active_session_after_meta_action(state, f"已删除当前会话到回收站：{title}")
+            clear_active_session_after_meta_action(state, f"已删除当前会话到回收站：{title}", persist_current_tokens=False)
         else:
             load_history(state, force=True)
             mark_dirty(state)
@@ -13772,12 +14268,12 @@ def workspace_command_matches(text: str) -> list[tuple[str, str, str, bool]]:
     if not re.match(r"^/workspaces?(?:\s|$)", raw, re.I):
         return []
     if raw.strip().lower() == "/workspaces":
-        return [("/workspaces", "", "列出项目工作区", True)]
+        return [("/workspaces", "", "列出项目工作区 provenance", True)]
     rest = re.sub(r"^/workspace\s*", "", raw, flags=re.I)
     if raw.lower().startswith("/workspaces"):
         rest = re.sub(r"^/workspaces\s*", "", raw, flags=re.I)
     if not rest:
-        return [("/workspace", "<cmd>", "管理项目工作区记忆", False)]
+        return [("/workspace", "<cmd>", "查看项目工作区 provenance", False)]
     parts = rest.split()
     trailing_space = raw.endswith(" ")
     sub_prefix = parts[0].lower() if parts else ""
@@ -14082,6 +14578,110 @@ def compact_description(text: str, max_chars: int = SESSION_DESCRIPTION_LIMIT) -
     return text
 
 
+def assistant_text_from_response_body(response_body: str) -> str:
+    try:
+        blocks = ast.literal_eval(response_body)
+    except Exception:
+        return clean_text(response_body)
+    if isinstance(blocks, list):
+        parts: list[str] = []
+        for block in blocks:
+            if isinstance(block, dict) and block.get("type") == "text":
+                parts.append(str(block.get("text") or ""))
+            elif isinstance(block, str):
+                parts.append(block)
+        return "\n".join(part for part in parts if part)
+    if isinstance(blocks, dict):
+        content = blocks.get("content")
+        if isinstance(content, list):
+            parts = [
+                str(item.get("text") or "")
+                for item in content
+                if isinstance(item, dict) and item.get("type") == "text"
+            ]
+            return "\n".join(part for part in parts if part)
+        return str(content or blocks.get("text") or "")
+    return clean_text(str(blocks or ""))
+
+
+def text_has_process_markers(text: str) -> bool:
+    lowered = (text or "").lower()
+    return (
+        bool(TURN_MARKER_RE.search(text or ""))
+        or "<thinking>" in lowered
+        or "<think>" in lowered
+        or bool(TOOL_USE_BLOCK_RE.search(text or ""))
+        or bool(TOOL_HEADER_RE.search(text or ""))
+    )
+
+
+def session_summary_titles_from_text(text: str) -> list[str]:
+    if text_has_process_markers(text):
+        return []
+    titles: list[str] = []
+    for summary in SUMMARY_RE.findall(text or ""):
+        title = short_session_title(summary, "")
+        if title:
+            titles.append(title)
+    return titles
+
+
+def session_response_preview_text(response_body: str, max_chars: int = 110) -> str:
+    text = assistant_text_from_response_body(response_body)
+    titles = session_summary_titles_from_text(text)
+    if titles:
+        return titles[-1]
+    return compact_description(latest_visible_reply_text(text), max_chars)
+
+
+def session_preview_from_pairs(pairs: list[tuple[str, str]]) -> str:
+    for _prompt, response in reversed(pairs):
+        titles = session_summary_titles_from_text(assistant_text_from_response_body(response))
+        if titles:
+            return titles[-1]
+    for prompt, _response in pairs:
+        user = compact_description(_user_text(prompt), 90)
+        if user:
+            return user
+    for _prompt, response in reversed(pairs):
+        preview = session_response_preview_text(response, 90)
+        if preview:
+            return preview
+    return ""
+
+
+def is_process_only_session_title(text: str) -> bool:
+    title = compact_title(re.sub(r"^（预览）", "", str(text or "")), 80).casefold()
+    if not title:
+        return False
+    if title in {"omp 思考", "思考", "thinking", "执行中", "搜索/浏览输出已折叠"}:
+        return True
+    return title.startswith(("omp 工具", "调用 omp 工具", "调用工具", "tool "))
+
+
+def history_cache_has_process_only_preview(meta: dict[str, Any]) -> bool:
+    if is_process_only_session_title(str(meta.get("preview") or "")):
+        return True
+    description = str(meta.get("description") or "")
+    if "OMP 思考" in description:
+        return True
+    raw_preview_messages = meta.get("ui_preview_messages")
+    if isinstance(raw_preview_messages, list):
+        for item in raw_preview_messages:
+            if isinstance(item, dict) and is_process_only_session_title(str(item.get("content") or "")):
+                return True
+    return False
+
+
+def message_text_for_title_context(msg: Message) -> str:
+    if msg.role == "assistant":
+        return latest_visible_reply_text(msg.content or "")
+    text = clean_text(strip_tui_controls(msg.content or ""))
+    text = META_BLOCK_RE.sub(" ", text)
+    text = TOOL_USE_BLOCK_RE.sub(" ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
 def session_description_from_pairs(pairs: list[tuple[str, str]], preview: str = "") -> str:
     snippets: list[str] = []
     if pairs:
@@ -14091,10 +14691,9 @@ def session_description_from_pairs(pairs: list[tuple[str, str]], preview: str = 
             user = compact_description(_user_text(prompt), 90)
             if user:
                 users.append(user)
-            for summary in SUMMARY_RE.findall(response or ""):
-                summary_text = compact_description(summary, 110)
-                if summary_text:
-                    summaries.append(summary_text)
+            summary_text = session_response_preview_text(response, 110)
+            if summary_text:
+                summaries.append(summary_text)
         if users:
             snippets.append(f"开始：{users[0]}")
             if users[-1] != users[0]:
@@ -14123,9 +14722,7 @@ def suggested_session_title(messages: list[Message]) -> str:
     for msg in reversed(messages):
         if msg.role != "assistant":
             continue
-        summaries = SUMMARY_RE.findall(msg.content or "")
-        for summary in reversed(summaries):
-            title = short_session_title(summary, "")
+        for title in reversed(session_summary_titles_from_text(msg.content or "")):
             if title:
                 return title
     for msg in messages:
@@ -14142,10 +14739,7 @@ def ai_title_context(messages: list[Message], max_chars: int = 3600) -> str:
         if msg.role not in {"user", "assistant"}:
             continue
         role = "用户" if msg.role == "user" else "助手"
-        text = clean_text(msg.content)
-        text = META_BLOCK_RE.sub(" ", text)
-        text = TOOL_USE_BLOCK_RE.sub(" ", text)
-        text = re.sub(r"\s+", " ", text).strip()
+        text = message_text_for_title_context(msg)
         if not text:
             continue
         chunks.append(f"{role}: {truncate_cells(text, 900)}")
@@ -14161,10 +14755,7 @@ def session_content_signature(messages: list[Message]) -> str:
     for msg in messages:
         if msg.role not in {"user", "assistant"}:
             continue
-        content = strip_tui_controls(msg.content or "")
-        content = META_BLOCK_RE.sub(" ", content)
-        content = TOOL_USE_BLOCK_RE.sub(" ", content)
-        content = re.sub(r"\s+", " ", content).strip()
+        content = message_text_for_title_context(msg)
         if not content:
             continue
         seen = True
@@ -14806,7 +15397,7 @@ def new_secret_current_session(state: State, keep_running: bool = True) -> bool:
             pass
     state.secret_vault.session_id = secret_new_session_id()
     set_agent_log_path(state.agent, os.devnull)
-    bind_agent_token_session(state, state.agent)
+    reset_agent_token_session(state, state.agent)
     state.messages.clear()
     state.current_title = "Secret Vault"
     state.selected_session = secret_session_sidebar_key(state.secret_vault.session_id)
@@ -14845,7 +15436,7 @@ def new_current_session(state: State, keep_running: bool = True) -> bool:
         except Exception:
             pass
         set_agent_log_path(state.agent, new_session_log_path())
-        bind_agent_token_session(state, state.agent)
+        reset_agent_token_session(state, state.agent)
     state.messages.clear()
     state.current_title = "main"
     state.selected_session = "main"
@@ -14882,7 +15473,7 @@ def new_temporary_session(state: State, keep_running: bool = True) -> bool:
         except Exception:
             pass
     set_agent_log_path(state.agent, os.devnull)
-    bind_agent_token_session(state, state.agent)
+    reset_agent_token_session(state, state.agent)
     state.messages.clear()
     state.current_title = "临时会话"
     state.selected_session = "temp"
@@ -15126,7 +15717,12 @@ def process_summary_text(text: str) -> str:
     summaries = SUMMARY_RE.findall(text or "")
     if not summaries:
         return ""
-    return compact_description(summaries[-1], 220)
+    summary = compact_description(summaries[-1], 220)
+    if is_process_only_session_title(summary):
+        thinking = THINKING_BLOCK_RE.findall(text or "")
+        if thinking:
+            return compact_description(thinking[-1].strip(" \t\r\n\"'“”‘’"), 220)
+    return summary
 
 
 def process_title_text(text: str) -> str:
@@ -15775,6 +16371,14 @@ def process_speech_summary_line(marker: str, body: str, summary: str) -> str:
     return f"· 过程 {turn_label}: {summary}{suffix}"
 
 
+def append_process_summary_line(rendered: list[str], marker: str, body: str) -> bool:
+    summary = process_summary_text(body)
+    if summary and summary != "执行中":
+        rendered.append(process_speech_summary_line(marker, body, summary))
+        return True
+    return False
+
+
 def expanded_process_header(marker: str, body: str, current: bool) -> str:
     turn = TURN_NO_RE.search(marker or "")
     turn_label = f"Turn {turn.group(1)}" if turn else "Turn"
@@ -15886,6 +16490,15 @@ def strip_tool_output_blocks(text: str) -> str:
     return text
 
 
+def strip_standalone_dot_lines(text: str) -> str:
+    lines = [
+        line
+        for line in (text or "").splitlines()
+        if line.strip() != "."
+    ]
+    return "\n".join(lines).strip()
+
+
 def visible_reply_text(body: str, hide_detail_fences: bool = False) -> str:
     """Keep user-facing prose while dropping tool-call/result noise."""
     text = strip_meta_blocks(body)
@@ -15896,7 +16509,7 @@ def visible_reply_text(body: str, hide_detail_fences: bool = False) -> str:
         text = TOOL_HEADER_RE.sub("", text)
         text = FINAL_RESPONSE_INFO_RE.sub("", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
+    return strip_standalone_dot_lines(text)
 
 
 def close_unbalanced_markdown_fence(text: str) -> str:
@@ -15940,6 +16553,8 @@ def append_process_turn(
             return
         if has_call_noise:
             rendered.append(process_speech_header(marker, body))
+        else:
+            append_process_summary_line(rendered, marker, body)
         rendered.append(final_text)
         if has_call_noise and fold_details:
             rendered.append(process_detail_line(marker, body, current=current))
@@ -16055,6 +16670,7 @@ def render_assistant_text(
                 continue
             final_text = visible_reply_text(body, hide_detail_fences=False)
             if final_text:
+                append_process_summary_line(rendered, marker, body)
                 rendered.append(final_text)
             else:
                 summary = process_summary_text(body) or process_preview(body)
@@ -16080,6 +16696,7 @@ def render_assistant_text(
             else:
                 final_text = visible_reply_text(body, hide_detail_fences=False)
                 if final_text:
+                    append_process_summary_line(rendered, marker, body)
                     rendered.append(final_text)
                 else:
                     summary = process_summary_text(body) or process_preview(body)
@@ -16093,6 +16710,7 @@ def render_assistant_text(
             else:
                 final_text = visible_reply_text(body, hide_detail_fences=False)
                 if final_text:
+                    append_process_summary_line(rendered, marker, body)
                     rendered.append(final_text)
                 else:
                     summary = process_summary_text(body) or process_preview(body)
@@ -17845,7 +18463,7 @@ def memory_entry_for(layer: str, path: str, note: str = "", *, root: str = "") -
 
 
 def memory_inventory() -> list[MemoryEntry]:
-    maybe_bootstrap_shuheng_legacy_state()
+    ensure_shuheng_layered_memory_files()
     memory_root = SHUHENG_MEMORY_DIR
     entries: list[MemoryEntry] = []
     for layer, filename, note in [
@@ -17894,15 +18512,15 @@ def memory_inventory() -> list[MemoryEntry]:
                 path = os.path.join(root, filename)
                 note = {
                     WORKSPACE_MANIFEST_FILENAME: "工作区身份/边界 manifest",
-                    WORKSPACE_MEMORY_FILENAME: "手动选择的项目工作区记忆",
+                    WORKSPACE_MEMORY_FILENAME: "工作区辅助 provenance 记忆",
                     WORKSPACE_INDEX_FILENAME: "工作区聚合索引",
                     WORKSPACE_L4_INDEX_FILENAME: "L4 冷归档引用索引",
-                    "active.json": "当前手动选择的工作区",
+                    "active.json": "最近自动推断的工作区",
                 }.get(filename, "工作区辅助文件")
                 item = memory_entry_for("Workspace", path, note, root=SHUHENG_HOME)
                 if item:
                     entries.append(item)
-    order = {"L1": 0, "L2": 1, "L0": 2, "Workspace": 3, "L3": 4, "Agent": 5, "Harness": 6, "L4": 7}
+    order = {"L1": 0, "L2": 1, "L0": 2, "L3": 3, "L4": 4, "Workspace": 5, "Agent": 6, "Harness": 7}
     entries.sort(key=lambda item: (order.get(item.layer, 99), item.label.lower()))
     return entries
 
@@ -20512,6 +21130,10 @@ def submit(state: State, text: str) -> None:
     if text == "/categories":
         add_system(state, format_category_counts(state))
         return
+    m_curate_history = re.match(r"/(?:curate-history|history-curate)(?:\s+([\s\S]*))?\s*$", text, re.I)
+    if m_curate_history:
+        start_history_curator_skill(state, m_curate_history.group(1) or "", text)
+        return
     m_catname = re.match(r"/catname\s+(.+?)\s+(.+?)\s*$", text, re.I)
     if m_catname:
         add_system(state, rename_category(state, m_catname.group(1), m_catname.group(2)))
@@ -21946,6 +22568,13 @@ def process_ui_queue(state: State) -> bool:
                         restore_secret_runtime_after_inflight_work(state)
                         state.last_error = "Secret 后台任务完成时 Vault 已锁定；结果仅保留在内存，解锁后可查看。"
                 else:
+                    persist_transcript_bridge_turn(
+                        bg.agent,
+                        bg.messages,
+                        display_text,
+                        source=bg.active_task_source,
+                        temporary_session=bg.temporary_session,
+                    )
                     apply_tui_controls_from_text(state, text, source="background-agent", default_target=getattr(bg.agent, "log_path", "") or "current")
                     if maybe_autoname_background_session(state, bg):
                         changed = True
@@ -22006,6 +22635,13 @@ def process_ui_queue(state: State) -> bool:
                 suffix = f" Secret 子 agent 控制已加密执行 {applied_secret_controls} 个。" if applied_secret_controls else (" Secret 输出中的非子 agent TUI 控制已忽略。" if had_tui_controls else "")
                 state.last_error = (f"Secret transcript encrypted: {os.path.basename(secret_ref)}" if ok else secret_ref) + suffix
             else:
+                persist_transcript_bridge_turn(
+                    state.agent,
+                    state.messages,
+                    display_text,
+                    source=finished_source,
+                    temporary_session=state.temporary_session,
+                )
                 control_results = apply_tui_controls_from_text(state, text, source="agent", default_target="current")
                 if maybe_autoname_current_session(state):
                     state.dirty = True
@@ -23058,6 +23694,7 @@ def run(stdscr) -> dict[str, Any]:
         state = State(agent=new_agent())
         install_interaction_hook(state, state.agent)
         state.token_usage_registry = load_token_usage_registry()
+        state.token_usage_registry_signature = token_usage_file_signature()
         bind_agent_token_session(state, state.agent)
         load_subagents(state)
         if load_history(state, force=True):

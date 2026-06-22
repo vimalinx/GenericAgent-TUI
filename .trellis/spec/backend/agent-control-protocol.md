@@ -57,6 +57,143 @@ Keep advertising `ga-tui` as a user-facing compatibility command, or rename ever
 
 Expose only `shuheng*` user commands and Shuheng/枢衡 UI strings, while preserving legacy protocol/module/env names until a dedicated compatibility migration is designed.
 
+## Scenario: Session History Titles Ignore Process Summaries
+
+### 1. Scope / Trigger
+
+- Trigger: Runtime providers can emit foldable process blocks such as `**LLM Running (Turn 1) ...**`, `<summary>specific thinking excerpt</summary>`, legacy `<summary>OMP 思考</summary>`, `<thinking>...</thinking>`, tool-call blocks, and tool result fences.
+- Applies to: session history preview caching, sidebar title fallback, restored-session preview messages, AI-generated title/description context, and `session_meta.json` cache reuse.
+- Non-goal: This does not remove process summaries from the main transcript renderer. Folded process summaries remain visible as process UI labels when rendering the assistant message itself.
+
+### 2. Signatures
+
+- History row source: `cached_session_rows(state, exclude_pid)` returns `(path, last_user_at, preview, rounds, description)`.
+- Sidebar display source: `load_history()` maps `session_names.json` or `preview` into `state.history_names`.
+- Process filtering helpers: `session_preview_from_pairs()`, `session_response_preview_text()`, `session_summary_titles_from_text()`, and `history_cache_has_process_only_preview()`.
+
+### 3. Contracts
+
+- Process-only summaries must not become `preview`, `description`, `ui_preview_messages`, `state.history_names`, or AI title-generation context.
+- If a response contains process markers, `<summary>` content belongs to process rendering, not session naming.
+- For process-marked responses, sidebar title fallback should prefer the first user message, then visible final assistant prose.
+- Existing cached metadata that already contains process-only preview text must be invalidated and recomputed from the raw model response file.
+- Explicit user names in `session_names.json` win unless they are process-only labels such as `OMP 思考`.
+- Standalone progress-dot deltas from OMP (`.` on its own line) are process noise and must not render in the transcript.
+- Current OMP thinking process summaries should use a compact excerpt of the thinking text, not the fixed label `OMP 思考`.
+- Legacy process blocks with `<summary>OMP 思考</summary>` should render a compact excerpt from the `<thinking>` body.
+
+### 4. Validation & Error Matrix
+
+- Raw response has `<summary>OMP 思考</summary>` plus final visible prose -> sidebar title uses the user task, not `OMP 思考`.
+- Cached metadata has `preview:"OMP 思考"` and matching file mtime/size -> cache is treated stale and recomputed.
+- AI title context includes a process block -> context includes user text and visible final prose, not hidden thinking text.
+- Main transcript renderer sees process blocks -> folded process UI still shows the process label.
+- Main transcript renderer sees a legacy thinking block plus a standalone `.` line -> renders the thinking excerpt and suppresses the dot line.
+
+### 5. Good/Base/Bad Cases
+
+- Good: History row title is `修复左栏历史会话标题` while restored assistant preview says `已完成历史会话标题修复`.
+- Good: Main transcript shows `过程 Turn 15: Let me observe the page...`, not `过程 Turn 15: OMP 思考`.
+- Base: A normal non-process assistant `<summary>` can still be used as a title candidate.
+- Bad: Sidebar `Recent` shows `OMP 思考`, `执行中`, or a tool-call label as the session title.
+- Bad: Main transcript shows standalone `.` lines between process turns.
+
+### 6. Tests Required
+
+- `scripts/check_policy_gates.py` must assert OMP process summaries do not title history rows.
+- The test must seed a stale `session_meta.json` cache with `preview:"OMP 思考"` to prove cache invalidation.
+- The test must assert restored preview messages and AI title context exclude process-only summary and hidden reasoning.
+- Tests must assert OMP thinking summaries use thinking excerpts, legacy `OMP 思考` summaries render from `<thinking>`, and standalone dot deltas/lines are suppressed.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```text
+SESSIONS
+S01 OMP 思考
+```
+
+#### Correct
+
+```text
+SESSIONS
+S01 修复左栏历史会话标题
+```
+
+## Scenario: History Curator Skill Command
+
+### 1. Scope / Trigger
+
+- Trigger: Users want categorized history to be summarized as a reusable skill workflow with progressive disclosure, memory-candidate extraction, and long-running subagent recommendations.
+- Applies to: `/curate-history`, `/history-curate`, history index generation, category summaries, artifact refs, memory-candidate recommendation text, and persistent-subagent recommendation text.
+- Non-goal: This command does not directly write long-term memory, does not directly create persistent subagents, and does not read full raw session logs before the curator asks for deeper disclosure.
+
+### 2. Signatures
+
+- Commands: `/curate-history [scope]` and `/history-curate [scope]`.
+- Scope forms:
+  - empty, `recent`, or `最近` -> recent visible sessions.
+  - `all` or `全部` -> all visible sessions up to the bounded limit.
+  - `pinned`, `pin`, or `置顶` -> pinned visible sessions.
+  - `cat:<name>`, `category:<name>`, or `分类:<name>` -> sessions in a category.
+  - `search:<query>`, `q:<query>`, or `查找:<query>` -> cached title/summary/category search.
+  - `limit=N`, `--limit N`, `限制 N`, or trailing number -> bounded result count.
+- Prompt builder: `history_curator_skill_prompt(state, raw_args)` returns `(prompt, artifact_ref, rows)`.
+- Index writer: `write_harness_artifact("history-curation-index", ...)` stores the index under Shuheng-owned `AGENT_HARNESS_DIR`.
+
+### 3. Contracts
+
+- The first curator turn receives only history index fields and cached summaries: stable id, title, category, rounds, age, flags, evidence ref, source path, and cached description.
+- The first curator turn must label the disclosure level as `index+cached_summary_only`.
+- The generated prompt must include nested mental subskills: `history-classifier`, `category-digest`, `memory-curator`, and `subagent-recommender`.
+- The curator output contract must include Category Digest, Memory Candidates, Archive Only / Do Not Memorize, Persistent Subagent Recommendations, and Needs Deeper Disclosure.
+- Memory candidates are recommendation-only in this command. Any actual memory write must later go through `queue_curated_memory_candidate(...)` and human approval.
+- Persistent subagent creation is recommendation-only in this command. Any actual creation must later use explicit `agent.create` with `lifecycle:"persistent"` or `persistent:true`.
+- The curator may request deeper disclosure for at most 3 stable session ids per turn and must state why each raw session is needed.
+- The command starts a main-agent task with source `user:history_curator_skill` and shows the literal command as the visible user message.
+
+### 4. Validation & Error Matrix
+
+- No matching rows -> user-visible message says there is no history to curate and no main-agent task is started.
+- Category scope with no matching category -> same empty-history behavior.
+- Limit above maximum -> clamped to the command maximum.
+- Hidden/deleted rows -> not included because `load_history()` and `session_meta` filtering remain the source of truth.
+- Secret Vault unlocked -> normal command isolation blocks this command before it can read normal history.
+- Curator says a memory should be stored -> it must still be output as a candidate, not appended to memory files.
+- Curator says a long-running agent is useful -> it must still be output as a recommendation, not an executable creation control unless the user separately asks for creation.
+
+### 5. Good/Base/Bad Cases
+
+- Good: `/curate-history cat:Shuheng limit=5` creates a `history-curation-index` artifact and starts a main-agent task that only sees Shuheng category cached summaries.
+- Good: The output proposes `Memory Candidates` with `evidence_refs:["session://..."]` and confidence, but does not write approved memory.
+- Good: The output recommends a persistent `History Curator` subagent with role/profile/boundaries, but does not create it.
+- Base: `/curate-history recent` summarizes the currently visible recent history list.
+- Bad: The command reads every raw `model_responses*.txt` file before deciding which sessions matter.
+- Bad: The command emits an executable persistent `agent.create` control block without a separate user request.
+- Bad: The command appends directly to `subagents/*/memory.md`.
+
+### 6. Tests Required
+
+- `scripts/check_policy_gates.py` must assert category-scoped `/curate-history` builds an index artifact with only matching session rows.
+- Tests must assert the generated prompt contains progressive disclosure rules, nested subskill names, candidate-only memory wording, and recommendation-only persistent-subagent wording.
+- Tests must assert the command starts the main agent with source `user:history_curator_skill` and preserves the literal command as the visible user message.
+- Tests must assert non-matching category scopes do not start a main-agent task.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```text
+/curate-history -> read all raw history -> append facts to memory.md -> create persistent agents automatically
+```
+
+#### Correct
+
+```text
+/curate-history cat:Shuheng limit=5 -> index artifact + cached summaries -> candidate recommendations + subagent recommendations -> user-approved follow-up actions
+```
+
 ## Scenario: OMP Runtime Permission Profiles
 
 ### 1. Scope / Trigger

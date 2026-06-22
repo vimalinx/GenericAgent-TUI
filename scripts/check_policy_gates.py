@@ -493,6 +493,130 @@ def assert_shuheng_history_storage_owned() -> None:
     assert "GenericAgent 的 model_responses" not in Path(a.__file__).read_text(encoding="utf-8")
 
 
+def assert_token_usage_registry_prunes_removed_history() -> None:
+    root = tempfile.mkdtemp(prefix="ga_tui_token_usage_")
+    retarget_harness(root)
+    os.makedirs(a.MODEL_RESPONSES_DIR, exist_ok=True)
+
+    live_key = "model_responses_live.txt"
+    deleted_key = "model_responses_deleted.txt"
+    hidden_key = "model_responses_hidden.txt"
+    missing_key = "model_responses_missing.txt"
+    external_key = "external-session-key"
+    live_path = os.path.join(a.MODEL_RESPONSES_DIR, live_key)
+    Path(live_path).write_text("live", encoding="utf-8")
+    a.write_text_atomic(a.SESSION_META_PATH, json.dumps({
+        live_key: {},
+        deleted_key: {"deleted": True},
+        hidden_key: {"hidden_subagent_log": True},
+        missing_key: {},
+    }, ensure_ascii=False))
+    a.write_text_atomic(a.TOKEN_USAGE_PATH, json.dumps({
+        live_key: {"requests": 1, "input": 10, "output": 5, "cache_create": 0, "cache_read": 0},
+        deleted_key: {"requests": 2, "input": 20, "output": 6, "cache_create": 0, "cache_read": 0},
+        hidden_key: {"requests": 3, "input": 30, "output": 7, "cache_create": 0, "cache_read": 0},
+        missing_key: {"requests": 4, "input": 40, "output": 8, "cache_create": 0, "cache_read": 0},
+        external_key: {"requests": 5, "input": 50, "output": 9, "cache_create": 0, "cache_read": 0},
+    }, ensure_ascii=False))
+
+    registry = a.load_token_usage_registry()
+    assert live_key in registry, registry
+    assert external_key in registry, registry
+    assert deleted_key not in registry, registry
+    assert hidden_key not in registry, registry
+    assert missing_key not in registry, registry
+
+    state = a.State(agent=FakeAgent())
+    state.token_usage_registry = registry
+    a.remove_session_token_usage(state, live_path)
+    persisted = json.loads(Path(a.TOKEN_USAGE_PATH).read_text(encoding="utf-8"))
+    assert live_key not in persisted, persisted
+    assert external_key in persisted, persisted
+    a.write_text_atomic(a.TOKEN_USAGE_PATH, "{}\n")
+    state.token_usage_registry = {live_key: {"requests": 7, "input": 70, "output": 11, "cache_create": 0, "cache_read": 0}}
+    state.token_usage_registry_signature = (0.0, -1)
+    assert a.refresh_state_token_usage_registry(state) is True
+    assert state.token_usage_registry == {}, state.token_usage_registry
+
+    class TokenAgent:
+        def __init__(self, path: str, thread_name: str) -> None:
+            self.log_path = path
+            self._ga_tui_thread_name = thread_name
+
+        def abort(self) -> None:
+            return None
+
+    class FakeTokenStats:
+        def __init__(self, requests: int = 0, input: int = 0, output: int = 0, cache_create: int = 0, cache_read: int = 0) -> None:
+            self.requests = requests
+            self.input = input
+            self.output = output
+            self.cache_create = cache_create
+            self.cache_read = cache_read
+            self.last_input = input
+            self.last_output = output
+
+        def total_input_side(self) -> int:
+            return self.input + self.cache_create + self.cache_read
+
+        def total_tokens(self) -> int:
+            return self.input + self.output + self.cache_create + self.cache_read
+
+        def cache_hit_rate(self) -> float:
+            side = self.total_input_side()
+            return (self.cache_read / side * 100.0) if side else 0.0
+
+    class FakeCostTracker:
+        TokenStats = FakeTokenStats
+
+        def __init__(self) -> None:
+            self.stats = FakeTokenStats(requests=1, input=100, output=50)
+            self.reset_calls: list[str] = []
+
+        def get(self, _thread_name: str) -> FakeTokenStats:
+            return self.stats
+
+        def reset(self, thread_name: str) -> None:
+            self.reset_calls.append(thread_name)
+            self.stats = FakeTokenStats()
+
+        def context_window_chars(self, _backend: object) -> int:
+            return 0
+
+        def current_input_chars(self, _backend: object) -> int:
+            return 0
+
+    current_path = os.path.join(a.MODEL_RESPONSES_DIR, "model_responses_current.txt")
+    Path(current_path).write_text("current", encoding="utf-8")
+    current_key = os.path.basename(current_path)
+    token_state = a.State(agent=TokenAgent(current_path, "token-current"))
+    token_state.token_usage_registry = {current_key: {"requests": 9, "input": 900, "output": 90, "cache_create": 0, "cache_read": 0}}
+    a.save_state_token_usage_registry(token_state)
+
+    old_cost_tracker = a.cost_tracker
+    fake_tracker = FakeCostTracker()
+    try:
+        a.cost_tracker = fake_tracker
+        result = a.apply_session_operation(token_state, "delete", "current", source="/delete")
+        assert "已删除到回收站" in result, result
+        after_delete = json.loads(Path(a.TOKEN_USAGE_PATH).read_text(encoding="utf-8"))
+        assert current_key not in after_delete, after_delete
+        assert fake_tracker.reset_calls == ["token-current"], fake_tracker.reset_calls
+        assert token_state.token_live_offsets["token-current"] == a.empty_token_stats_dict(), token_state.token_live_offsets
+
+        next_path = os.path.join(a.MODEL_RESPONSES_DIR, "model_responses_next.txt")
+        Path(next_path).write_text("next", encoding="utf-8")
+        fake_tracker.stats = FakeTokenStats(requests=2, input=200, output=80)
+        next_state = a.State(agent=TokenAgent(next_path, "token-next"))
+        next_state.token_live_offsets["token-next"] = a.empty_token_stats_dict()
+        assert a.new_current_session(next_state, keep_running=False) is False
+        assert fake_tracker.reset_calls[-1] == "token-next", fake_tracker.reset_calls
+        assert next_state.token_live_offsets["token-next"] == a.empty_token_stats_dict(), next_state.token_live_offsets
+        assert a.session_token_stats(next_state, next_state.agent).total_tokens() == 0
+    finally:
+        a.cost_tracker = old_cost_tracker
+
+
 def assert_shuheng_workspace_memory_context() -> None:
     root = tempfile.mkdtemp(prefix="ga_tui_workspaces_")
     retarget_harness(root)
@@ -533,7 +657,9 @@ def assert_shuheng_workspace_memory_context() -> None:
 
         pack_with_memory, _ref_with_memory = a.build_main_runtime_context_pack(state, "use project memory", "task_workspace_auto_memory")
         assert "Use this auto project fact." in str(pack_with_memory["layers"]["L2_project_memory"]["items"]), pack_with_memory["layers"]["L2_project_memory"]
-        workspace_memory_entries = [row for row in pack_with_memory["memory_pack"]["included"] if row.get("scope") == "workspace.project"]
+        layered_entries = [row for row in pack_with_memory["memory_pack"]["included"] if row.get("scope") == "shuheng.layered-memory"]
+        assert layered_entries, pack_with_memory["memory_pack"]
+        workspace_memory_entries = [row for row in pack_with_memory["memory_pack"]["included"] if row.get("scope") == "workspace.project-provenance"]
         assert workspace_memory_entries, pack_with_memory["memory_pack"]
         assert workspace_memory_entries[-1]["refs"], workspace_memory_entries[-1]
 
@@ -679,14 +805,14 @@ def assert_ohmypi_memory_prompt_and_command() -> None:
     harness = tempfile.mkdtemp(prefix="ga_tui_omp_harness_")
     memory_dir = os.path.join(root, "memory")
     os.makedirs(memory_dir, exist_ok=True)
-    Path(memory_dir, "global_mem_insight.txt").write_text("remember useful path\n", encoding="utf-8")
+    Path(memory_dir, "global_mem_insight.txt").write_text("api_key: SHOULD_NOT_LEAK\nremember useful path\n", encoding="utf-8")
     Path(memory_dir, "global_mem.txt").write_text("api_key: SHOULD_NOT_LEAK\nvalidated fact\n", encoding="utf-8")
     Path(memory_dir, "memory_management_sop.md").write_text("No Execution, No Memory.\n", encoding="utf-8")
     prompt_path = omp.write_ohmypi_memory_prompt(root_dir=root, harness_dir=harness)
     prompt_text = Path(prompt_path).read_text(encoding="utf-8")
-    assert "GA/TUI Memory Guidance" in prompt_text, prompt_text
+    assert "Shuheng Layered Memory Guidance" in prompt_text, prompt_text
     assert "remember useful path" in prompt_text, prompt_text
-    assert "validated fact" in prompt_text, prompt_text
+    assert "global_mem.txt" in prompt_text, prompt_text
     assert "SHOULD_NOT_LEAK" not in prompt_text, prompt_text
     assert "[REDACTED]" in prompt_text, prompt_text
     command = omp.ohmypi_rpc_command(binary="/fake/omp", append_system_prompt=prompt_path)
@@ -1186,6 +1312,10 @@ def assert_ohmypi_rpc_process_blocks_fold_like_genericagent() -> None:
         },
     })
     process.stdout.push({
+        "type": "message_update",
+        "assistantMessageEvent": {"type": "text_delta", "delta": "."},
+    })
+    process.stdout.push({
         "type": "tool_execution_start",
         "toolCallId": "tool-read-1",
         "toolName": "read",
@@ -1210,18 +1340,21 @@ def assert_ohmypi_rpc_process_blocks_fold_like_genericagent() -> None:
     done, streamed = wait_for_queue_done(dq)
     text = done["done"]
     assert "**LLM Running (Turn 1) ...**" in text, text
-    assert "<summary>OMP 思考</summary>" in text, text
+    assert "<summary>Hidden OMP reasoning should be folded, not shown as final speech.</summary>" in text, text
+    assert "OMP 思考" not in text, text
+    assert "\n.\n" not in text, text
     assert "🛠️ Tool: `read` 📥 args:" in text, text
     assert final_reply in text, text
     assert streamed and streamed in text, streamed
 
     rendered = a.render_assistant_text(text, done=True, fold_process=True, message_index=20)
     assert "过程组 G21" in rendered, rendered
-    assert "OMP 思考" in rendered, rendered
+    assert "Hidden OMP reasoning should be folded" in rendered, rendered
+    assert "OMP 思考" not in rendered, rendered
     assert final_reply in rendered, rendered
     assert "README.md" not in rendered, rendered
     assert "README contents that should stay folded" not in rendered, rendered
-    assert "Hidden OMP reasoning" not in rendered, rendered
+    assert "\n.\n" not in rendered, rendered
 
     signal = omp.ohmypi_memory_candidate_signal(text, source="test", request_id="fold-1")
     assert signal is not None, signal
@@ -1257,12 +1390,27 @@ def assert_ohmypi_rpc_process_blocks_fold_like_genericagent() -> None:
     fallback_process.stdout.push({"type": "turn_end"})
     fallback_done, _fallback_streamed = wait_for_queue_done(fallback_q)
     fallback_text = fallback_done["done"]
-    assert "OMP 思考" in fallback_text, fallback_text
+    assert "OMP 思考" not in fallback_text, fallback_text
+    assert "fold this fallback thought" in fallback_text, fallback_text
     assert "fallback final reply stays visible" in fallback_text, fallback_text
     fallback_rendered = a.render_assistant_text(fallback_text, done=True, fold_process=True, message_index=21)
     assert "fallback final reply stays visible" in fallback_rendered, fallback_rendered
-    assert "fold this fallback thought" not in fallback_rendered, fallback_rendered
+    assert "fold this fallback thought" in fallback_rendered, fallback_rendered
     fallback_agent.close()
+
+    legacy_text = (
+        "**LLM Running (Turn 1) ...**\n"
+        "<summary>OMP 思考</summary>\n"
+        "<thinking>\nold hidden thought\n</thinking>\n\n"
+        ".\n\n"
+        "**LLM Running (Turn 2) ...**\n"
+        "<summary>调用 OMP 工具: read</summary>\n"
+        "🛠️ Tool: `read` 📥 args:\n````text\n{\"path\":\"README.md\"}\n````"
+    )
+    legacy_rendered = a.render_assistant_text(legacy_text, done=True, fold_process=True, message_index=22)
+    assert "old hidden thought" in legacy_rendered, legacy_rendered
+    assert "OMP 思考" not in legacy_rendered, legacy_rendered
+    assert "\n.\n" not in legacy_rendered, legacy_rendered
 
 
 def assert_ohmypi_rpc_env_model_switch_and_error_mapping() -> None:
@@ -3537,6 +3685,133 @@ def assert_recent_sessions_use_last_message_activity() -> None:
     assert all(a.normalized_path(item[0]) not in used_paths for _idx, item in deduped_recent), deduped_recent
 
 
+def assert_history_curator_skill_uses_progressive_disclosure() -> None:
+    root = tempfile.mkdtemp(prefix="ga_tui_history_curator_")
+    retarget_harness(root)
+    os.makedirs(a.MODEL_RESPONSES_DIR, exist_ok=True)
+
+    shuheng_path = os.path.join(a.MODEL_RESPONSES_DIR, "model_responses_shuheng_skill.txt")
+    other_path = os.path.join(a.MODEL_RESPONSES_DIR, "model_responses_other_skill.txt")
+    assert a.append_model_response_transcript_turn(
+        shuheng_path,
+        "修复左栏 token",
+        "已修复 token registry 刷新和 live tracker 重置。",
+    )
+    assert a.append_model_response_transcript_turn(
+        other_path,
+        "写一个小游戏",
+        "这是另一个分类里的临时任务。",
+    )
+    a.save_session_meta_registry({
+        os.path.basename(shuheng_path): {
+            "category": "Shuheng",
+            "description": "修复左栏 token；长期经验是历史侧栏异常先查 Shuheng-owned sidecars。",
+            "last_user_at": time.time(),
+        },
+        os.path.basename(other_path): {
+            "category": "Games",
+            "description": "一次性小游戏讨论。",
+            "last_user_at": time.time() - 60,
+        },
+    })
+    if a.session_names is not None:
+        a.session_names.set_name(shuheng_path, "Shuheng token 修复")
+        a.session_names.set_name(other_path, "小游戏")
+
+    state = a.State(agent=FakeLLMAgent())
+    state.running = True
+    prompt, artifact_ref, rows = a.history_curator_skill_prompt(state, "cat:Shuheng limit=5")
+    assert artifact_ref.startswith("artifact://artifacts/history-curation-index/"), artifact_ref
+    assert len(rows) == 1, rows
+    assert rows[0]["category"] == "Shuheng", rows
+    assert rows[0]["stable_id"] == "shuheng_skill", rows
+    assert "[Shuheng History Curator Skill]" in prompt, prompt
+    assert "Progressive disclosure protocol" in prompt, prompt
+    assert "Nested subskills" in prompt, prompt
+    assert "Do not write long-term memory directly" in prompt, prompt
+    assert "Do not create persistent subagents directly" in prompt, prompt
+    assert "Memory Candidates (candidate only" in prompt, prompt
+    assert "Persistent Subagent Recommendations (recommendation only" in prompt, prompt
+    assert "id:shuheng_skill" in prompt, prompt
+    assert "model_responses_shuheng_skill.txt" in prompt, prompt
+    assert "model_responses_other_skill.txt" not in prompt, prompt
+
+    a.submit(state, "/curate-history cat:Shuheng limit=5")
+    assert state.agent.prompts, state.agent.prompts
+    submitted_prompt, submitted_source = state.agent.prompts[-1]
+    assert submitted_source == "user:history_curator_skill", state.agent.prompts
+    assert "Index artifact: artifact://artifacts/history-curation-index/" in submitted_prompt, submitted_prompt
+    assert state.messages[0].role == "user" and state.messages[0].content == "/curate-history cat:Shuheng limit=5", state.messages
+
+    empty_state = a.State(agent=FakeLLMAgent())
+    empty_state.running = True
+    assert a.start_history_curator_skill(empty_state, "cat:Missing", "/curate-history cat:Missing") is False
+    assert empty_state.agent.prompts == [], empty_state.agent.prompts
+    assert any("没有可策展的历史会话" in msg.content for msg in empty_state.messages), empty_state.messages
+
+
+def assert_ohmypi_process_summary_does_not_title_history() -> None:
+    root = tempfile.mkdtemp(prefix="ga_tui_omp_title_")
+    retarget_harness(root)
+    os.makedirs(a.MODEL_RESPONSES_DIR, exist_ok=True)
+    path = os.path.join(a.MODEL_RESPONSES_DIR, "model_responses_omp_title.txt")
+    user_text = "修复左栏历史会话标题"
+    final_text = "已完成历史会话标题修复，左侧会显示用户任务。"
+    assistant_text = (
+        "**LLM Running (Turn 1) ...**\n"
+        "<summary>OMP 思考</summary>\n"
+        "<thinking>Hidden OMP reasoning must stay out of history titles.</thinking>\n\n"
+        f"{final_text}"
+    )
+    prompt = {"role": "user", "content": [{"type": "text", "text": user_text}]}
+    response = [{"type": "text", "text": assistant_text}]
+    a.write_text_atomic(
+        path,
+        "=== Prompt === 2026-06-22 09:19:20\n"
+        + json.dumps(prompt, ensure_ascii=False, indent=2)
+        + "\n\n=== Response === 2026-06-22 09:19:30\n"
+        + repr(response)
+        + "\n",
+    )
+    stat = os.stat(path)
+    a.save_session_meta_registry({
+        os.path.basename(path): {
+            "cache_mtime": stat.st_mtime,
+            "cache_size": stat.st_size,
+            "preview": "OMP 思考",
+            "rounds": 1,
+            "last_user_at": time.mktime(time.strptime("2026-06-22 09:19:20", "%Y-%m-%d %H:%M:%S")),
+            "description": "开始：修复左栏历史会话标题；摘要：OMP 思考",
+            "ui_preview_messages": [
+                {"role": "user", "content": user_text},
+                {"role": "assistant", "content": "（预览）OMP 思考"},
+            ],
+        }
+    })
+
+    state = a.State(agent=None)
+    assert a.load_history(state, force=True) is True
+    assert state.history_names[path] == user_text, state.history_names
+    assert "OMP 思考" not in state.history_names[path], state.history_names[path]
+    assert "OMP 思考" not in state.history_descriptions[path], state.history_descriptions[path]
+    assert "已完成历史会话标题修复" in state.history_descriptions[path], state.history_descriptions[path]
+
+    meta = a.load_session_meta_registry()[os.path.basename(path)]
+    assert meta["preview"] == user_text, meta
+    preview_messages = meta["ui_preview_messages"]
+    assert preview_messages[-1]["role"] == "assistant", preview_messages
+    assert "已完成历史会话标题修复" in preview_messages[-1]["content"], preview_messages
+    assert "OMP 思考" not in preview_messages[-1]["content"], preview_messages
+
+    messages = [a.Message("user", user_text), a.Message("assistant", assistant_text)]
+    assert a.suggested_session_title(messages) == user_text
+    title_context = a.ai_title_context(messages)
+    assert user_text in title_context, title_context
+    assert final_text in title_context, title_context
+    assert "OMP 思考" not in title_context, title_context
+    assert "Hidden OMP reasoning" not in title_context, title_context
+
+
 def assert_missing_source_history_rows_restore_from_l4_archive() -> None:
     root = tempfile.mkdtemp(prefix="ga_tui_missing_source_history_")
     retarget_harness(root)
@@ -3890,12 +4165,48 @@ def assert_new_agent_uses_shuheng_history_dir() -> None:
     assert agent.llmclient.backend.log_path == path
 
 
+def assert_ohmypi_main_turn_persists_model_response_history() -> None:
+    root = tempfile.mkdtemp(prefix="ga_tui_omp_history_")
+    retarget_harness(root)
+    os.makedirs(a.MODEL_RESPONSES_DIR, exist_ok=True)
+    agent = RuntimeCaptureFakeAgent()
+    path = a.new_session_log_path()
+    a.set_agent_log_path(agent, path)
+    if a.session_names is not None:
+        a.session_names.set_name(path, "OMP Transcript Smoke")
+    state = a.State(agent=agent)
+    state.running = True
+
+    assert a.start_main_agent_task(
+        state,
+        "今天的历史会话应该出现",
+        source="user",
+        visible_user_text="今天的历史会话应该出现",
+        remember_user=True,
+        clear_history=True,
+    )
+    drain_ui(state)
+
+    assert state.status == "idle", state.status
+    assert state.messages[-1].content == "runtime ok", state.messages[-1]
+    content = Path(path).read_text(encoding="utf-8")
+    pairs = a._pairs(content)
+    assert pairs, content
+    assert a._user_text(pairs[-1][0]) == "今天的历史会话应该出现", pairs[-1][0]
+    assert "runtime ok" in a._format_response_segment(pairs[-1][1], {}), pairs[-1][1]
+    assert any(row[0] == path for row in state.history), state.history
+    meta = a.load_session_meta_registry().get(os.path.basename(path), {})
+    assert meta.get("rounds") == 1, meta
+    assert meta.get("last_user_at"), meta
+
+
 def run_checks() -> None:
     assert_scheduler_module_boundary()
     assert_genericagent_provider_module_boundary()
     assert_ohmypi_provider_module_boundary()
     assert_shuheng_brand_entrypoints()
     assert_shuheng_history_storage_owned()
+    assert_token_usage_registry_prunes_removed_history()
     assert_shuheng_workspace_memory_context()
     assert_shuheng_bootstraps_legacy_state_without_mutating_source()
     assert_ohmypi_runtime_registry()
@@ -3934,11 +4245,14 @@ def run_checks() -> None:
     assert_tui_query_tools_expose_dashboard_state()
     assert_historical_subagent_result_quarantine_backfill()
     assert_recent_sessions_use_last_message_activity()
+    assert_history_curator_skill_uses_progressive_disclosure()
+    assert_ohmypi_process_summary_does_not_title_history()
     assert_missing_source_history_rows_restore_from_l4_archive()
     assert_self_intro_does_not_consume_mutual_chat_step()
     assert_control_result_continues_intermediate_workflow_step()
     assert_temp_session_is_non_persistent()
     assert_new_agent_uses_shuheng_history_dir()
+    assert_ohmypi_main_turn_persists_model_response_history()
 
     root = tempfile.mkdtemp(prefix="ga_tui_policy_check_")
     retarget_harness(root)

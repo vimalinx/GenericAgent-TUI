@@ -32,7 +32,7 @@ HostToolHandler = Callable[[str, dict[str, Any]], dict[str, Any]]
 RuntimeEventSink = Callable[[RuntimeTaskEvent], None]
 
 GA_TUI_MEMORY_PROMPT_FILENAME = "ohmypi-ga-tui-memory.md"
-GA_TUI_MEMORY_PROMPT_HEADER = "GA/TUI Memory Guidance"
+GA_TUI_MEMORY_PROMPT_HEADER = "Shuheng Layered Memory Guidance"
 OHMYPI_RUNTIME_DIRNAME = "ohmypi"
 OHMYPI_AGENT_DIRNAME = "agent"
 MAX_HOST_TOOL_RESULT_CHARS = 12000
@@ -269,13 +269,29 @@ def _bounded_host_tool_text(value: Any, *, max_chars: int = MAX_HOST_TOOL_RESULT
     return text
 
 
+def _bounded_process_text(text: str, *, max_chars: int = MAX_HOST_TOOL_RESULT_CHARS) -> str:
+    result = _redact_memory_text(str(text or "")).strip()
+    if len(result) > max_chars:
+        result = result[:max_chars].rstrip() + "\n...[truncated]"
+    return result
+
+
 def _compact_process_summary(text: str, *, max_chars: int = 140) -> str:
     summary = re.sub(r"\s+", " ", str(text or "")).strip()
     summary = summary.replace("<summary>", "").replace("</summary>", "")
     summary = summary.replace("<thinking>", "").replace("</thinking>", "")
+    summary = summary.strip(" \t\r\n\"'“”‘’")
     if len(summary) > max_chars:
         summary = summary[:max_chars].rstrip() + "..."
-    return summary or "OMP runtime event"
+    return summary or "runtime event"
+
+
+def _thinking_process_summary(thinking: str) -> str:
+    return _compact_process_summary(thinking, max_chars=120) or "思考"
+
+
+def _is_standalone_dot_delta(delta: str) -> bool:
+    return str(delta or "").strip() == "."
 
 
 def _safe_process_tool_name(tool_name: str) -> str:
@@ -882,8 +898,9 @@ class OhMyPiRpcAgent:
                 return
             thinking = active.pending_thinking
             active.pending_thinking = ""
-        body = "<thinking>\n" + _bounded_host_tool_text(thinking, max_chars=MAX_PROCESS_RESULT_CHARS) + "\n</thinking>"
-        self._append_active_process_block("OMP 思考", body)
+        thinking_text = _bounded_process_text(thinking, max_chars=MAX_PROCESS_RESULT_CHARS)
+        body = "<thinking>\n" + thinking_text + "\n</thinking>"
+        self._append_active_process_block(_thinking_process_summary(thinking_text), body)
 
     def _append_active_tool_call_process(self, tool_name: str, args: Any, *, summary: str = "") -> None:
         self._flush_active_thinking()
@@ -925,6 +942,8 @@ class OhMyPiRpcAgent:
 
     def _append_active_delta(self, delta: str) -> None:
         if not delta:
+            return
+        if _is_standalone_dot_delta(delta):
             return
         self._flush_active_thinking()
         with self._active_lock:
@@ -1407,6 +1426,10 @@ def _redact_memory_text(text: str) -> str:
     return redacted
 
 
+def redact_memory_text(text: str) -> str:
+    return _redact_memory_text(text)
+
+
 def _bounded_section(title: str, path: str, text: str, *, max_chars: int = 2200) -> str:
     text = _redact_memory_text(text).strip()
     if len(text) > max_chars:
@@ -1416,24 +1439,52 @@ def _bounded_section(title: str, path: str, text: str, *, max_chars: int = 2200)
     return f"## {title}\n\nSource: `{path}`\n\n{text}\n"
 
 
+def _shuheng_memory_structure(*, memory_dir: str, harness_dir: str) -> str:
+    global_path = os.path.join(memory_dir, "global_mem.txt")
+    sop_path = os.path.join(memory_dir, "memory_management_sop.md")
+    l4_path = os.path.join(memory_dir, "L4_raw_sessions")
+    return (
+        f"Facts(L2): {global_path} | "
+        f"SOPs(L3): {memory_dir}/*.md or *.py | "
+        f"META-SOP(L0): {sop_path}\n"
+        f"L4: {l4_path} historical sessions; use refs/indexes, do not mine directly.\n"
+        f"Harness: {harness_dir}; memory writes are candidate-only through Shuheng governance."
+    )
+
+
 def build_ohmypi_memory_prompt(*, root_dir: str, harness_dir: str) -> str:
     memory_dir = os.path.join(root_dir, "memory")
     insight_path = os.path.join(memory_dir, "global_mem_insight.txt")
     global_path = os.path.join(memory_dir, "global_mem.txt")
     sop_path = os.path.join(memory_dir, "memory_management_sop.md")
+    insight = _redact_memory_text(_read_text_if_exists(insight_path, max_chars=3500)).strip()
+    if not insight:
+        insight = "(not available)"
     sections = [
         f"# {GA_TUI_MEMORY_PROMPT_HEADER}",
         "",
         "You are running as the Oh My Pi execution runtime inside Shuheng.",
         "Shuheng remains the Orchestrator: it owns task ledgers, approvals, artifact refs, and long-term memory governance.",
-        "Use the memory below as heuristic context. Verify current repository state before acting when memory could be stale.",
-        "Do not write long-term memory directly. If execution reveals a durable, verified lesson, include it in your final answer under `Memory candidates` with evidence refs.",
+        "Use this GenericAgent-style layered memory as routing context. Read referenced files only when needed and verify current repository state before acting when memory could be stale.",
+        "Do not write long-term memory directly. If execution reveals a durable, verified lesson, submit or report a memory candidate with evidence refs.",
         "Never expose or store secrets. Treat redacted or credential-looking content as unavailable.",
         "",
-        _bounded_section("L1 Global Memory Index", insight_path, _read_text_if_exists(insight_path, max_chars=3500), max_chars=2600),
-        _bounded_section("L2 Global Memory Facts", global_path, _read_text_if_exists(global_path, max_chars=3500), max_chars=2600),
-        _bounded_section("L0 Memory Governance", sop_path, _read_text_if_exists(sop_path, max_chars=2800), max_chars=2200),
-        "## TUI Governance Refs",
+        f"cwd = {os.path.join(harness_dir, 'runtime')} (./)",
+        "",
+        f"[Memory] ({memory_dir})",
+        _shuheng_memory_structure(memory_dir=memory_dir, harness_dir=harness_dir),
+        f"{insight_path}:",
+        insight,
+        "",
+        _bounded_section("L0 Memory Governance Preview", sop_path, _read_text_if_exists(sop_path, max_chars=2800), max_chars=2200),
+        "## Layer References",
+        "",
+        f"- L1 global memory index: `{insight_path}`",
+        f"- L2 global facts: `{global_path}`",
+        f"- L3 SOPs/tools: `{memory_dir}`",
+        f"- L4 raw sessions: `{os.path.join(memory_dir, 'L4_raw_sessions')}`",
+        "",
+        "## Shuheng Governance Refs",
         "",
         f"- Runtime harness dir: `{harness_dir}`",
         "- Architecture baseline: `docs/agent-harness-architecture.md`",
@@ -1583,6 +1634,7 @@ __all__ = [
     "ohmypi_rpc_command",
     "ohmypi_runtime_root",
     "ohmypi_subprocess_env",
+    "redact_memory_text",
     "resolve_ohmypi_binary",
     "write_ohmypi_runtime_files",
     "write_ohmypi_memory_prompt",
