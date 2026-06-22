@@ -4483,12 +4483,12 @@ def assert_long_secret_render_reuses_stable_message_blocks() -> None:
         scoped_meta,
     )
     stable_block = state.message_block_cache[stable_key]
+    streaming_block = state.message_block_cache[streaming_key_frame0]
     assert streaming_key_frame0 in state.message_block_cache, state.message_block_cache.keys()
 
     state.run_frame = 1
     a.message_lines_cached(state, 80)
     assert state.message_block_cache[stable_key] is stable_block
-    assert streaming_key_frame0 not in state.message_block_cache
     streaming_key_frame1 = a.message_render_cache_key(
         state.messages[-1],
         len(state.messages) - 1,
@@ -4501,7 +4501,36 @@ def assert_long_secret_render_reuses_stable_message_blocks() -> None:
         state.expanded_process_turns,
         scoped_meta,
     )
+    assert streaming_key_frame1 == streaming_key_frame0
     assert streaming_key_frame1 in state.message_block_cache, state.message_block_cache.keys()
+    assert state.message_block_cache[streaming_key_frame1] is streaming_block
+
+
+def assert_stream_queue_coalesces_burst_updates() -> None:
+    state = a.State(agent=None)
+    target = a.StreamTarget("active")
+    dq: queue.Queue = queue.Queue()
+    for chunk in ("a", "b", "c", "d", "e"):
+        dq.put({"next": chunk})
+    dq.put({
+        "done": "abcde",
+        "usage": {"requests": 1, "input": 2, "output": 3, "cache_create": 0, "cache_read": 0},
+    })
+    old_interval = a.STREAM_UI_FLUSH_INTERVAL
+    try:
+        a.STREAM_UI_FLUSH_INTERVAL = 3600.0
+        a.consume_queue(state, target, 7, dq)
+    finally:
+        a.STREAM_UI_FLUSH_INTERVAL = old_interval
+    items: list[tuple] = []
+    while not state.ui_queue.empty():
+        items.append(state.ui_queue.get_nowait())
+    stream_items = [item for item in items if item[0] == "stream"]
+    usage_items = [item for item in items if item[0] == "token_usage"]
+    assert len(stream_items) == 2, stream_items
+    assert stream_items[0] == ("stream", target, 7, "a", False), stream_items
+    assert stream_items[-1] == ("stream", target, 7, "abcde", True), stream_items
+    assert usage_items and usage_items[0][1:4] == ("stream", target, 7), items
 
 
 def assert_secret_native_restore_hydrates_backend_context_blocks() -> None:
@@ -4697,6 +4726,7 @@ def run_checks() -> None:
     assert_ohmypi_missing_binary_and_abort()
     assert_top_bar_header_requested_fields()
     assert_long_secret_render_reuses_stable_message_blocks()
+    assert_stream_queue_coalesces_burst_updates()
     assert_secret_native_restore_hydrates_backend_context_blocks()
     assert_restored_process_group_folds_intermediate_speech()
     assert_mixed_omp_process_turns_fold_into_single_group()

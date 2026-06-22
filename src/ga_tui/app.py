@@ -331,6 +331,7 @@ SUBAGENT_SESSION_PREFIX = "subagent_session:"
 SECRET_PROXY_ENV_KEYS = ("ALL_PROXY", "all_proxy", "HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "NO_PROXY", "no_proxy")
 TOKEN_STAT_KEYS = ("requests", "input", "output", "cache_create", "cache_read")
 TUI_POLL_TIMEOUT_MS = 25
+STREAM_UI_FLUSH_INTERVAL = 0.05
 for path in (ROOT_DIR, FRONTENDS_DIR):
     if path not in sys.path:
         sys.path.insert(0, path)
@@ -14621,8 +14622,8 @@ def current_interaction_payload(state: State) -> Optional[dict[str, Any]]:
     return state.pending_interaction
 
 
-def message_cache_signature(messages: list[Message]) -> tuple[tuple[int, str, int, int, bool], ...]:
-    return tuple((id(msg), str(msg.role or ""), len(msg.content or ""), hash(msg.content or ""), bool(msg.done)) for msg in messages)
+def message_cache_signature(messages: list[Message]) -> tuple[tuple[int, str, int, bool], ...]:
+    return tuple((id(msg), str(msg.role or ""), len(msg.content or ""), bool(msg.done)) for msg in messages)
 
 
 def prune_message_block_cache(state: State, live_keys: set[tuple[Any, ...]], max_entries: int = 1200) -> None:
@@ -14640,11 +14641,13 @@ def prune_message_block_cache(state: State, live_keys: set[tuple[Any, ...]], max
 
 def message_lines_cached(state: State, width: int) -> list[RenderLine]:
     messages = display_messages(state)
-    active_anim = any(msg.role == "assistant" and not msg.done for msg in messages)
-    frame = state.run_frame if active_anim else 0
+    # Message cache invalidation is driven by message_version/content changes.
+    # The running spinner must not force long assistant responses through the
+    # markdown/process renderer on every animation tick.
+    frame = 0
     scope = display_scope_key(state)
     assistant_label = "AI"
-    render_signature = message_cache_signature(messages)
+    render_signature = (state.message_version, message_cache_signature(messages))
     key = (
         render_signature,
         scope,
@@ -17458,7 +17461,6 @@ def message_render_cache_key(
     scoped_subagent_meta: set[str],
     assistant_label: str = "AI",
 ) -> tuple[Any, ...]:
-    frame = run_frame if msg.role == "assistant" and not msg.done else 0
     return (
         id(msg),
         msg_index,
@@ -17469,7 +17471,6 @@ def message_render_cache_key(
         width,
         fold_process,
         markdown,
-        frame,
         process_scope,
         assistant_label,
         tuple(sorted(expanded_groups)),
@@ -22159,22 +22160,39 @@ def start_subagent_task(
     return f"已启动子 agent：{sub.name}"
 
 
-def consume_subagent_queue_to_kind(state: State, kind: str, subagent_id: str, task_id: int, dq: queue.Queue) -> None:
+def consume_stream_queue_to_ui(state: State, kind: str, target_ref: Any, task_id: int, dq: queue.Queue) -> None:
     buf = ""
+    last_emit_at = 0.0
+    pending_emit = False
+    timeout = max(0.01, STREAM_UI_FLUSH_INTERVAL)
     while state.running:
         try:
-            item = dq.get(timeout=0.05)
+            item = dq.get(timeout=timeout)
         except queue.Empty:
+            if pending_emit and buf:
+                state.ui_queue.put((kind, target_ref, task_id, buf, False))
+                last_emit_at = time.monotonic()
+                pending_emit = False
             continue
         if "next" in item:
             buf += str(item.get("next") or "")
-            state.ui_queue.put((kind, subagent_id, task_id, buf, False))
+            now = time.monotonic()
+            if now - last_emit_at >= STREAM_UI_FLUSH_INTERVAL:
+                state.ui_queue.put((kind, target_ref, task_id, buf, False))
+                last_emit_at = now
+                pending_emit = False
+            else:
+                pending_emit = True
         if "done" in item:
             usage = item.get("usage")
             if usage:
-                state.ui_queue.put(("token_usage", kind, subagent_id, task_id, usage))
-            state.ui_queue.put((kind, subagent_id, task_id, str(item.get("done") or buf), True))
+                state.ui_queue.put(("token_usage", kind, target_ref, task_id, usage))
+            state.ui_queue.put((kind, target_ref, task_id, str(item.get("done") or buf), True))
             return
+
+
+def consume_subagent_queue_to_kind(state: State, kind: str, subagent_id: str, task_id: int, dq: queue.Queue) -> None:
+    consume_stream_queue_to_ui(state, kind, subagent_id, task_id, dq)
 
 
 def consume_subagent_queue(state: State, subagent_id: str, task_id: int, dq: queue.Queue) -> None:
@@ -22207,21 +22225,7 @@ def format_memory_candidate_notice(updates: list[str], results: list[str]) -> st
 
 
 def consume_queue(state: State, stream_target: StreamTarget, task_id: int, dq: queue.Queue) -> None:
-    buf = ""
-    while state.running:
-        try:
-            item = dq.get(timeout=0.05)
-        except queue.Empty:
-            continue
-        if "next" in item:
-            buf += str(item.get("next") or "")
-            state.ui_queue.put(("stream", stream_target, task_id, buf, False))
-        if "done" in item:
-            usage = item.get("usage")
-            if usage:
-                state.ui_queue.put(("token_usage", "stream", stream_target, task_id, usage))
-            state.ui_queue.put(("stream", stream_target, task_id, str(item.get("done") or buf), True))
-            return
+    consume_stream_queue_to_ui(state, "stream", stream_target, task_id, dq)
 
 
 def latest_visible_reply_text(text: str) -> str:
@@ -23926,7 +23930,6 @@ def run(stdscr) -> dict[str, Any]:
                 next_clock_refresh = now + 1
             if display_status(state) in {"running", "aborting"} and now >= next_run_frame:
                 state.run_frame = (state.run_frame + 1) % len(RUN_FRAMES)
-                state.dirty = True
                 next_run_frame = now + 0.12
             if now >= next_history_refresh:
                 if load_history(state):
