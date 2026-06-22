@@ -78,6 +78,9 @@ Expose only `shuheng*` user commands and Shuheng/枢衡 UI strings, while preser
 - For process-marked responses, sidebar title fallback should prefer the first user message, then visible final assistant prose.
 - Existing cached metadata that already contains process-only preview text must be invalidated and recomputed from the raw model response file.
 - Explicit user names in `session_names.json` win unless they are process-only labels such as `OMP 思考`.
+- Automatic AI session titles should be re-evaluated whenever the user/assistant content signature changes, so each completed round can refine the visible session name.
+- Main-runtime agents may maintain the current title by emitting `session.rename`; those model-owned title changes are recorded as `title_source:"ai"`.
+- Manual `/rename` or history rename writes `title_source:"manual"` and must not be overwritten by later automatic AI title reviews.
 - Standalone progress-dot deltas from OMP (`.` on its own line) are process noise and must not render in the transcript.
 - Current OMP thinking process summaries should use a compact excerpt of the thinking text, not the fixed label `OMP 思考`.
 - Legacy process blocks with `<summary>OMP 思考</summary>` should render a compact excerpt from the `<thinking>` body.
@@ -87,6 +90,9 @@ Expose only `shuheng*` user commands and Shuheng/枢衡 UI strings, while preser
 - Raw response has `<summary>OMP 思考</summary>` plus final visible prose -> sidebar title uses the user task, not `OMP 思考`.
 - Cached metadata has `preview:"OMP 思考"` and matching file mtime/size -> cache is treated stale and recomputed.
 - AI title context includes a process block -> context includes user text and visible final prose, not hidden thinking text.
+- AI title review sees a new content signature after another completed round -> a new title job can run and update the AI-owned session title.
+- AI title review sees `title_source:"manual"` -> it does not start or overwrite the title.
+- Main-runtime `session.rename` changes an unlocked AI-owned title -> title source remains `ai`; the same control against a manual title is skipped.
 - Main transcript renderer sees process blocks -> folded process UI still shows the process label.
 - Main transcript renderer sees a legacy thinking block plus a standalone `.` line -> renders the thinking excerpt and suppresses the dot line.
 - Main transcript renderer sees multiple `LLM Running` blocks in one assistant message -> collapsed view shows one `过程组 G...` row, not one visible `过程 Turn ...` row per process block; intermediate progress prose stays inside the expandable group while the final user-facing reply remains visible outside the group.
@@ -105,6 +111,8 @@ Expose only `shuheng*` user commands and Shuheng/枢衡 UI strings, while preser
 - `scripts/check_policy_gates.py` must assert OMP process summaries do not title history rows.
 - The test must seed a stale `session_meta.json` cache with `preview:"OMP 思考"` to prove cache invalidation.
 - The test must assert restored preview messages and AI title context exclude process-only summary and hidden reasoning.
+- Tests must assert AI-owned session titles are reviewed again when content signatures change, while manual titles remain stable.
+- Tests must assert model-owned `session.rename` updates are marked AI-owned and do not override manual titles.
 - Tests must assert OMP thinking summaries use thinking excerpts, legacy `OMP 思考` summaries render from `<thinking>`, and standalone dot deltas/lines are suppressed.
 - Tests must assert mixed OMP process turns, including thinking-only summaries, tool turns, and short progress prose, collapse into one expandable process group while the final response stays visible.
 
@@ -331,6 +339,7 @@ memory_write: candidate_only
 - Reuse intent must be explicit. `reuse_policy:"force_new"` / `force_new:true` forces a new agent; visible prose such as "do not reuse" is not a runtime signal unless the model also emits the structured field.
 - Plan binding must be explicit. Controls that belong to a plan step must carry `plan_step_id`, `parent_task_id`, or an equivalent explicit step reference; the runtime must not bind steps by matching words like "self-introduction", "chat", or "summary".
 - Executable `<ga-control>` blocks are only for real operations. Capability explanations, tutorials, and examples must not include literal executable tags; use escaped text such as `&lt;ga-control&gt;...&lt;/ga-control&gt;` or show only the JSON payload.
+- Automatic current-session title maintenance is an allowed `session.rename` control exception: the main runtime may emit it at the end of a normal reply when the title is stale or misleading, and must stay silent when the title is already accurate.
 - When a real control block is needed, append it after all user-visible prose. Do not place hidden controls in the middle of a visible section, because stripping the control block will leave the visible answer looking truncated.
 - Inline-code labels such as `` `<ga-control>` `` in visible prose are not executable control starts and must not consume a later real closing tag.
 - `install_tui_control_hint()` must replace any previous GenericAgent-TUI hint block before installing the current `ga-control.v2` hint, and repeated installation must leave exactly one current hint block per backend prompt.

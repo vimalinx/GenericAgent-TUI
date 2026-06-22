@@ -843,7 +843,7 @@ class State:
     token_usage_registry: dict[str, dict[str, int]] = field(default_factory=dict)
     token_live_offsets: dict[str, dict[str, int]] = field(default_factory=dict)
     title_jobs: set[str] = field(default_factory=set)
-    title_attempted: set[str] = field(default_factory=set)
+    title_signatures: dict[str, str] = field(default_factory=dict)
     description_jobs: set[str] = field(default_factory=set)
     description_signatures: dict[str, str] = field(default_factory=dict)
     category_jobs: set[str] = field(default_factory=set)
@@ -13232,7 +13232,7 @@ def cancel_normal_history_restore(state: State) -> None:
     clear_history_ui_state(state)
 
 
-def rename_current_session(state: State, raw_name: str) -> str:
+def rename_current_session(state: State, raw_name: str, source: str = "manual") -> str:
     name = compact_title(raw_name, 80)
     if not name:
         return "名称不能为空。"
@@ -13241,11 +13241,21 @@ def rename_current_session(state: State, raw_name: str) -> str:
         mark_dirty(state)
         return f"当前临时会话已命名为: {name}；仅本次界面生效，不会持久化。"
     persist_msg = ""
+    title_source = title_source_for_rename(source)
     if session_names is not None:
         try:
             path = getattr(state.agent, "log_path", "")
             if path:
+                if title_source == "ai" and str(session_meta_for(state, path).get("title_source") or "") == "manual":
+                    return "手动标题已保留，AI 改名已跳过。"
                 session_names.set_name(path, name)
+                set_session_meta_fields(
+                    state,
+                    path,
+                    title_source=title_source,
+                    title_signature="",
+                    title_updated_at=time.time(),
+                )
                 persist_msg = "已持久化。"
             else:
                 persist_msg = "当前会话暂无日志路径，仅本次界面生效。"
@@ -13925,16 +13935,30 @@ def apply_session_operation(
     return f"{source}: 未知会话操作 {action}"
 
 
-def rename_session_path(state: State, path: str, raw_name: str) -> str:
+def title_source_for_rename(source: str) -> str:
+    return "manual" if source in {"", "manual", "TUI"} or source.startswith("/") else "ai"
+
+
+def rename_session_path(state: State, path: str, raw_name: str, source: str = "manual") -> str:
     name = compact_title(raw_name, 80)
     if not name:
         return "名称不能为空。"
     if is_current_session_path(state, path):
-        return rename_current_session(state, name)
+        return rename_current_session(state, name, source=source)
     if session_names is None:
         return "session_names 模块不可用，无法持久化历史会话名称。"
+    title_source = title_source_for_rename(source)
+    if title_source == "ai" and str(session_meta_for(state, path).get("title_source") or "") == "manual":
+        return "手动标题已保留，AI 改名已跳过。"
     try:
         session_names.set_name(path, name)
+        set_session_meta_fields(
+            state,
+            path,
+            title_source=title_source,
+            title_signature="",
+            title_updated_at=time.time(),
+        )
         if load_history(state, force=True):
             state.dirty = True
         return f"已命名会话：{name}"
@@ -14108,7 +14132,7 @@ def apply_tui_controls_from_text(state: State, text: str, source: str = "agent",
             continue
         if action in {"rename", "set_name", "name"}:
             path, error = resolve_session_target(state, target, allow_view_index=not agent_source or bool(expected_title), expected_title=expected_title)
-            result = error if error else rename_session_path(state, path or "", value)
+            result = error if error else rename_session_path(state, path or "", value, source=source)
         else:
             if agent_source and action in {"archive", "delete", "remove"}:
                 path, error = resolve_session_target(state, target, allow_view_index=False, expected_title=expected_title)
@@ -14991,7 +15015,7 @@ def generate_ai_session_category(agent: Any, title: str, description: str, categ
     return clean_ai_category(content)
 
 
-def ai_title_worker(ui_queue: queue.Queue, path: str, messages: list[Message], agent: Any) -> None:
+def ai_title_worker(ui_queue: queue.Queue, path: str, messages: list[Message], agent: Any, signature: str) -> None:
     old_name = threading.current_thread().name
     thread_name = token_thread_name(agent)
     if thread_name:
@@ -15006,7 +15030,7 @@ def ai_title_worker(ui_queue: queue.Queue, path: str, messages: list[Message], a
         error = f"{type(exc).__name__}: {exc}"
     finally:
         threading.current_thread().name = old_name
-    ui_queue.put(("title_done", os.path.basename(path), path, title, error))
+    ui_queue.put(("title_done", os.path.basename(path), path, title, error, signature))
 
 
 def ai_description_worker(
@@ -15059,7 +15083,7 @@ def ai_category_worker(
     ui_queue.put(("category_done", os.path.basename(path), path, category, error, signature))
 
 
-def maybe_start_ai_title_job(state: State, path: str, messages: list[Message], agent: Any) -> bool:
+def maybe_start_ai_title_job(state: State, path: str, messages: list[Message], agent: Any, force: bool = False) -> bool:
     if state.temporary_session or agent_log_path_is_devnull(agent):
         return False
     if not agent_supports_inline_ai_metadata(agent):
@@ -15067,16 +15091,29 @@ def maybe_start_ai_title_job(state: State, path: str, messages: list[Message], a
     if session_names is None or not path or agent is None:
         return False
     key = os.path.basename(path)
-    if not key or key in state.title_jobs or key in state.title_attempted:
+    signature = session_content_signature(messages)
+    if not key or not signature or key in state.title_jobs:
+        return False
+    try:
+        state.session_meta = load_session_meta_registry()
+    except Exception:
+        pass
+    meta = state.session_meta.get(session_key(path), {})
+    if not force and str(meta.get("title_source") or "") == "manual":
+        return False
+    if not force and (
+        state.title_signatures.get(key) == signature
+        or (meta.get("title_signature") == signature and str(meta.get("title_source") or "") == "ai")
+    ):
         return False
     if not ai_title_context(messages):
         return False
     state.title_jobs.add(key)
-    state.title_attempted.add(key)
+    state.title_signatures[key] = signature
     snapshot = [Message(msg.role, msg.content, msg.done) for msg in messages]
     threading.Thread(
         target=ai_title_worker,
-        args=(state.ui_queue, path, snapshot, agent),
+        args=(state.ui_queue, path, snapshot, agent, signature),
         daemon=True,
         name=token_thread_name(agent) or "ga-title-worker",
     ).start()
@@ -15188,17 +15225,16 @@ def maybe_autoname_current_session(state: State, force: bool = False) -> bool:
     except Exception:
         current = ""
     current = compact_title(current, 80) if current else ""
+    changed = False
     if current and not force:
         if state.current_title != current:
             state.current_title = current
-            return True
-        return False
+            changed = True
     title = suggested_session_title(state.messages)
-    changed = False
-    if title and state.current_title in {"", "main", "运行中会话", "空闲会话"}:
+    if not current and title and state.current_title in {"", "main", "运行中会话", "空闲会话"}:
         state.current_title = title
         changed = True
-    title_started = maybe_start_ai_title_job(state, path, state.messages, state.agent)
+    title_started = maybe_start_ai_title_job(state, path, state.messages, state.agent, force=force)
     description_started = maybe_start_ai_description_job(state, path, state.messages, state.agent, force=force)
     category_started = maybe_start_ai_category_job(state, path, state.agent, force=force)
     return title_started or description_started or category_started or changed
@@ -15223,17 +15259,16 @@ def maybe_autoname_background_session(state: State, bg: BackgroundSession, force
     except Exception:
         current = ""
     current = compact_title(current, 80) if current else ""
+    changed = False
     if current and not force:
         if bg.title != current:
             bg.title = current
-            return True
-        return False
+            changed = True
     title = suggested_session_title(bg.messages)
-    changed = False
-    if title and bg.title in {"", "main", "运行中会话", "空闲会话"}:
+    if not current and title and bg.title in {"", "main", "运行中会话", "空闲会话"}:
         bg.title = title
         changed = True
-    title_started = maybe_start_ai_title_job(state, path, bg.messages, bg.agent)
+    title_started = maybe_start_ai_title_job(state, path, bg.messages, bg.agent, force=force)
     description_started = maybe_start_ai_description_job(state, path, bg.messages, bg.agent, force=force)
     category_started = maybe_start_ai_category_job(state, path, bg.agent, force=force)
     return title_started or description_started or category_started or changed
@@ -22416,30 +22451,35 @@ def process_ui_queue(state: State) -> bool:
             continue
 
         if kind == "title_done":
-            _kind, key, path, title, error = item
+            _kind, key, path, title, error, signature = item
             state.title_jobs.discard(key)
             active_key = token_session_key(state.agent)
             if title and session_names is not None:
                 try:
-                    existing_title = session_names.name_for(path)
-                    if existing_title:
-                        title = compact_title(existing_title, 80)
-                    else:
+                    state.session_meta = load_session_meta_registry()
+                    entry = dict(state.session_meta.get(session_key(path), {}))
+                    if str(entry.get("title_source") or "") != "manual":
                         title = short_session_title(title, "")
                         session_names.set_name(path, title)
-                    if active_key == key:
-                        state.current_title = title
-                    for bg in state.background_sessions.values():
-                        if token_session_key(bg.agent) == key:
-                            bg.title = title
-                    load_history(state, force=True)
-                    if active_key == key and not path_is_active_history_view(state, path):
-                        maybe_start_ai_category_job(state, path, state.agent)
-                    else:
+                        entry["title_source"] = "ai"
+                        entry["title_signature"] = signature
+                        entry["title_updated_at"] = time.time()
+                        entry["title_reviewed_at"] = time.time()
+                        state.session_meta[session_key(path)] = entry
+                        save_session_meta_registry(state.session_meta)
+                        if active_key == key:
+                            state.current_title = title
                         for bg in state.background_sessions.values():
                             if token_session_key(bg.agent) == key:
-                                maybe_start_ai_category_job(state, path, bg.agent)
-                                break
+                                bg.title = title
+                        load_history(state, force=True)
+                        if active_key == key and not path_is_active_history_view(state, path):
+                            maybe_start_ai_category_job(state, path, state.agent)
+                        else:
+                            for bg in state.background_sessions.values():
+                                if token_session_key(bg.agent) == key:
+                                    maybe_start_ai_category_job(state, path, bg.agent)
+                                    break
                 except Exception as exc:
                     state.last_error = f"AI title save: {type(exc).__name__}: {exc}"
             elif error and active_key == key:

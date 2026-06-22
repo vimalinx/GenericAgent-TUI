@@ -2192,6 +2192,33 @@ class FakeBackend:
         self.log_path = ""
 
 
+class ScriptedMetadataBackend(FakeBackend):
+    def __init__(self, titles: list[str]) -> None:
+        super().__init__("metadata", "model-metadata")
+        self.title_queue = titles
+        self.raw_prompts: list[str] = []
+
+    def raw_ask(self, request):
+        prompt = ""
+        try:
+            content = request[0]["content"][0]
+            prompt = str(content.get("text") or "")
+        except Exception:
+            prompt = str(request)
+        self.raw_prompts.append(prompt)
+        if "生成一个简短标题" in prompt:
+            text = self.title_queue.pop(0) if self.title_queue else "默认会话标题"
+        elif "维护一个简介" in prompt:
+            text = "这是会话简介，说明主题和当前进展。"
+        elif "选择一个分类" in prompt:
+            text = "Shuheng"
+        else:
+            text = ""
+        if False:
+            yield ""
+        return [{"type": "text", "text": text}]
+
+
 class FakeLLMClient:
     def __init__(self, name: str, model: str, apibase: str = "https://example.invalid/v1") -> None:
         self.backend = FakeBackend(name, model, apibase)
@@ -2231,6 +2258,14 @@ class FakeLLMAgent:
 
     def abort(self) -> None:
         return None
+
+
+class ScriptedMetadataAgent(FakeLLMAgent):
+    def __init__(self, titles: list[str]) -> None:
+        super().__init__()
+        self.llmclient = FakeLLMClient("metadata", "model-metadata")
+        self.llmclient.backend = ScriptedMetadataBackend(titles)
+        self.llmclients = [self.llmclient]
 
 
 class RuntimeCaptureFakeAgent(FakeLLMAgent):
@@ -3562,6 +3597,8 @@ def assert_agent_create_respects_explicit_lifecycle_and_reuse_policy() -> None:
     assert "能力说明" in a.TUI_AGENT_CONTROL_HINT
     assert "不要在示例、教程或解释中包含可执行 `<ga-control>` 标签" in a.TUI_AGENT_CONTROL_HINT
     assert "回复末尾隐藏块" in a.TUI_AGENT_CONTROL_HINT
+    assert "会话标题维护" in a.TUI_AGENT_CONTROL_HINT
+    assert "session.rename" in a.TUI_AGENT_CONTROL_HINT
     assert "secret_subagents" in a.TUI_AGENT_CONTROL_HINT
     assert "Shuheng `SUBAGENTS_DIR`" in a.TUI_AGENT_CONTROL_HINT
     assert "agent_list" in a.TUI_AGENT_CONTROL_HINT
@@ -4035,6 +4072,67 @@ def assert_history_curator_skill_uses_progressive_disclosure() -> None:
     assert a.start_history_curator_skill(empty_state, "cat:Missing", "/curate-history cat:Missing") is False
     assert empty_state.agent.prompts == [], empty_state.agent.prompts
     assert any("没有可策展的历史会话" in msg.content for msg in empty_state.messages), empty_state.messages
+
+
+def assert_ai_session_title_review_runs_each_content_signature() -> None:
+    root = tempfile.mkdtemp(prefix="ga_tui_ai_title_review_")
+    retarget_harness(root)
+    os.makedirs(a.MODEL_RESPONSES_DIR, exist_ok=True)
+    if a.session_names is None:
+        return
+
+    agent = ScriptedMetadataAgent(["初始需求梳理", "标题重评更新", "不应覆盖手动"])
+    path = a.new_session_log_path()
+    a.set_agent_log_path(agent, path)
+    state = a.State(agent=agent)
+    state.running = True
+    state.messages = [
+        a.Message("user", "第一轮：整理 Shuheng 历史会话标题。"),
+        a.Message("assistant", "先修复历史标题。"),
+    ]
+
+    assert a.maybe_autoname_current_session(state) is True
+    drain_ui(state)
+    assert a.session_names.name_for(path) == "初始需求梳理", a.session_names._load()
+    first_meta = a.load_session_meta_registry()[os.path.basename(path)]
+    assert first_meta["title_source"] == "ai", first_meta
+    first_signature = first_meta["title_signature"]
+
+    state.messages.extend([
+        a.Message("user", "第二轮：现在需要每轮都让 AI 重看标题。"),
+        a.Message("assistant", "已改成按内容签名重新评估。"),
+    ])
+    assert a.maybe_autoname_current_session(state) is True
+    drain_ui(state)
+    assert a.session_names.name_for(path) == "标题重评更新", a.session_names._load()
+    second_meta = a.load_session_meta_registry()[os.path.basename(path)]
+    assert second_meta["title_source"] == "ai", second_meta
+    assert second_meta["title_signature"] != first_signature, second_meta
+
+    a.apply_tui_controls_from_text(
+        state,
+        ga_control({"action": "session.rename", "target": "current", "value": "智能控制标题"}),
+        source="agent",
+    )
+    assert a.session_names.name_for(path) == "智能控制标题", a.session_names._load()
+    control_meta = a.load_session_meta_registry()[os.path.basename(path)]
+    assert control_meta["title_source"] == "ai", control_meta
+
+    rename_result = a.rename_current_session(state, "固定手动标题")
+    assert "已持久化" in rename_result, rename_result
+    state.messages.extend([
+        a.Message("user", "第三轮：这个手动标题不要被自动覆盖。"),
+        a.Message("assistant", "手动标题应保持。"),
+    ])
+    assert a.maybe_start_ai_title_job(state, path, state.messages, agent) is False
+    a.apply_tui_controls_from_text(
+        state,
+        ga_control({"action": "session.rename", "target": "current", "value": "不应覆盖手动"}),
+        source="agent",
+    )
+    assert a.session_names.name_for(path) == "固定手动标题", a.session_names._load()
+    manual_meta = a.load_session_meta_registry()[os.path.basename(path)]
+    assert manual_meta["title_source"] == "manual", manual_meta
 
 
 def assert_ohmypi_process_summary_does_not_title_history() -> None:
@@ -4525,6 +4623,7 @@ def run_checks() -> None:
     assert_single_search_turn_keeps_final_reply_visible()
     assert_ask_user_tool_use_input_payload_visible()
     assert_ask_user_multiline_tool_args_payload_visible()
+    assert_ai_session_title_review_runs_each_content_signature()
     assert_aux_mouse_buttons_do_not_start_selection()
     assert_subagent_result_context_update_from_notice()
     assert_live_subagent_result_reaches_main_context()
