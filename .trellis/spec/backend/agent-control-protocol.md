@@ -518,6 +518,7 @@ temp_root = os.path.join(TEMP_SUBAGENTS_DIR, owner)
 - `COMMANDS` must not include `/llm` or `/models`; hidden aliases execute only through explicit command handling.
 - `command_matches("/mo", state)` may return `/model`; `command_matches("/ll", state)` and `command_matches("/models", state)` must return no model alias rows.
 - `/model`, `/llm`, and `/models` all open the unified model manager with config-management actions enabled.
+- `/model` add/edit forms must expose a manual `context_win` field after the model id; saving must persist it as an integer in the existing model config entry.
 - The unified manager must keep current-session switching, default selection, recent-model jumping, add/edit/delete, model extraction, single-model test, batch health check, and reload actions.
 - Model rows are grouped by concrete provider tabs, not broad protocol categories.
 - Provider labels must render as a vertical provider rail inside the model manager, with model rows rendered beside the rail. Do not collapse providers back into one horizontal `供应商 Tabs: A / B / C` line.
@@ -534,6 +535,7 @@ temp_root = os.path.join(TEMP_SUBAGENTS_DIR, owner)
 - User types `/llm` or `/models` -> open unified `/model` manager as a hidden compatibility alias.
 - User requests command completion for `/ll` or `/models` -> do not show hidden aliases.
 - No configured models -> `/model` manager displays an empty-state message that says to add a provider/API with `/model`.
+- User edits `Context Win` -> the saved `context_win` value survives `mykey.py` round-trip and is available to runtime providers.
 - Selected row belongs to a different active tab after reload/edit/delete -> normalize selection to the first visible row in the active category.
 - Active provider tab has no visible rows -> display a no-models-in-provider message and keep navigation safe.
 - Active `常用` tab -> display configured recent models in recent order and keep provider switching/navigation behavior unchanged.
@@ -543,6 +545,7 @@ temp_root = os.path.join(TEMP_SUBAGENTS_DIR, owner)
 ### 5. Good/Base/Bad Cases
 
 - Good: `/model` opens one panel where the user can switch the current dialogue model, set the default, add a provider, extract provider models, test a model, and batch validate all models grouped by supplier.
+- Good: `/model` lets a user set `context_win:1050000` for a large-window OpenAI-compatible model without editing `mykey.py` by hand.
 - Good: Providers render as a left-side vertical list, and the filtered model list renders to the right.
 - Good: `常用` appears as a peer rail item when recent configured models exist, while empty common providers stay grey until configured.
 - Good: DeepSeek and OpenAI-compatible entries with known template base URLs appear under `DeepSeek` and `OpenAI`, not together under one broad `OpenAI` protocol category.
@@ -558,6 +561,7 @@ temp_root = os.path.join(TEMP_SUBAGENTS_DIR, owner)
 - `scripts/check_policy_gates.py` must assert `/model` is present in `COMMANDS` and `/llm` / `/models` are absent.
 - `scripts/check_policy_gates.py` must assert `/mo` completes to `/model` and hidden aliases do not complete.
 - `scripts/check_policy_gates.py` must assert `/llm`, `/model`, and `/models` help text describes the unified manager and compatibility aliases.
+- `scripts/check_policy_gates.py` must assert `/model` exposes `context_win` and saving/reloading model config preserves it.
 - `scripts/check_policy_gates.py` must assert model category helpers group OpenAI, DeepSeek, custom endpoint, common-provider, and non-common configured providers correctly.
 - `scripts/check_policy_gates.py` must assert the model manager renders a vertical provider rail and does not render the old horizontal `供应商 Tabs:` line.
 - `scripts/check_policy_gates.py` must assert the model manager exposes `常用` as a virtual category and renders provider rail status colors for configured, empty, and failed categories.
@@ -817,8 +821,11 @@ configure_genericagent_provider_runtime(
 - OMP binary discovery order is explicit `binary` argument, `GA_TUI_OHMYPI_BIN`, `PATH` lookup for `omp`, then user-local Bun install at `$HOME/.bun/bin/omp`. A still-missing executable remains a visible startup error instead of mutating user shell configuration.
 - Generated OMP `config.yml` must set `modelRoles.default` to the GA-TUI default model selector when a complete matching `/model` entry exists.
 - Generated OMP `models.yml` must represent complete GA-TUI OpenAI-compatible entries as custom OMP providers with `baseUrl`, `apiKey`, `api`, and `models[].id`; API keys must be referenced through child-process env var names instead of written as secrets in the generated file.
+- Generated OMP `models.yml` must project `/model` `context_win` to OMP `models[].contextWindow`; if `max_tokens` is configured, it must project to `models[].maxTokens`.
 - Incomplete GA-TUI model entries without API key, base URL, or model id are skipped when generating OMP model providers.
 - OMP runtime model rows exposed to the TUI must preserve enough provider/model/base URL metadata for `/model` current-session switching to call OMP `set_model` with structured `provider` and `modelId`.
+- Embedded OMP must not auto-resume stale internal OMP sessions; Shuheng owns visible session history and resets the OMP RPC session when Shuheng opens a fresh main/temporary/restored runtime context.
+- A long-running OMP process must receive at most one full `[GA TUI Context Pack]` prompt per Shuheng runtime session. Later context refreshes should pass a bounded `[GA TUI Context Ref]` with the artifact ref, so OMP history does not accumulate repeated full context packs.
 - `ga_tui_query` is read-only and must never mutate sessions, tasks, agents, approvals, artifacts, memory, or files.
 - `ga_tui_propose` accepts only bounded proposal payloads with `proposal_type:"ga_control"` or `proposal_type:"memory_candidate"`.
 - `ga_tui_propose` with `proposal_type:"ga_control"` must require a current-schema `ga-control.v2` envelope or `agenttask.v2` action object, validate that it maps to known current controls, and route execution through `apply_tui_controls_from_text(..., source="agent:ohmypi_host_tool")` so existing policy gates and ledgers remain the source of truth.
@@ -866,8 +873,10 @@ configure_genericagent_provider_runtime(
 - OMP `host_tool_call` whose callback raises -> provider sends `host_tool_result` with `isError:true`.
 - OMP `host_tool_cancel` -> provider records the cancellation safely and continues normal prompt handling.
 - Complete GA-TUI model entry -> isolated OMP `models.yml` gets one provider/model mapping and the child env gets a matching `GA_TUI_OMP_API_KEY_<digest>` value.
+- Complete GA-TUI model entry with `context_win:1050000` -> isolated OMP `models.yml` writes `contextWindow:1050000` for that model.
 - Incomplete GA-TUI model entry -> omitted from isolated OMP `models.yml`; no invalid OMP provider is generated.
 - Selected GA-TUI default model -> OMP command may include `--model <isolated-provider>/<model-id>` and isolated `config.yml` carries the same `modelRoles.default`.
+- New Shuheng main or temporary session -> active OMP RPC session receives a `new_session` reset when the process is running, and a later first runtime task may inject one fresh full context pack.
 - User system OMP config exists -> policy checks must verify its hash remains unchanged across embedded OMP runtime setup.
 - OMP adapter registration -> subprocess `cwd` is the GenericAgent-TUI app root so relative repo paths such as `AGENTS.md` resolve to the TUI project while isolated runtime files still live under the Shuheng-owned harness directory.
 - OMP error frame with `stopReason:"error"` and `errorMessage` -> active TUI queue receives a visible `[Oh My Pi] ...` done item.
@@ -879,6 +888,7 @@ configure_genericagent_provider_runtime(
 - OMP `agent_end` arrives before the isolated session JSONL flushes usage -> the provider waits for the short stable-flush window, attaches the recovered usage, and only then emits the terminal queue item.
 - OMP terminal queue item carries usage -> the TUI main thread writes the active session row in `session_token_usage.json`, and the left status panel reads that row through `session_token_stats()`.
 - OMP terminal queue item carries usage for a devnull temporary session -> no token usage registry row is written.
+- Two consecutive OMP main turns in one Shuheng runtime session -> first prompt contains `[GA TUI Context Pack]`; second prompt contains `[GA TUI Context Ref]` and does not repeat the full pack.
 - OMP thinking delta + tool execution frames + final text delta -> active TUI queue receives GA-style process markers plus the final reply; `render_assistant_text(..., fold_process:true)` folds thinking/tool noise and keeps the final reply visible.
 - OMP host tool calls/results -> active TUI queue receives folded GA-style tool process turns while RPC still receives matching `host_tool_result` frames.
 - OMP memory-candidate signal extraction over normalized process output -> candidate statement contains only the final durable reply, not thinking text, tool args, or tool results.
@@ -931,6 +941,7 @@ configure_genericagent_provider_runtime(
 - Tests must assert isolated OMP runtime files are generated under `${AGENT_HARNESS_DIR}/runtime/ohmypi/agent`, not under `~/.omp/agent`.
 - Tests must assert the OMP runtime adapter subprocess `cwd` is the GenericAgent-TUI app root, not the GenericAgent harness root.
 - Tests must assert generated OMP API keys are env references in `models.yml`, raw key values are absent from generated files, and child-process env carries `PI_CODING_AGENT_DIR`.
+- Tests must assert generated OMP model rows preserve `contextWindow` / `maxTokens` from `/model`, embedded OMP `config.yml` disables `autoResume`, and repeated runtime turns use a context ref instead of repeating the full context pack.
 - Tests must assert `/model` default selection maps to isolated OMP `modelRoles.default` and RPC `set_model` can be sent before the first prompt when a TUI model is selected.
 - Tests must assert OMP terminal error frames surface `errorMessage` / `errorStatus` visibly instead of an empty done item.
 - Tests must assert system `~/.omp/agent/config.yml` hash remains unchanged when present.

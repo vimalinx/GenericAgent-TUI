@@ -933,7 +933,7 @@ def assert_ohmypi_isolated_runtime_settings() -> None:
         "\n".join([
             "mixin_config = {'llm_nos': ['beta'], 'max_retries': 10, 'base_delay': 0.5}",
             "native_oai_config = {'name': 'alpha', 'apikey': 'key-alpha', 'apibase': 'https://alpha.example.invalid/v1', 'model': 'model-alpha'}",
-            "native_oai_config_1 = {'name': 'beta', 'apikey': 'key-beta', 'apibase': 'https://beta.example.invalid/v1', 'model': 'model-beta', 'api_mode': 'responses'}",
+            "native_oai_config_1 = {'name': 'beta', 'apikey': 'key-beta', 'apibase': 'https://beta.example.invalid/v1', 'model': 'model-beta', 'api_mode': 'responses', 'context_win': 1050000, 'max_tokens': 128000}",
             "",
         ]),
         encoding="utf-8",
@@ -950,9 +950,12 @@ def assert_ohmypi_isolated_runtime_settings() -> None:
         assert runtime_config.env["PI_CODING_AGENT_DIR"] == runtime_config.agent_dir, runtime_config.env
         assert len(runtime_config.models) == 2, runtime_config.models
         assert runtime_config.default_model.endswith("/model-beta"), runtime_config.default_model
+        assert runtime_config.models[1].context_window == 1050000, runtime_config.models[1]
+        assert runtime_config.models[1].max_tokens == 128000, runtime_config.models[1]
         assert runtime_config.approval_mode == "yolo", runtime_config
         config_data = json.loads(Path(runtime_config.config_path).read_text(encoding="utf-8"))
         models_data = json.loads(Path(runtime_config.models_path).read_text(encoding="utf-8"))
+        assert config_data["autoResume"] is False, config_data
         assert config_data["modelRoles"]["default"] == runtime_config.default_model, config_data
         assert config_data["tools"]["approvalMode"] == "yolo", config_data
         assert "providers" in models_data and len(models_data["providers"]) == 2, models_data
@@ -962,6 +965,8 @@ def assert_ohmypi_isolated_runtime_settings() -> None:
         )
         assert beta_provider["api"] == "openai-responses", beta_provider
         assert beta_provider["apiKey"].startswith("GA_TUI_OMP_API_KEY_"), beta_provider
+        assert beta_provider["models"][0]["contextWindow"] == 1050000, beta_provider
+        assert beta_provider["models"][0]["maxTokens"] == 128000, beta_provider
         assert "key-beta" not in Path(runtime_config.models_path).read_text(encoding="utf-8")
 
         registry = a.agent_runtime_registry(write_memory_prompt_file=False)
@@ -1066,6 +1071,80 @@ def assert_ohmypi_permission_profiles() -> None:
             os.environ.pop("GA_TUI_DEFAULT_PERMISSION_PROFILE", None)
         else:
             os.environ["GA_TUI_DEFAULT_PERMISSION_PROFILE"] = old_default_profile
+
+
+def assert_model_context_window_surface() -> None:
+    fields = [field for field, _label, _kind in a.model_form_fields("native_oai")]
+    assert "context_win" in fields, fields
+    assert fields.index("context_win") > fields.index("model"), fields
+
+    root = tempfile.mkdtemp(prefix="ga_tui_model_context_")
+    mykey_file = os.path.join(root, "mykey.py")
+    old_mykey_path = a.mykey_path
+    try:
+        a.mykey_path = lambda: mykey_file
+        entry = a.LLMConfigEntry(
+            "native_oai_config",
+            "native_oai",
+            {
+                "name": "ctx-model",
+                "apikey": "key",
+                "apibase": "https://ctx.example.invalid/v1",
+                "model": "gpt-5.5",
+                "context_win": 1050000,
+            },
+        )
+        ok, message = a.save_llm_config_entries([entry], {"llm_nos": ["ctx-model"]}, [])
+        assert ok, message
+        loaded_entries, loaded_mixin, _preserved, load_error = a.load_llm_config_entries()
+        assert load_error == "", load_error
+        assert loaded_mixin["llm_nos"] == ["ctx-model"], loaded_mixin
+        assert loaded_entries[0].cfg["context_win"] == 1050000, loaded_entries[0]
+    finally:
+        a.mykey_path = old_mykey_path
+
+
+def assert_ohmypi_runtime_context_pack_is_not_repeated() -> None:
+    root = tempfile.mkdtemp(prefix="ga_tui_omp_context_once_")
+    retarget_harness(root)
+    runtime_agent = RuntimeCaptureFakeAgent()
+    runtime_state = a.State(agent=runtime_agent)
+    assert a.start_main_agent_task(
+        runtime_state,
+        "first task",
+        source="user",
+        visible_user_text="first task",
+    )
+    first = runtime_agent.runtime_requests[-1]
+    assert "[GA TUI Context Pack]" in first.prompt, first.prompt
+    assert "[GA TUI Context Ref]" not in first.prompt, first.prompt
+
+    runtime_state.status = "idle"
+    runtime_state.active_task_id = None
+    runtime_state.active_task_source = ""
+    assert a.start_main_agent_task(
+        runtime_state,
+        "second task",
+        source="user",
+        visible_user_text="second task",
+    )
+    second = runtime_agent.runtime_requests[-1]
+    assert "[GA TUI Context Pack]" not in second.prompt, second.prompt
+    assert "[GA TUI Context Ref]" in second.prompt, second.prompt
+    assert second.context_pack_ref.startswith("artifact://"), second.context_pack_ref
+
+    a.reset_agent_runtime_context_no_snapshot(runtime_agent)
+    runtime_state.status = "idle"
+    runtime_state.active_task_id = None
+    runtime_state.active_task_source = ""
+    assert a.start_main_agent_task(
+        runtime_state,
+        "third task",
+        source="user",
+        visible_user_text="third task",
+    )
+    third = runtime_agent.runtime_requests[-1]
+    assert "[GA TUI Context Pack]" in third.prompt, third.prompt
 
 
 def assert_ohmypi_rpc_extension_approval_bridge() -> None:
@@ -4598,7 +4677,9 @@ def run_checks() -> None:
     assert_ohmypi_memory_prompt_and_command()
     assert_ohmypi_rpc_command_discovers_user_bun_binary()
     assert_ohmypi_isolated_runtime_settings()
+    assert_model_context_window_surface()
     assert_ohmypi_permission_profiles()
+    assert_ohmypi_runtime_context_pack_is_not_repeated()
     assert_ohmypi_rpc_extension_approval_bridge()
     assert_ohmypi_rpc_queue_mapping()
     assert_ohmypi_rpc_usage_tracking()

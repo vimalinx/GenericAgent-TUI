@@ -1881,6 +1881,18 @@ def reset_agent_runtime_context_no_snapshot(agent: Any, history: Optional[list[d
         agent.handler = None
     if hasattr(agent, "_ga_tui_pending_key_info"):
         setattr(agent, "_ga_tui_pending_key_info", "")
+    for attr in ("_ga_tui_runtime_context_full_sent", "_ga_tui_runtime_context_prompt_count"):
+        if hasattr(agent, attr):
+            try:
+                setattr(agent, attr, 0)
+            except Exception:
+                pass
+    reset_runtime_session = getattr(agent, "reset_runtime_session", None)
+    if callable(reset_runtime_session):
+        try:
+            reset_runtime_session()
+        except Exception:
+            pass
 
 
 def write_text_atomic(path: str, text: str) -> None:
@@ -6415,6 +6427,41 @@ Memory excerpt:
 """.strip()
 
 
+def format_context_ref_for_prompt(pack: dict[str, Any], context_ref: str) -> str:
+    permissions = pack.get("permissions") or {}
+    return f"""
+[GA TUI Context Ref]
+task_id: {pack.get("task_id", "")}
+context_pack_ref: {context_ref or "(none)"}
+role: {(pack.get("for_agent") or {}).get("role", "main_orchestrator")}
+objective: {pack.get("objective", "")}
+permission_profile: {pack.get("permission_profile") or permissions.get("permission_profile", PERMISSION_PROFILE_STANDARD)}
+policy: This is a refreshed Shuheng context-pack artifact for the current turn.
+Do not treat older full context-pack blocks in OMP history as current if this ref is newer.
+Read the referenced artifact or call memory_context_get only when the task needs deeper context.
+[/GA TUI Context Ref]
+""".strip()
+
+
+def runtime_context_prompt_for_agent(agent: Any, pack: dict[str, Any], context_ref: str) -> str:
+    provider_id = agent_runtime_provider_id(agent)
+    if provider_id != "ohmypi":
+        return format_context_pack_for_prompt(pack)
+    sent = int(getattr(agent, "_ga_tui_runtime_context_full_sent", 0) or 0)
+    count = int(getattr(agent, "_ga_tui_runtime_context_prompt_count", 0) or 0) + 1
+    try:
+        setattr(agent, "_ga_tui_runtime_context_prompt_count", count)
+    except Exception:
+        pass
+    if sent <= 0:
+        try:
+            setattr(agent, "_ga_tui_runtime_context_full_sent", 1)
+        except Exception:
+            pass
+        return format_context_pack_for_prompt(pack)
+    return format_context_ref_for_prompt(pack, context_ref)
+
+
 def a2a_task_state(status: str) -> str:
     status = (status or "").strip().lower()
     if status in {"working", "created", "queued"}:
@@ -8538,7 +8585,7 @@ def start_main_agent_task(
                     runtime_task_id,
                 )
                 runtime_permissions = dict(context_pack.get("permissions") or runtime_permissions)
-                runtime_prompt = f"{format_context_pack_for_prompt(context_pack)}\n\n[Task]\n{agent_text}\n[/Task]"
+                runtime_prompt = f"{runtime_context_prompt_for_agent(state.agent, context_pack, runtime_context_ref)}\n\n[Task]\n{agent_text}\n[/Task]"
             except Exception as exc:
                 append_trace(
                     runtime_task_id,
@@ -9815,7 +9862,7 @@ def build_subagent_direct_chat_prompt(state: State, sub: SubAgentRuntime, prompt
     chat_context_id = short_uid("chat")
     context_pack, context_ref = build_context_pack(state, sub, prompt, chat_context_id)
     prompt_text = "\n\n".join([
-        format_context_pack_for_prompt(context_pack),
+        runtime_context_prompt_for_agent(sub.agent, context_pack, context_ref),
         subagent_direct_chat_prompt(sub, prompt, context_ref=context_ref, chat_context_id=chat_context_id),
     ])
     return prompt_text, context_ref, chat_context_id
@@ -12565,7 +12612,7 @@ def ohmypi_api_key_env_name(entry: LLMConfigEntry, index: int) -> str:
 def ohmypi_runtime_settings_payload(default_model: str, *, approval_mode: str = "") -> dict[str, Any]:
     approval_mode = normalized_ohmypi_approval_mode(approval_mode or default_ohmypi_approval_mode())
     payload: dict[str, Any] = {
-        "autoResume": True,
+        "autoResume": False,
         "browser": {"headless": True},
         "github": {"enabled": False},
         "memory": {"backend": "local"},
@@ -12579,6 +12626,14 @@ def ohmypi_runtime_settings_payload(default_model: str, *, approval_mode: str = 
     if default_model:
         payload["modelRoles"] = {"default": default_model}
     return payload
+
+
+def positive_int_config_value(value: Any) -> int:
+    try:
+        number = int(str(value).strip())
+    except Exception:
+        return 0
+    return number if number > 0 else 0
 
 
 def build_ohmypi_runtime_config(*, write_files: bool = True, base_env: Optional[dict[str, str]] = None) -> OhMyPiRuntimeConfig:
@@ -12600,11 +12655,18 @@ def build_ohmypi_runtime_config(*, write_files: bool = True, base_env: Optional[
         provider_id = ohmypi_provider_id_for_entry(entry, index)
         env_key = ohmypi_api_key_env_name(entry, index)
         env_overrides[env_key] = api_key
+        context_window = positive_int_config_value(cfg.get("context_win"))
+        max_tokens = positive_int_config_value(cfg.get("max_tokens"))
+        model_payload: dict[str, Any] = {"api": api, "id": model_id}
+        if context_window > 0:
+            model_payload["contextWindow"] = context_window
+        if max_tokens > 0:
+            model_payload["maxTokens"] = max_tokens
         provider_payloads[provider_id] = {
             "api": api,
             "apiKey": env_key,
             "baseUrl": endpoint_base(api_base) or api_base,
-            "models": [{"api": api, "id": model_id}],
+            "models": [model_payload],
         }
         runtime_models.append(OhMyPiRuntimeModel(
             provider=provider_id,
@@ -12612,6 +12674,8 @@ def build_ohmypi_runtime_config(*, write_files: bool = True, base_env: Optional[
             display_name=config_display_name(entry),
             base_url=api_base,
             api=api,
+            context_window=context_window,
+            max_tokens=max_tokens,
         ))
 
     default_model = ""
@@ -15536,6 +15600,7 @@ def new_current_session(state: State, keep_running: bool = True) -> bool:
             if state.status in {"running", "aborting"}:
                 state.agent.abort()
             reset_conversation(state.agent, message=None)
+            reset_agent_runtime_context_no_snapshot(state.agent)
             reset_agent_to_default_llm(state)
         except Exception:
             pass
@@ -15573,6 +15638,7 @@ def new_temporary_session(state: State, keep_running: bool = True) -> bool:
             if state.status in {"running", "aborting"}:
                 state.agent.abort()
             reset_conversation(state.agent, message=None)
+            reset_agent_runtime_context_no_snapshot(state.agent)
             reset_agent_to_default_llm(state)
         except Exception:
             pass
@@ -19603,6 +19669,7 @@ def model_form_fields(cfg_type: str) -> list[tuple[str, str, str]]:
         ("apikey", "API Key", "secret"),
         ("apibase", "Base URL", "text"),
         ("model", "Model", "text"),
+        ("context_win", "Context Win", "text"),
     ]
     if cfg_type in {"native_oai", "oai"}:
         fields.append(("api_mode", "API Mode", "choice"))
@@ -21689,7 +21756,7 @@ def start_secret_subagent_task(
         "working",
         {"context_pack": context_ref, "source": source, "runtime_provider_id": agent_runtime_provider_id(agent)},
     )
-    agent_prompt = f"{format_context_pack_for_prompt(context_pack)}\n\n[Task]\n{prompt}\n[/Task]"
+    agent_prompt = f"{runtime_context_prompt_for_agent(agent, context_pack, context_ref)}\n\n[Task]\n{prompt}\n[/Task]"
     try:
         runtime_source = f"secret-subagent:{sub.agent_id}"
         request = runtime_task_request_for_agent(
@@ -22024,7 +22091,7 @@ def start_subagent_task(
             "runtime_provider_id": runtime_provider_id,
         },
     )
-    agent_prompt = f"{format_context_pack_for_prompt(context_pack)}\n\n[Task]\n{prompt}\n[/Task]"
+    agent_prompt = f"{runtime_context_prompt_for_agent(agent, context_pack, context_ref)}\n\n[Task]\n{prompt}\n[/Task]"
     try:
         runtime_source = f"subagent:{sub.agent_id}"
         request = runtime_task_request_for_agent(

@@ -87,6 +87,14 @@ def _empty_token_usage() -> dict[str, int]:
     return {key: 0 for key in TOKEN_USAGE_KEYS}
 
 
+def _positive_int(value: Any) -> int:
+    try:
+        number = int(str(value).strip())
+    except Exception:
+        return 0
+    return number if number > 0 else 0
+
+
 def normalized_ohmypi_approval_mode(value: str = "") -> str:
     raw = str(value or "").strip().lower().replace("_", "-")
     return raw if raw in _OHMYPI_APPROVAL_MODES else "yolo"
@@ -185,6 +193,8 @@ class OhMyPiRuntimeModel:
     display_name: str = ""
     base_url: str = ""
     api: str = ""
+    context_window: int = 0
+    max_tokens: int = 0
 
     @property
     def selector(self) -> str:
@@ -611,6 +621,12 @@ class OhMyPiRpcAgent:
                 provider=model.provider,
                 model_id=model.model_id,
             )
+            if model.context_window > 0:
+                setattr(backend, "context_win", model.context_window)
+                setattr(backend, "contextWindow", model.context_window)
+            if model.max_tokens > 0:
+                setattr(backend, "max_tokens", model.max_tokens)
+                setattr(backend, "maxTokens", model.max_tokens)
             clients.append(_OhMyPiClient(backend))
         return clients
 
@@ -725,6 +741,20 @@ class OhMyPiRpcAgent:
         except Exception:
             pass
         self._finish_active("[Oh My Pi] 已请求中止。", wait_for_session_usage=False)
+
+    def reset_runtime_session(self) -> None:
+        self.history = []
+        with self._active_lock:
+            self._active = None
+            self.is_running = False
+        self.task_queue.done()
+        process = self._process
+        if process is None or process.poll() is not None or not self._ready.is_set():
+            return
+        try:
+            self._send({"id": self._next_request_id("new-session"), "type": "new_session"})
+        except Exception:
+            pass
 
     def close(self) -> None:
         self._closed = True
@@ -970,6 +1000,8 @@ class OhMyPiRpcAgent:
                 display_name=str(item.get("name") or f"{provider}/{model_id}"),
                 base_url=str(item.get("baseUrl") or item.get("base_url") or ""),
                 api=str(item.get("api") or ""),
+                context_window=_positive_int(item.get("contextWindow") or item.get("context_window") or 0),
+                max_tokens=_positive_int(item.get("maxTokens") or item.get("max_tokens") or 0),
             ))
         if not configured:
             return
