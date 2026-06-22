@@ -1246,6 +1246,27 @@ def assert_ohmypi_rpc_usage_tracking() -> None:
     session_path = os.path.join(sessions_dir, "session.jsonl")
     Path(session_path).write_text("", encoding="utf-8")
 
+    def append_session_usage(message_id: str, input_tokens: int, output_tokens: int, cache_read: int, cache_write: int, text: str) -> None:
+        with open(session_path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps({
+                "type": "message",
+                "id": f"row-{message_id}",
+                "message": {
+                    "id": message_id,
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": text}],
+                    "usage": {
+                        "input": input_tokens,
+                        "output": output_tokens,
+                        "cacheRead": cache_read,
+                        "cacheWrite": cache_write,
+                        "totalTokens": input_tokens + output_tokens + cache_read + cache_write,
+                    },
+                },
+            }, ensure_ascii=False) + "\n")
+
+    append_session_usage("session-message-old", 1000, 1000, 1000, 1000, "old usage")
+
     def fallback_process_factory(*_args, **_kwargs):
         process = FakeRpcProcess(auto_finish=False)
         fallback_processes.append(process)
@@ -1257,20 +1278,12 @@ def assert_ohmypi_rpc_usage_tracking() -> None:
         env={"PI_CODING_AGENT_DIR": agent_dir},
         process_factory=fallback_process_factory,
         startup_timeout=1,
+        session_usage_flush_timeout=0.5,
+        session_usage_stable_interval=0.02,
     )
     dq = fallback_agent.put_task("usage from session file", source="test")
     process = wait_for_process(fallback_processes)
-    with open(session_path, "a", encoding="utf-8") as handle:
-        handle.write(json.dumps({
-            "type": "message",
-            "id": "row-usage-1",
-            "message": {
-                "id": "session-message-1",
-                "role": "assistant",
-                "content": [{"type": "text", "text": "fallback done"}],
-                "usage": {"input": 11, "output": 12, "cacheRead": 13, "cacheWrite": 14, "totalTokens": 50},
-            },
-        }, ensure_ascii=False) + "\n")
+    append_session_usage("session-message-1", 11, 12, 13, 14, "fallback done")
     process.stdout.push({
         "type": "agent_end",
         "messages": [{"role": "assistant", "content": [{"type": "text", "text": "fallback done"}]}],
@@ -1284,6 +1297,27 @@ def assert_ohmypi_rpc_usage_tracking() -> None:
         "cache_create": 14,
         "cache_read": 13,
     }, fallback_done
+
+    second_q = fallback_agent.put_task("delayed usage from session file", source="test")
+
+    def append_delayed_usage() -> None:
+        time.sleep(0.1)
+        append_session_usage("session-message-2", 21, 22, 23, 24, "delayed fallback done")
+
+    threading.Thread(target=append_delayed_usage, daemon=True).start()
+    process.stdout.push({
+        "type": "agent_end",
+        "messages": [{"role": "assistant", "content": [{"type": "text", "text": "delayed fallback done"}]}],
+    })
+    second_done, _second_streamed = wait_for_queue_done(second_q)
+    assert second_done["done"] == "delayed fallback done", second_done
+    assert second_done["usage"] == {
+        "requests": 1,
+        "input": 21,
+        "output": 22,
+        "cache_create": 24,
+        "cache_read": 23,
+    }, second_done
     fallback_agent.close()
 
 

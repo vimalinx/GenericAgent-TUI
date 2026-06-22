@@ -153,6 +153,7 @@ class _ActivePrompt:
     terminal_grace_started: bool = False
     token_usage: dict[str, int] = field(default_factory=_empty_token_usage)
     token_usage_signatures: set[str] = field(default_factory=set)
+    session_usage_baseline_signatures: set[str] = field(default_factory=set)
 
 
 @dataclass(frozen=True)
@@ -452,7 +453,7 @@ def _frame_token_usage_entries(frame: dict[str, Any]) -> list[tuple[str, dict[st
             return
         seen_containers.add(container_id)
         usage = _normalize_ohmypi_token_usage(value.get("usage"))
-        if usage:
+        if _has_token_usage(usage):
             entries.append((_token_usage_signature(value, usage, len(entries)), usage))
         for key in ("message", "assistantMessage", "assistantMessageEvent"):
             child = value.get(key)
@@ -527,6 +528,8 @@ class OhMyPiRpcAgent:
         startup_timeout: float = 10.0,
         stop_timeout: float = 3.0,
         terminal_grace_timeout: float = 1.0,
+        session_usage_flush_timeout: float = 1.0,
+        session_usage_stable_interval: float = 0.08,
     ) -> None:
         self.command = list(command or ohmypi_rpc_command())
         self.cwd = cwd or os.getcwd()
@@ -544,6 +547,8 @@ class OhMyPiRpcAgent:
         self.startup_timeout = startup_timeout
         self.stop_timeout = stop_timeout
         self.terminal_grace_timeout = terminal_grace_timeout
+        self.session_usage_flush_timeout = max(0.0, float(session_usage_flush_timeout))
+        self.session_usage_stable_interval = max(0.0, float(session_usage_stable_interval))
         self.task_queue = _TaskCounter()
         self.is_running = False
         self.log_path = ""
@@ -563,8 +568,6 @@ class OhMyPiRpcAgent:
         self._closed = False
         self._host_tools_registered = False
         self._pending_model: OhMyPiRuntimeModel | None = None
-        self._session_usage_seen_signatures: set[str] = set()
-        self._session_usage_seen_initialized = False
 
     def _clients_from_models(self, models: list[OhMyPiRuntimeModel]) -> list[_OhMyPiClient]:
         if not models:
@@ -650,6 +653,7 @@ class OhMyPiRpcAgent:
         runtime_request: RuntimeTaskRequest | None = None,
     ) -> queue.Queue:
         display_queue: queue.Queue = queue.Queue()
+        session_usage_baseline = self._session_usage_signature_set()
         with self._active_lock:
             if self._active is not None and not self._active.finished:
                 display_queue.put({"done": "[Oh My Pi] 当前 RPC 会话仍在运行，不能并发启动新任务。", "source": source})
@@ -660,10 +664,10 @@ class OhMyPiRpcAgent:
                 display_queue=display_queue,
                 source=source,
                 runtime_request=runtime_request,
+                session_usage_baseline_signatures=session_usage_baseline,
             )
             self.is_running = True
             self.task_queue.start()
-        self._initialize_session_usage_seen()
         self._emit_runtime_event(
             "runtime_task_requested",
             status="starting",
@@ -677,7 +681,11 @@ class OhMyPiRpcAgent:
                 self._ensure_process()
                 self._send({"id": request_id, "type": "prompt", "message": prompt})
             except Exception as exc:
-                self._finish_active(f"[Oh My Pi] 启动失败: {type(exc).__name__}: {exc}", source=source)
+                self._finish_active(
+                    f"[Oh My Pi] 启动失败: {type(exc).__name__}: {exc}",
+                    source=source,
+                    wait_for_session_usage=False,
+                )
 
         self.thread_factory(target=_runner, daemon=True, name="ohmypi-rpc-submit").start()
         return display_queue
@@ -687,7 +695,7 @@ class OhMyPiRpcAgent:
             self._send({"id": self._next_request_id("abort"), "type": "abort"})
         except Exception:
             pass
-        self._finish_active("[Oh My Pi] 已请求中止。")
+        self._finish_active("[Oh My Pi] 已请求中止。", wait_for_session_usage=False)
 
     def close(self) -> None:
         self._closed = True
@@ -757,7 +765,7 @@ class OhMyPiRpcAgent:
                     self._handle_frame(frame)
         finally:
             if not self._closed:
-                self._finish_active("[Oh My Pi] RPC 进程已退出。")
+                self._finish_active("[Oh My Pi] RPC 进程已退出。", wait_for_session_usage=False)
 
     def _read_stderr(self) -> None:
         process = self._process
@@ -802,7 +810,7 @@ class OhMyPiRpcAgent:
         if frame_type == "message_end":
             error_text = self._frame_error_text(frame)
             if error_text:
-                self._finish_active(error_text)
+                self._finish_active(error_text, wait_for_session_usage=False)
             else:
                 self._remember_active_final_text(self._frame_visible_text(frame))
             return
@@ -817,7 +825,11 @@ class OhMyPiRpcAgent:
                 )
             else:
                 pending_text, pending_fallback = self._active_pending_terminal()
-                self._finish_active(error_text or pending_text, fallback_text=fallback_text or pending_fallback)
+                self._finish_active(
+                    error_text or pending_text,
+                    fallback_text=fallback_text or pending_fallback,
+                    wait_for_session_usage=not bool(error_text or pending_text),
+                )
             return
         if frame_type == "extension_ui_request":
             self._answer_extension_ui(frame)
@@ -844,7 +856,7 @@ class OhMyPiRpcAgent:
             else:
                 error_text = str(error_payload or event.get("errorMessage") or event.get("message") or "")
             if error_text:
-                self._finish_active(f"[Oh My Pi] {error_text}")
+                self._finish_active(f"[Oh My Pi] {error_text}", wait_for_session_usage=False)
             return
         text = _visible_text_from_payload(event)
         if text:
@@ -889,7 +901,7 @@ class OhMyPiRpcAgent:
         if frame.get("success") is False:
             error = str(frame.get("error") or "unknown RPC error")
             if command in {"prompt", "abort_and_prompt"}:
-                self._finish_active(f"[Oh My Pi] RPC prompt failed: {error}")
+                self._finish_active(f"[Oh My Pi] RPC prompt failed: {error}", wait_for_session_usage=False)
             return
         data = frame.get("data")
         if command in {"get_state", "set_model"} and isinstance(data, dict):
@@ -1123,21 +1135,59 @@ class OhMyPiRpcAgent:
         env = self.env if self.env is not None else os.environ
         return str(env.get("PI_CODING_AGENT_DIR") or "").strip()
 
-    def _initialize_session_usage_seen(self) -> None:
-        if self._session_usage_seen_initialized:
-            return
+    def _session_usage_signature_set(self) -> set[str]:
         agent_dir = self._session_agent_dir()
         if not agent_dir:
-            self._session_usage_seen_initialized = True
-            return
-        self._session_usage_seen_signatures.update(signature for signature, _usage in _session_usage_entries(agent_dir))
-        self._session_usage_seen_initialized = True
+            return set()
+        return {signature for signature, _usage in _session_usage_entries(agent_dir)}
 
-    def _merge_active_session_file_token_usage(self) -> None:
+    def _new_active_session_usage_entries(self, active: _ActivePrompt) -> list[tuple[str, dict[str, int]]]:
+        agent_dir = self._session_agent_dir()
+        if not agent_dir:
+            return []
+        entries = _session_usage_entries(agent_dir)
+        if not entries:
+            return []
+        return [
+            (signature, usage)
+            for signature, usage in entries
+            if signature not in active.session_usage_baseline_signatures
+            and signature not in active.token_usage_signatures
+            and _has_token_usage(usage)
+        ]
+
+    def _wait_for_active_session_file_token_usage(self, active: _ActivePrompt) -> list[tuple[str, dict[str, int]]]:
+        timeout = self.session_usage_flush_timeout
+        deadline = time.monotonic() + timeout
+        last_signatures: tuple[str, ...] = ()
+        stable_since = 0.0
+        while True:
+            entries = self._new_active_session_usage_entries(active)
+            signatures = tuple(signature for signature, _usage in entries)
+            now = time.monotonic()
+            if signatures:
+                if signatures != last_signatures:
+                    last_signatures = signatures
+                    stable_since = now
+                elif now - stable_since >= self.session_usage_stable_interval:
+                    return entries
+            if now >= deadline:
+                return entries
+            if timeout <= 0:
+                return entries
+            time.sleep(0.05)
+
+    def _merge_active_session_file_token_usage(self, *, wait: bool = False) -> None:
         agent_dir = self._session_agent_dir()
         if not agent_dir:
             return
-        entries = _session_usage_entries(agent_dir)
+        with self._active_lock:
+            active = self._active
+            if active is None or active.finished:
+                return
+            if _has_token_usage(active.token_usage):
+                return
+        entries = self._wait_for_active_session_file_token_usage(active) if wait else self._new_active_session_usage_entries(active)
         if not entries:
             return
         with self._active_lock:
@@ -1145,9 +1195,6 @@ class OhMyPiRpcAgent:
             if active is None or active.finished:
                 return
             for signature, usage in entries:
-                if signature in self._session_usage_seen_signatures:
-                    continue
-                self._session_usage_seen_signatures.add(signature)
                 if signature in active.token_usage_signatures:
                     continue
                 active.token_usage_signatures.add(signature)
@@ -1197,10 +1244,17 @@ class OhMyPiRpcAgent:
                 return
         self._finish_active(text, fallback_text=fallback_text)
 
-    def _finish_active(self, text: str | None = None, *, source: str = "ohmypi", fallback_text: str = "") -> None:
+    def _finish_active(
+        self,
+        text: str | None = None,
+        *,
+        source: str = "ohmypi",
+        fallback_text: str = "",
+        wait_for_session_usage: bool = True,
+    ) -> None:
         if text is None:
             self._flush_active_thinking()
-        self._merge_active_session_file_token_usage()
+        self._merge_active_session_file_token_usage(wait=wait_for_session_usage)
         done_text = ""
         signal_source = source
         request_id = ""

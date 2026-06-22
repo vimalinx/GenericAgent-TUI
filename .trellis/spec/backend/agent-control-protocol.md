@@ -783,7 +783,8 @@ configure_genericagent_provider_runtime(
 - OMP assistant message `usage` payloads must be normalized inside `ohmypi_provider.py` and attached to the terminal queue item as `usage:{requests,input,output,cache_create,cache_read}`.
 - OMP usage mapping is `input -> input`, `output -> output`, `cacheRead -> cache_read`, and `cacheWrite` / `cacheCreate` -> `cache_create`; each distinct usage-bearing assistant message increments `requests` by 1.
 - OMP usage from repeated terminal frames such as `message_end` followed by `agent_end.messages` must be de-duplicated by stable message/response ids when available.
-- If RPC terminal frames do not carry non-zero usage, `ohmypi_provider.py` must fall back to the Shuheng-owned isolated OMP session JSONL files under `PI_CODING_AGENT_DIR/sessions`, count only newly observed assistant-message usage rows, and then attach the same normalized queue `usage`.
+- If RPC terminal frames do not carry non-zero usage, `ohmypi_provider.py` must fall back to the Shuheng-owned isolated OMP session JSONL files under `PI_CODING_AGENT_DIR/sessions`, diff against the active prompt's session-file baseline, count only assistant-message usage rows created for that prompt, and then attach the same normalized queue `usage`.
+- The session-file fallback must tolerate OMP writing JSONL usage shortly after `agent_end`: normal completions should wait for a short stable-flush window before emitting the terminal queue item, while startup, abort, prompt-failure, and terminal-error paths should not wait for usage.
 - `app.py` owns persistence of provider-normalized usage into `session_token_usage.json` for the active Shuheng session key; provider code must not import app state or write the registry directly.
 - Temporary/devnull sessions must not persist OMP token usage, matching the `/temp` non-persistence contract.
 - If no `text_delta` populated the active buffer, the done text must fall back to visible assistant text carried by assistant `message_end`, terminal-frame assistant `message.content`, `assistantMessageEvent` text payloads, or the last assistant entry in `agent_end.messages`.
@@ -859,7 +860,8 @@ configure_genericagent_provider_runtime(
 - OMP `turn_end` followed by an immediate next `put_task()` before `agent_end` -> wrapper rejects the next prompt as concurrent instead of sending it to OMP and surfacing `Agent is already processing`.
 - OMP `turn_end` followed by `agent_end` -> active queue receives the done item and the next prompt can then be sent normally.
 - OMP `message_end` and `agent_end.messages` carry the same assistant message usage -> token usage is counted once.
-- OMP RPC frames omit non-zero usage but the isolated session JSONL contains new assistant message usage -> token usage is recovered from the session file and counted once.
+- OMP RPC frames omit non-zero usage but the isolated session JSONL contains assistant-message usage created after the active prompt baseline -> token usage is recovered from the session file and counted once.
+- OMP `agent_end` arrives before the isolated session JSONL flushes usage -> the provider waits for the short stable-flush window, attaches the recovered usage, and only then emits the terminal queue item.
 - OMP terminal queue item carries usage -> the TUI main thread writes the active session row in `session_token_usage.json`, and the left status panel reads that row through `session_token_stats()`.
 - OMP terminal queue item carries usage for a devnull temporary session -> no token usage registry row is written.
 - OMP thinking delta + tool execution frames + final text delta -> active TUI queue receives GA-style process markers plus the final reply; `render_assistant_text(..., fold_process:true)` folds thinking/tool noise and keeps the final reply visible.
@@ -895,7 +897,7 @@ configure_genericagent_provider_runtime(
 - Tests must assert OMP command construction discovers `$HOME/.bun/bin/omp` when `omp` is absent from `PATH`, while explicit `GA_TUI_OHMYPI_BIN` remains authoritative.
 - Tests must assert completed Oh My Pi output can produce a governed memory candidate signal and that empty, too-short, secret-looking, and Secret-context outputs are skipped.
 - Tests must assert a fake RPC process maps `ready`, `prompt` ack, `message_update` deltas, and `agent_end` into queue `next`/`done` items.
-- Tests must assert OMP `usage` payloads are normalized, de-duplicated across repeated terminal frames, recovered from isolated OMP session JSONL when RPC frames omit non-zero usage, attached to queue `done` items, included in runtime completion event payloads, persisted into `session_token_usage.json`, and skipped for devnull temporary sessions.
+- Tests must assert OMP `usage` payloads are normalized, de-duplicated across repeated terminal frames, recovered from isolated OMP session JSONL when RPC frames omit non-zero usage, diffed against the active prompt baseline rather than a provider-lifetime seen set, attached to queue `done` items after the stable-flush wait, included in runtime completion event payloads, persisted into `session_token_usage.json`, and skipped for devnull temporary sessions.
 - Tests must assert `turn_end` does not release the active prompt before `agent_end`, preventing immediate next-prompt races against real OMP finalization.
 - Tests must assert `turn_end` carrying `stopReason:"toolUse"` or tool results waits for the final assistant answer instead of completing from the tool-result turn.
 - Tests must assert a fake RPC process maps OMP thinking/tool events into GenericAgent-TUI foldable process blocks, that the existing assistant renderer folds them, and that final replies remain visible.
