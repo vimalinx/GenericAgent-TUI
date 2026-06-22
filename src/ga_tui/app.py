@@ -8476,6 +8476,7 @@ def start_main_agent_task(
     visible_user_text: Optional[str] = None,
     remember_user: bool = False,
     clear_history: bool = False,
+    runtime_context_mode: str = "default",
 ) -> bool:
     if state.status in {"running", "aborting", "restoring"}:
         state.last_error = "当前主控仍在运行，不能启动新的主控任务。"
@@ -8521,28 +8522,31 @@ def start_main_agent_task(
     runtime_prompt = agent_text
     runtime_task_id = f"main-{task_id}"
     runtime_context_ref = ""
+    runtime_context_mode = str(runtime_context_mode or "default").strip().lower()
+    include_runtime_context_pack = runtime_context_mode not in {"none", "lean", "minimal"}
     runtime_permissions = permissions_for_role(
         "main_orchestrator",
         security_context="standard",
         permission_profile=default_omp_permission_profile(),
     )
     if hasattr(state.agent, "put_runtime_task") and not secret_task:
-        try:
-            context_pack, runtime_context_ref = build_main_runtime_context_pack(
-                state,
-                policy_relevant_subagent_prompt_text(text),
-                runtime_task_id,
-            )
-            runtime_permissions = dict(context_pack.get("permissions") or runtime_permissions)
-            runtime_prompt = f"{format_context_pack_for_prompt(context_pack)}\n\n[Task]\n{agent_text}\n[/Task]"
-        except Exception as exc:
-            append_trace(
-                runtime_task_id,
-                "runtime_context_pack_failed",
-                agent_id="orchestrator.main",
-                status="failed",
-                payload={"error": f"{type(exc).__name__}: {exc}", "runtime_provider_id": agent_runtime_provider_id(state.agent)},
-            )
+        if include_runtime_context_pack:
+            try:
+                context_pack, runtime_context_ref = build_main_runtime_context_pack(
+                    state,
+                    policy_relevant_subagent_prompt_text(text),
+                    runtime_task_id,
+                )
+                runtime_permissions = dict(context_pack.get("permissions") or runtime_permissions)
+                runtime_prompt = f"{format_context_pack_for_prompt(context_pack)}\n\n[Task]\n{agent_text}\n[/Task]"
+            except Exception as exc:
+                append_trace(
+                    runtime_task_id,
+                    "runtime_context_pack_failed",
+                    agent_id="orchestrator.main",
+                    status="failed",
+                    payload={"error": f"{type(exc).__name__}: {exc}", "runtime_provider_id": agent_runtime_provider_id(state.agent)},
+                )
     try:
         if hasattr(state.agent, "put_runtime_task") and not secret_task:
             request = runtime_task_request_for_agent(
@@ -8560,6 +8564,7 @@ def start_main_agent_task(
                 artifact_refs=[runtime_context_ref] if runtime_context_ref else [],
                 metadata={"runtime_lane": "main", "ui_task_id": task_id, "security_context": "standard"},
             )
+            request.metadata["runtime_context_mode"] = runtime_context_mode or "default"
             dq = put_agent_runtime_task(state.agent, request)
         else:
             task_source = f"secret-main:{source}" if secret_task else source
@@ -13529,6 +13534,7 @@ def start_history_curator_skill(state: State, raw_args: str, visible_text: str) 
         visible_user_text=visible_text,
         remember_user=True,
         clear_history=True,
+        runtime_context_mode="lean",
     )
 
 
@@ -14793,7 +14799,24 @@ def clean_ai_category(category: str) -> str:
     return compact_category(category)
 
 
+def agent_supports_inline_ai_metadata(agent: Any) -> bool:
+    if agent is None:
+        return False
+    source_backend = getattr(getattr(agent, "llmclient", None), "backend", None)
+    try:
+        source_backend = source_backend.primary
+    except Exception:
+        pass
+    if source_backend is None:
+        return False
+    if getattr(source_backend, "supports_raw_ask", True) is False:
+        return False
+    return callable(getattr(source_backend, "raw_ask", None))
+
+
 def generate_ai_session_title(agent: Any, messages: list[Message]) -> str:
+    if not agent_supports_inline_ai_metadata(agent):
+        return ""
     context = ai_title_context(messages)
     if not context:
         return ""
@@ -14835,6 +14858,8 @@ def generate_ai_session_title(agent: Any, messages: list[Message]) -> str:
 
 
 def generate_ai_session_description(agent: Any, messages: list[Message]) -> str:
+    if not agent_supports_inline_ai_metadata(agent):
+        return ""
     context = ai_title_context(messages, max_chars=5200)
     if not context:
         return ""
@@ -14877,6 +14902,8 @@ def generate_ai_session_description(agent: Any, messages: list[Message]) -> str:
 
 
 def generate_ai_session_category(agent: Any, title: str, description: str, categories: list[tuple[str, str]]) -> str:
+    if not agent_supports_inline_ai_metadata(agent):
+        return ""
     title = compact_title(title, 80)
     description = compact_description(description)
     if not title and not description:
@@ -14999,6 +15026,8 @@ def ai_category_worker(
 def maybe_start_ai_title_job(state: State, path: str, messages: list[Message], agent: Any) -> bool:
     if state.temporary_session or agent_log_path_is_devnull(agent):
         return False
+    if not agent_supports_inline_ai_metadata(agent):
+        return False
     if session_names is None or not path or agent is None:
         return False
     key = os.path.basename(path)
@@ -15020,6 +15049,8 @@ def maybe_start_ai_title_job(state: State, path: str, messages: list[Message], a
 
 def maybe_start_ai_description_job(state: State, path: str, messages: list[Message], agent: Any, force: bool = False) -> bool:
     if state.temporary_session or agent_log_path_is_devnull(agent):
+        return False
+    if not agent_supports_inline_ai_metadata(agent):
         return False
     if not path or agent is None:
         return False
@@ -15077,6 +15108,8 @@ def session_title_for_category(state: State, path: str) -> str:
 
 def maybe_start_ai_category_job(state: State, path: str, agent: Any, force: bool = False) -> bool:
     if state.temporary_session or agent_log_path_is_devnull(agent):
+        return False
+    if not agent_supports_inline_ai_metadata(agent):
         return False
     if not path or agent is None:
         return False

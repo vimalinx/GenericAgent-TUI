@@ -108,6 +108,7 @@ class _TaskCounter:
 
 @dataclass
 class _OhMyPiBackend:
+    supports_raw_ask: bool = False
     name: str = "Oh My Pi"
     model: str = "unknown"
     api_base: str = ""

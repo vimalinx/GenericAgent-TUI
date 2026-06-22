@@ -152,6 +152,7 @@ S01 修复左栏历史会话标题
 - Persistent subagent creation is recommendation-only in this command. Any actual creation must later use explicit `agent.create` with `lifecycle:"persistent"` or `persistent:true`.
 - The curator may request deeper disclosure for at most 3 stable session ids per turn and must state why each raw session is needed.
 - The command starts a main-agent task with source `user:history_curator_skill` and shows the literal command as the visible user message.
+- The command must run its main runtime request in `runtime_context_mode:"lean"`: do not prepend the full Shuheng runtime context pack because the curation prompt already contains the scoped index, artifact ref, and governance rules.
 
 ### 4. Validation & Error Matrix
 
@@ -178,6 +179,7 @@ S01 修复左栏历史会话标题
 - `scripts/check_policy_gates.py` must assert category-scoped `/curate-history` builds an index artifact with only matching session rows.
 - Tests must assert the generated prompt contains progressive disclosure rules, nested subskill names, candidate-only memory wording, and recommendation-only persistent-subagent wording.
 - Tests must assert the command starts the main agent with source `user:history_curator_skill` and preserves the literal command as the visible user message.
+- Tests must assert runtime-agent execution for this command does not prepend `[GA TUI Context Pack]` and records `runtime_context_mode:"lean"`.
 - Tests must assert non-matching category scopes do not start a main-agent task.
 
 ### 7. Wrong vs Correct
@@ -227,6 +229,7 @@ S01 修复左栏历史会话标题
 - OMP isolated runtime config must be written under the Shuheng-owned harness runtime directory and must not mutate the user's system OMP config.
 - OMP isolated runtime config defaults `tools.approvalMode` to `yolo`, so OMP runtime tools do not stop for OMP approval prompts.
 - If OMP still emits an RPC extension-UI approval prompt, it may be auto-approved when the active runtime request has `permission_profile:"full"` and the requested tool maps to an allowed capability.
+- OMP RPC backend does not expose `raw_ask`; inline AI metadata jobs such as automatic title, description, and category generation must skip OMP instead of surfacing UI errors.
 
 ### 4. Validation & Error Matrix
 
@@ -238,6 +241,7 @@ S01 修复左栏历史会话标题
 - OMP RPC approval select for safe `bash` under full profile -> respond `Approve`.
 - OMP RPC approval select for risky `rm -rf` under full profile -> respond `Approve`.
 - OMP RPC approval select under `standard` profile -> respond `Deny`.
+- OMP active session completes a normal task -> automatic metadata workers are not started through unsupported `raw_ask`, and no `AI title: RuntimeError` appears.
 
 ### 5. Good/Base/Bad Cases
 
@@ -252,6 +256,7 @@ S01 修复左栏历史会话标题
 ### 6. Tests Required
 
 - `scripts/check_policy_gates.py` must assert default full main context with `role:"main_orchestrator"`, main runtime task request role/permissions/prompt/output-contract wiring, read-only env override, standard subagent context, isolated OMP approval mode, runtime provider metadata, and OMP RPC extension approval bridge behavior.
+- `scripts/check_policy_gates.py` must assert OMP inline AI metadata generation is disabled when the backend marks `supports_raw_ask:false`.
 - `python3 -m compileall -q src scripts` must pass.
 - `python3 scripts/check_policy_gates.py` must pass.
 

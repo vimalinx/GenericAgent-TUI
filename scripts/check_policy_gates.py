@@ -918,6 +918,16 @@ def assert_ohmypi_isolated_runtime_settings() -> None:
         assert adapter is not None
         assert getattr(adapter, "cwd") == a.APP_ROOT_DIR, getattr(adapter, "cwd")
         assert getattr(adapter, "env")["PI_CODING_AGENT_DIR"] == runtime_config.agent_dir
+        ohmypi_agent = adapter.create_agent()
+        setattr(ohmypi_agent, "_ga_tui_runtime_provider_id", "ohmypi")
+        title_state = a.State(agent=ohmypi_agent)
+        title_path = os.path.join(a.MODEL_RESPONSES_DIR, "model_responses_ohmypi_title.txt")
+        a.set_agent_log_path(ohmypi_agent, title_path)
+        title_messages = [a.Message("user", "给这个会话起名"), a.Message("assistant", "这是回答")]
+        assert a.agent_supports_inline_ai_metadata(ohmypi_agent) is False
+        assert a.generate_ai_session_title(ohmypi_agent, title_messages) == ""
+        assert a.maybe_start_ai_title_job(title_state, title_path, title_messages, ohmypi_agent) is False
+        assert title_state.title_jobs == set(), title_state.title_jobs
         record = adapter.spec.to_record()
         assert record["model_routing"]["isolated_agent_dir"] == runtime_config.agent_dir, record
         assert record["model_routing"]["configured_model_count"] == 2, record
@@ -3742,6 +3752,20 @@ def assert_history_curator_skill_uses_progressive_disclosure() -> None:
     assert submitted_source == "user:history_curator_skill", state.agent.prompts
     assert "Index artifact: artifact://artifacts/history-curation-index/" in submitted_prompt, submitted_prompt
     assert state.messages[0].role == "user" and state.messages[0].content == "/curate-history cat:Shuheng limit=5", state.messages
+
+    runtime_agent = RuntimeCaptureFakeAgent()
+    runtime_state = a.State(agent=runtime_agent)
+    runtime_state.running = True
+    a.submit(runtime_state, "/curate-history cat:Shuheng limit=5")
+    assert runtime_agent.runtime_requests, runtime_agent.runtime_requests
+    runtime_request = runtime_agent.runtime_requests[-1]
+    assert runtime_request.source == "user:history_curator_skill", runtime_request
+    assert runtime_request.metadata.get("runtime_context_mode") == "lean", runtime_request.metadata
+    assert runtime_request.context_pack_ref == "", runtime_request
+    assert runtime_request.artifact_refs == [], runtime_request
+    assert "[GA TUI Context Pack]" not in runtime_request.prompt, runtime_request.prompt
+    assert runtime_request.prompt.startswith("[Shuheng History Curator Skill]"), runtime_request.prompt
+    assert "Index artifact: artifact://artifacts/history-curation-index/" in runtime_request.prompt, runtime_request.prompt
 
     empty_state = a.State(agent=FakeLLMAgent())
     empty_state.running = True
