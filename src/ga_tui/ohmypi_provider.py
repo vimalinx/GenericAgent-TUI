@@ -80,6 +80,11 @@ _FULL_APPROVAL_TOOL_MAP = {
     "write": {"write", "repo.write"},
 }
 _OHMYPI_APPROVAL_MODES = {"always-ask", "write", "yolo"}
+TOKEN_USAGE_KEYS = ("requests", "input", "output", "cache_create", "cache_read")
+
+
+def _empty_token_usage() -> dict[str, int]:
+    return {key: 0 for key in TOKEN_USAGE_KEYS}
 
 
 def normalized_ohmypi_approval_mode(value: str = "") -> str:
@@ -146,6 +151,8 @@ class _ActivePrompt:
     pending_terminal_text: str | None = None
     pending_terminal_fallback_text: str = ""
     terminal_grace_started: bool = False
+    token_usage: dict[str, int] = field(default_factory=_empty_token_usage)
+    token_usage_signatures: set[str] = field(default_factory=set)
 
 
 @dataclass(frozen=True)
@@ -370,6 +377,137 @@ def _visible_text_from_payload(value: Any) -> str:
     return "".join(parts)
 
 
+def _token_usage_int(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _token_usage_add(left: dict[str, int], right: dict[str, int]) -> dict[str, int]:
+    return {key: _token_usage_int(left.get(key)) + _token_usage_int(right.get(key)) for key in TOKEN_USAGE_KEYS}
+
+
+def _has_token_usage(usage: dict[str, int]) -> bool:
+    return any(_token_usage_int(usage.get(key)) > 0 for key in ("input", "output", "cache_create", "cache_read"))
+
+
+def _normalize_ohmypi_token_usage(raw: Any) -> dict[str, int]:
+    if not isinstance(raw, dict):
+        return {}
+    known_keys = {
+        "input",
+        "inputTokens",
+        "input_tokens",
+        "output",
+        "outputTokens",
+        "output_tokens",
+        "cacheRead",
+        "cache_read",
+        "cacheWrite",
+        "cacheCreate",
+        "cache_create",
+        "cacheCreation",
+        "cache_creation",
+    }
+    if not any(key in raw for key in known_keys):
+        return {}
+    usage = _empty_token_usage()
+    usage["requests"] = 1
+    usage["input"] = _token_usage_int(raw.get("input", raw.get("inputTokens", raw.get("input_tokens", 0))))
+    usage["output"] = _token_usage_int(raw.get("output", raw.get("outputTokens", raw.get("output_tokens", 0))))
+    usage["cache_read"] = _token_usage_int(raw.get("cacheRead", raw.get("cache_read", 0)))
+    usage["cache_create"] = (
+        _token_usage_int(raw.get("cacheWrite"))
+        + _token_usage_int(raw.get("cacheCreate"))
+        + _token_usage_int(raw.get("cache_create"))
+        + _token_usage_int(raw.get("cacheCreation"))
+        + _token_usage_int(raw.get("cache_creation"))
+    )
+    return usage
+
+
+def _token_usage_signature(container: dict[str, Any], usage: dict[str, int], fallback_index: int) -> str:
+    for key in ("responseId", "response_id", "messageId", "message_id", "id"):
+        value = str(container.get(key) or "").strip()
+        if value:
+            return f"id:{value}"
+    timestamp = str(container.get("timestamp") or container.get("createdAt") or container.get("created_at") or "").strip()
+    model = str(container.get("model") or container.get("provider") or container.get("api") or "").strip()
+    usage_blob = json.dumps(usage, sort_keys=True, separators=(",", ":"))
+    if timestamp:
+        return f"ts:{timestamp}:{model}:{usage_blob}"
+    return f"anon:{fallback_index}:{model}:{usage_blob}"
+
+
+def _frame_token_usage_entries(frame: dict[str, Any]) -> list[tuple[str, dict[str, int]]]:
+    entries: list[tuple[str, dict[str, int]]] = []
+    seen_containers: set[int] = set()
+
+    def visit(value: Any) -> None:
+        if not isinstance(value, dict):
+            return
+        container_id = id(value)
+        if container_id in seen_containers:
+            return
+        seen_containers.add(container_id)
+        usage = _normalize_ohmypi_token_usage(value.get("usage"))
+        if usage:
+            entries.append((_token_usage_signature(value, usage, len(entries)), usage))
+        for key in ("message", "assistantMessage", "assistantMessageEvent"):
+            child = value.get(key)
+            if isinstance(child, dict):
+                visit(child)
+        messages = value.get("messages")
+        if isinstance(messages, list):
+            for item in messages:
+                if isinstance(item, dict):
+                    visit(item)
+
+    visit(frame)
+    return entries
+
+
+def _usage_entries_from_session_file(path: str) -> list[tuple[str, dict[str, int]]]:
+    entries: list[tuple[str, dict[str, int]]] = []
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            for line_no, line in enumerate(handle, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                message = row.get("message")
+                if not isinstance(message, dict) or str(message.get("role") or "") != "assistant":
+                    continue
+                usage = _normalize_ohmypi_token_usage(message.get("usage"))
+                if not _has_token_usage(usage):
+                    continue
+                signature = _token_usage_signature(message, usage, line_no)
+                entries.append((signature, usage))
+    except OSError:
+        return []
+    return entries
+
+
+def _session_usage_entries(agent_dir: str) -> list[tuple[str, dict[str, int]]]:
+    sessions_dir = os.path.join(agent_dir, "sessions")
+    if not os.path.isdir(sessions_dir):
+        return []
+    entries: list[tuple[str, dict[str, int]]] = []
+    for root, _dirs, files in os.walk(sessions_dir):
+        for name in files:
+            if not name.endswith(".jsonl"):
+                continue
+            entries.extend(_usage_entries_from_session_file(os.path.join(root, name)))
+    return entries
+
+
 class OhMyPiRpcAgent:
     """Small queue-compatible wrapper around `omp --mode rpc`."""
 
@@ -425,6 +563,8 @@ class OhMyPiRpcAgent:
         self._closed = False
         self._host_tools_registered = False
         self._pending_model: OhMyPiRuntimeModel | None = None
+        self._session_usage_seen_signatures: set[str] = set()
+        self._session_usage_seen_initialized = False
 
     def _clients_from_models(self, models: list[OhMyPiRuntimeModel]) -> list[_OhMyPiClient]:
         if not models:
@@ -523,6 +663,7 @@ class OhMyPiRpcAgent:
             )
             self.is_running = True
             self.task_queue.start()
+        self._initialize_session_usage_seen()
         self._emit_runtime_event(
             "runtime_task_requested",
             status="starting",
@@ -632,6 +773,7 @@ class OhMyPiRpcAgent:
             return
 
     def _handle_frame(self, frame: dict[str, Any]) -> None:
+        self._remember_frame_token_usage(frame)
         frame_type = str(frame.get("type") or "")
         if frame_type == "ready":
             self._register_host_tools()
@@ -963,6 +1105,54 @@ class OhMyPiRpcAgent:
                 return
             active.final_text = text
 
+    def _remember_frame_token_usage(self, frame: dict[str, Any]) -> None:
+        entries = _frame_token_usage_entries(frame)
+        if not entries:
+            return
+        with self._active_lock:
+            active = self._active
+            if active is None or active.finished:
+                return
+            for signature, usage in entries:
+                if signature in active.token_usage_signatures:
+                    continue
+                active.token_usage_signatures.add(signature)
+                active.token_usage = _token_usage_add(active.token_usage, usage)
+
+    def _session_agent_dir(self) -> str:
+        env = self.env if self.env is not None else os.environ
+        return str(env.get("PI_CODING_AGENT_DIR") or "").strip()
+
+    def _initialize_session_usage_seen(self) -> None:
+        if self._session_usage_seen_initialized:
+            return
+        agent_dir = self._session_agent_dir()
+        if not agent_dir:
+            self._session_usage_seen_initialized = True
+            return
+        self._session_usage_seen_signatures.update(signature for signature, _usage in _session_usage_entries(agent_dir))
+        self._session_usage_seen_initialized = True
+
+    def _merge_active_session_file_token_usage(self) -> None:
+        agent_dir = self._session_agent_dir()
+        if not agent_dir:
+            return
+        entries = _session_usage_entries(agent_dir)
+        if not entries:
+            return
+        with self._active_lock:
+            active = self._active
+            if active is None or active.finished:
+                return
+            for signature, usage in entries:
+                if signature in self._session_usage_seen_signatures:
+                    continue
+                self._session_usage_seen_signatures.add(signature)
+                if signature in active.token_usage_signatures:
+                    continue
+                active.token_usage_signatures.add(signature)
+                active.token_usage = _token_usage_add(active.token_usage, usage)
+
     def _active_pending_terminal(self) -> tuple[str | None, str]:
         with self._active_lock:
             active = self._active
@@ -1010,10 +1200,12 @@ class OhMyPiRpcAgent:
     def _finish_active(self, text: str | None = None, *, source: str = "ohmypi", fallback_text: str = "") -> None:
         if text is None:
             self._flush_active_thinking()
+        self._merge_active_session_file_token_usage()
         done_text = ""
         signal_source = source
         request_id = ""
         runtime_request: RuntimeTaskRequest | None = None
+        token_usage = _empty_token_usage()
         with self._active_lock:
             active = self._active
             if active is None or active.finished:
@@ -1032,7 +1224,11 @@ class OhMyPiRpcAgent:
             signal_source = active.source or source
             request_id = active.request_id
             runtime_request = active.runtime_request
-            active.display_queue.put({"done": done_text, "source": source})
+            token_usage = dict(active.token_usage)
+            done_item: dict[str, Any] = {"done": done_text, "source": source}
+            if _has_token_usage(token_usage):
+                done_item["usage"] = token_usage
+            active.display_queue.put(done_item)
             self._active = None
             self.is_running = False
             self.task_queue.done()
@@ -1046,6 +1242,9 @@ class OhMyPiRpcAgent:
             event_type = "runtime_task_failed"
             status = "failed"
             error = done_text
+        event_payload: dict[str, Any] = {"request_id": request_id}
+        if _has_token_usage(token_usage):
+            event_payload["token_usage"] = token_usage
         self._emit_runtime_event(
             event_type,
             status=status,
@@ -1053,7 +1252,7 @@ class OhMyPiRpcAgent:
             source=signal_source,
             message=done_text[:1200],
             error=error,
-            payload={"request_id": request_id},
+            payload=event_payload,
         )
         self._emit_memory_candidate_signal(done_text, source=signal_source, request_id=request_id)
 

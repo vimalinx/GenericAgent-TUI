@@ -613,6 +613,57 @@ def assert_token_usage_registry_prunes_removed_history() -> None:
         assert fake_tracker.reset_calls[-1] == "token-next", fake_tracker.reset_calls
         assert next_state.token_live_offsets["token-next"] == a.empty_token_stats_dict(), next_state.token_live_offsets
         assert a.session_token_stats(next_state, next_state.agent).total_tokens() == 0
+
+        omp_path = os.path.join(a.MODEL_RESPONSES_DIR, "model_responses_omp.txt")
+        Path(omp_path).write_text("omp", encoding="utf-8")
+        omp_key = os.path.basename(omp_path)
+        omp_state = a.State(agent=TokenAgent(omp_path, "token-omp"))
+        assert a.persist_runtime_token_usage(omp_state, omp_state.agent, {
+            "requests": 2,
+            "input": 120,
+            "output": 30,
+            "cache_create": 4,
+            "cache_read": 400,
+        }) is True
+        assert omp_state.token_usage_registry[omp_key] == {
+            "requests": 2,
+            "input": 120,
+            "output": 30,
+            "cache_create": 4,
+            "cache_read": 400,
+        }, omp_state.token_usage_registry
+        assert a.session_token_stats(omp_state, omp_state.agent).total_tokens() == 554
+
+        ui_path = os.path.join(a.MODEL_RESPONSES_DIR, "model_responses_ui_usage.txt")
+        Path(ui_path).write_text("ui", encoding="utf-8")
+        ui_key = os.path.basename(ui_path)
+        ui_state = a.State(agent=TokenAgent(ui_path, "token-ui"))
+        ui_state.active_task_id = 77
+        ui_state.ui_queue.put((
+            "token_usage",
+            "stream",
+            a.StreamTarget("active"),
+            77,
+            {"requests": 1, "input": 7, "output": 8, "cache_create": 0, "cache_read": 9},
+        ))
+        assert a.process_ui_queue(ui_state) is True
+        assert ui_state.token_usage_registry[ui_key] == {
+            "requests": 1,
+            "input": 7,
+            "output": 8,
+            "cache_create": 0,
+            "cache_read": 9,
+        }, ui_state.token_usage_registry
+
+        temp_state = a.State(agent=TokenAgent(os.devnull, "token-temp"))
+        assert a.persist_runtime_token_usage(temp_state, temp_state.agent, {
+            "requests": 1,
+            "input": 10,
+            "output": 5,
+            "cache_create": 0,
+            "cache_read": 0,
+        }) is False
+        assert temp_state.token_usage_registry == {}, temp_state.token_usage_registry
     finally:
         a.cost_tracker = old_cost_tracker
 
@@ -1130,6 +1181,110 @@ def assert_ohmypi_rpc_queue_mapping() -> None:
     assert runtime_events[-1]["event_type"] == "runtime_task_completed", runtime_events
     assert runtime_events[-1]["artifact_refs"] == ["artifact://context_packs/researcher-1/task_omp_runtime.json"], runtime_events[-1]
     agent.close()
+
+
+def assert_ohmypi_rpc_usage_tracking() -> None:
+    processes: list[FakeRpcProcess] = []
+    runtime_events: list[dict[str, object]] = []
+
+    def process_factory(*_args, **_kwargs):
+        process = FakeRpcProcess(auto_finish=False)
+        processes.append(process)
+        return process
+
+    agent = omp.OhMyPiRpcAgent(
+        command=["/fake/omp", "--mode", "rpc"],
+        cwd=str(ROOT),
+        process_factory=process_factory,
+        runtime_event_sink=lambda event: runtime_events.append(event.to_record()),
+        startup_timeout=1,
+    )
+    request = a.RuntimeTaskRequest(
+        task_id="task_omp_usage",
+        provider_id="ohmypi",
+        agent_id="orchestrator.main",
+        role="main_orchestrator",
+        objective="Count usage.",
+        prompt="usage",
+        source="test",
+    )
+    dq = agent.put_runtime_task(request)
+    process = wait_for_process(processes)
+    first_message = {
+        "id": "message-usage-1",
+        "role": "assistant",
+        "content": [{"type": "text", "text": "intermediate"}],
+        "usage": {"input": 100, "output": 20, "cacheRead": 300, "cacheWrite": 7, "totalTokens": 427},
+        "timestamp": 1780000000,
+    }
+    final_message = {
+        "id": "message-usage-2",
+        "role": "assistant",
+        "content": [{"type": "text", "text": "usage done"}],
+        "usage": {"input": 8, "output": 3, "cacheRead": 50, "cacheWrite": 0, "totalTokens": 61},
+        "timestamp": 1780000001,
+    }
+    process.stdout.push({"type": "message_end", "message": first_message})
+    process.stdout.push({"type": "agent_end", "messages": [first_message, final_message]})
+    done, _streamed = wait_for_queue_done(dq)
+    assert done["done"] == "usage done", done
+    assert done["usage"] == {
+        "requests": 2,
+        "input": 108,
+        "output": 23,
+        "cache_create": 7,
+        "cache_read": 350,
+    }, done
+    assert runtime_events[-1]["event_type"] == "runtime_task_completed", runtime_events
+    assert runtime_events[-1]["payload"]["token_usage"] == done["usage"], runtime_events[-1]
+    agent.close()
+
+    fallback_processes: list[FakeRpcProcess] = []
+    agent_dir = tempfile.mkdtemp(prefix="ga_tui_omp_usage_agent_")
+    sessions_dir = os.path.join(agent_dir, "sessions", "-Programs-Shuheng")
+    os.makedirs(sessions_dir, exist_ok=True)
+    session_path = os.path.join(sessions_dir, "session.jsonl")
+    Path(session_path).write_text("", encoding="utf-8")
+
+    def fallback_process_factory(*_args, **_kwargs):
+        process = FakeRpcProcess(auto_finish=False)
+        fallback_processes.append(process)
+        return process
+
+    fallback_agent = omp.OhMyPiRpcAgent(
+        command=["/fake/omp", "--mode", "rpc"],
+        cwd=str(ROOT),
+        env={"PI_CODING_AGENT_DIR": agent_dir},
+        process_factory=fallback_process_factory,
+        startup_timeout=1,
+    )
+    dq = fallback_agent.put_task("usage from session file", source="test")
+    process = wait_for_process(fallback_processes)
+    with open(session_path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps({
+            "type": "message",
+            "id": "row-usage-1",
+            "message": {
+                "id": "session-message-1",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "fallback done"}],
+                "usage": {"input": 11, "output": 12, "cacheRead": 13, "cacheWrite": 14, "totalTokens": 50},
+            },
+        }, ensure_ascii=False) + "\n")
+    process.stdout.push({
+        "type": "agent_end",
+        "messages": [{"role": "assistant", "content": [{"type": "text", "text": "fallback done"}]}],
+    })
+    fallback_done, _fallback_streamed = wait_for_queue_done(dq)
+    assert fallback_done["done"] == "fallback done", fallback_done
+    assert fallback_done["usage"] == {
+        "requests": 1,
+        "input": 11,
+        "output": 12,
+        "cache_create": 14,
+        "cache_read": 13,
+    }, fallback_done
+    fallback_agent.close()
 
 
 def assert_ohmypi_rpc_final_text_fallback() -> None:
@@ -4240,6 +4395,7 @@ def run_checks() -> None:
     assert_ohmypi_permission_profiles()
     assert_ohmypi_rpc_extension_approval_bridge()
     assert_ohmypi_rpc_queue_mapping()
+    assert_ohmypi_rpc_usage_tracking()
     assert_ohmypi_rpc_final_text_fallback()
     assert_ohmypi_rpc_waits_for_agent_end_before_next_prompt()
     assert_ohmypi_rpc_tool_use_turn_end_waits_for_final_answer()

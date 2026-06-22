@@ -12833,6 +12833,8 @@ def clean_token_usage_registry(raw: Any) -> dict[str, dict[str, int]]:
                 clean[stat_key] = max(0, int(value.get(stat_key, 0) or 0))
             except (TypeError, ValueError):
                 clean[stat_key] = 0
+        if not token_stats_has_tokens(clean):
+            clean["requests"] = 0
         registry[key] = clean
     return registry
 
@@ -12927,6 +12929,40 @@ def token_stats_delta(now: dict[str, int], before: dict[str, int]) -> dict[str, 
 
 def token_stats_add(left: dict[str, int], right: dict[str, int]) -> dict[str, int]:
     return {key: max(0, int(left.get(key, 0)) + int(right.get(key, 0))) for key in TOKEN_STAT_KEYS}
+
+
+def token_stats_has_tokens(stats: dict[str, int]) -> bool:
+    return any(max(0, int(stats.get(key, 0) or 0)) > 0 for key in ("input", "output", "cache_create", "cache_read"))
+
+
+def normalize_runtime_token_usage(usage: Any) -> dict[str, int]:
+    if not isinstance(usage, dict):
+        return empty_token_stats_dict()
+    clean = empty_token_stats_dict()
+    for key in TOKEN_STAT_KEYS:
+        try:
+            clean[key] = max(0, int(usage.get(key, 0) or 0))
+        except (TypeError, ValueError):
+            clean[key] = 0
+    return clean
+
+
+def persist_runtime_token_usage(state: State, agent: Any, usage: Any) -> bool:
+    clean = normalize_runtime_token_usage(usage)
+    if not token_stats_has_tokens(clean):
+        return False
+    key = token_session_key(agent)
+    if agent_log_path_is_devnull(agent) or not key:
+        return False
+    refresh_state_token_usage_registry(state)
+    prune_state_token_usage_registry(state)
+    state.token_usage_registry[key] = token_stats_add(state.token_usage_registry.get(key, empty_token_stats_dict()), clean)
+    try:
+        save_state_token_usage_registry(state)
+    except Exception as exc:
+        state.last_error = f"token usage save: {type(exc).__name__}: {exc}"
+        return False
+    return True
 
 
 def bind_agent_token_session(state: State, agent: Any) -> None:
@@ -22030,6 +22066,9 @@ def consume_subagent_queue_to_kind(state: State, kind: str, subagent_id: str, ta
             buf += str(item.get("next") or "")
             state.ui_queue.put((kind, subagent_id, task_id, buf, False))
         if "done" in item:
+            usage = item.get("usage")
+            if usage:
+                state.ui_queue.put(("token_usage", kind, subagent_id, task_id, usage))
             state.ui_queue.put((kind, subagent_id, task_id, str(item.get("done") or buf), True))
             return
 
@@ -22074,6 +22113,9 @@ def consume_queue(state: State, stream_target: StreamTarget, task_id: int, dq: q
             buf += str(item.get("next") or "")
             state.ui_queue.put(("stream", stream_target, task_id, buf, False))
         if "done" in item:
+            usage = item.get("usage")
+            if usage:
+                state.ui_queue.put(("token_usage", "stream", stream_target, task_id, usage))
             state.ui_queue.put(("stream", stream_target, task_id, str(item.get("done") or buf), True))
             return
 
@@ -22149,6 +22191,27 @@ def process_ui_queue(state: State) -> bool:
                 changed = True
             return changed
         kind = item[0]
+        if kind == "token_usage":
+            _kind, target_kind, target_ref, task_id, usage = item
+            persisted = False
+            if target_kind == "stream":
+                target_key = target_ref.key if isinstance(target_ref, StreamTarget) else str(target_ref)
+                if target_key == "active":
+                    if task_id == state.active_task_id:
+                        persisted = persist_runtime_token_usage(state, state.agent, usage)
+                else:
+                    bg = state.background_sessions.get(target_key)
+                    if bg is not None and task_id == bg.active_task_id:
+                        persisted = persist_runtime_token_usage(state, bg.agent, usage)
+            elif target_kind in {"sub_stream", "sub_chat_stream"}:
+                sub = state.subagents.get(str(target_ref))
+                if sub is not None and task_id == sub.active_task_id and sub.agent is not None:
+                    persisted = persist_runtime_token_usage(state, sub.agent, usage)
+            if persisted:
+                changed = True
+                state.dirty = True
+            continue
+
         if kind == "sub_chat_stream":
             _kind, subagent_id, task_id, text, done = item
             sub = state.subagents.get(str(subagent_id))
