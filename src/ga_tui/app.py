@@ -6462,6 +6462,7 @@ tools_forbidden: {", ".join(permissions.get("tools_forbidden", []))}
 output_contract: {", ".join(pack.get("output_contract") or [])}
 stop_condition: {task.get("stop_condition", "")}
 subagent_identity_rule: To claim you talked to a persistent Shuheng subagent, route the message to that existing agent_id through Shuheng subagent task/direct-chat controls. A copied profile, OMP native task spawn, or IRC demo participant is only a clone/persona simulation and must be reported as such.
+final_reply_rule: After tool use, runtime task execution, or memory-candidate submission attempts, always finish with a normal user-facing final reply in the user's language. Tool results, "Result:" status lines, and memory-candidate submitted/deferred notices are not a substitute for that reply.
 
 Boundaries:
 {boundaries or "- (empty)"}
@@ -6510,6 +6511,7 @@ permission_profile: {pack.get("permission_profile") or permissions.get("permissi
 policy: This is a refreshed Shuheng context-pack artifact for the current turn.
 Do not treat older full context-pack blocks in OMP history as current if this ref is newer.
 Read the referenced artifact or call memory_context_get only when the task needs deeper context.
+final_reply_rule: Always finish with a normal user-facing final reply in the user's language; do not stop at tool results, "Result:" status lines, or memory-candidate notices.
 [/GA TUI Context Ref]
 """.strip()
 
@@ -12416,7 +12418,11 @@ def ohmypi_typed_governed_host_tool_definitions() -> list[RpcHostToolDefinition]
         RpcHostToolDefinition(
             name="memory_candidate_submit",
             label="memory.candidate.submit",
-            description="Submit a memory candidate to the Shuheng human approval queue; never writes long-term memory directly.",
+            description=(
+                "Submit a memory candidate to the Shuheng human approval queue only when a concrete persistent "
+                "subagent target is known; never writes long-term memory directly. Do not call for generic runtime "
+                "lessons without a target, and never let submitted/deferred status replace the final user reply."
+            ),
             parameters={
                 "type": "object",
                 "additionalProperties": False,

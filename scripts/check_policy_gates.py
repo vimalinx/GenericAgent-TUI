@@ -921,6 +921,8 @@ def assert_ohmypi_memory_prompt_and_command() -> None:
     prompt_path = omp.write_ohmypi_memory_prompt(root_dir=root, harness_dir=harness)
     prompt_text = Path(prompt_path).read_text(encoding="utf-8")
     assert "Shuheng Layered Memory Guidance" in prompt_text, prompt_text
+    assert "normal user-facing final reply" in prompt_text, prompt_text
+    assert "memory-candidate submit/deferred notices are not a substitute" in prompt_text, prompt_text
     assert "remember useful path" in prompt_text, prompt_text
     assert "global_mem.txt" in prompt_text, prompt_text
     assert "SHOULD_NOT_LEAK" not in prompt_text, prompt_text
@@ -1179,6 +1181,8 @@ def assert_ohmypi_runtime_context_pack_is_not_repeated() -> None:
     assert "[GA TUI Context Ref]" not in first.prompt, first.prompt
     assert "subagent_identity_rule:" in first.prompt, first.prompt
     assert "copied profile, OMP native task spawn, or IRC demo participant is only a clone" in first.prompt, first.prompt
+    assert "final_reply_rule:" in first.prompt, first.prompt
+    assert "memory-candidate submitted/deferred notices are not a substitute" in first.prompt, first.prompt
 
     runtime_state.status = "idle"
     runtime_state.active_task_id = None
@@ -1192,6 +1196,8 @@ def assert_ohmypi_runtime_context_pack_is_not_repeated() -> None:
     second = runtime_agent.runtime_requests[-1]
     assert "[GA TUI Context Pack]" not in second.prompt, second.prompt
     assert "[GA TUI Context Ref]" in second.prompt, second.prompt
+    assert "final_reply_rule:" in second.prompt, second.prompt
+    assert "memory-candidate notices" in second.prompt, second.prompt
     assert second.context_pack_ref.startswith("artifact://"), second.context_pack_ref
 
     a.reset_agent_runtime_context_no_snapshot(runtime_agent)
@@ -2061,6 +2067,9 @@ def assert_ohmypi_tui_query_host_tool_contract() -> None:
     assert "identity/interaction rules" in typed_agent_get_tool["description"], typed_agent_get_tool
     typed_agent_match_tool = next(item for item in all_tools if item["name"] == "agent_match")
     assert "not clone its persona" in typed_agent_match_tool["description"], typed_agent_match_tool
+    typed_memory_candidate_tool = next(item for item in all_tools if item["name"] == "memory_candidate_submit")
+    assert "only when a concrete persistent subagent target is known" in typed_memory_candidate_tool["description"], typed_memory_candidate_tool
+    assert "never let submitted/deferred status replace the final user reply" in typed_memory_candidate_tool["description"], typed_memory_candidate_tool
     typed_handler = a.ohmypi_tui_host_tool_handler(state)
     typed_agents = typed_handler("agent_list", {"limit": 5})
     assert typed_agents["schema_version"] == "ga-tui.query.v1", typed_agents
