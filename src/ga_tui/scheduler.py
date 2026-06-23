@@ -650,9 +650,15 @@ def update_schedule_last_run(row: dict[str, Any], run: dict[str, Any]) -> None:
 def append_schedule_skip_run(row: dict[str, Any], info: dict[str, Any], *, status: str, reason: str) -> dict[str, Any]:
     schedule_id = str(row.get("schedule_id") or row.get("id") or "").strip()
     trigger = schedule_record_trigger(row)
-    base_key = info.get("idempotency_key") or f"{schedule_id}:{status}:{hashlib.sha1((trigger + reason).encode('utf-8')).hexdigest()[:16]}"
+    base_key = str(info.get("idempotency_key") or "")
+    legacy_key = ""
+    if not base_key:
+        hash_src = (trigger + reason).encode("utf-8")
+        base_key = f"{schedule_id}:{status}:{hashlib.sha256(hash_src).hexdigest()[:16]}"
+        legacy_key = f"{schedule_id}:{status}:{hashlib.sha1(hash_src).hexdigest()[:16]}:{status}"
     key = f"{base_key}:{status}"
-    if key in schedule_run_idempotency_keys():
+    seen_keys = schedule_run_idempotency_keys()
+    if key in seen_keys or (legacy_key and legacy_key in seen_keys):
         return {}
     run = append_schedule_run({
         "schedule_id": schedule_id,
@@ -851,9 +857,12 @@ def scheduler_tick(
             continue
         if status == "invalid":
             result["invalid"] += 1
-            trigger_hash = hashlib.sha1(schedule_record_trigger(row).encode("utf-8")).hexdigest()[:16]
+            trigger_bytes = schedule_record_trigger(row).encode("utf-8")
+            trigger_hash = hashlib.sha256(trigger_bytes).hexdigest()[:16]
+            legacy_trigger_hash = hashlib.sha1(trigger_bytes).hexdigest()[:16]
             invalid_key = f"{schedule_id}:invalid:{trigger_hash}"
-            if invalid_key not in seen_keys:
+            legacy_invalid_key = f"{schedule_id}:invalid:{legacy_trigger_hash}"
+            if invalid_key not in seen_keys and legacy_invalid_key not in seen_keys:
                 run = append_schedule_skip_run(row, {**info, "idempotency_key": invalid_key}, status="invalid", reason=str(info.get("reason") or "invalid schedule"))
                 if run:
                     result["runs"].append(run)

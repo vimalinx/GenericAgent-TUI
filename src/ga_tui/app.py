@@ -304,6 +304,18 @@ AGENT_GATEWAY_PUSH_DELIVERIES_PATH = os.path.join(AGENT_HARNESS_DIR, "gateway_pu
 AGENT_GATEWAY_DAEMON_PID_PATH = os.path.join(AGENT_HARNESS_DIR, "gateway_daemon.pid")
 AGENT_GATEWAY_DAEMON_STATUS_PATH = os.path.join(AGENT_HARNESS_DIR, "gateway_daemon.json")
 AGENT_GATEWAY_DAEMON_LOG_PATH = os.path.join(AGENT_HARNESS_DIR, "gateway_daemon.log")
+try:
+    GATEWAY_SSE_MAX_SECONDS = max(5.0, float(os.environ.get("GA_TUI_GATEWAY_SSE_MAX_SECONDS", "300") or "300"))
+except ValueError:
+    GATEWAY_SSE_MAX_SECONDS = 300.0
+try:
+    GATEWAY_SSE_WRITE_TIMEOUT_SECONDS = max(0.5, float(os.environ.get("GA_TUI_GATEWAY_SSE_WRITE_TIMEOUT_SECONDS", "5") or "5"))
+except ValueError:
+    GATEWAY_SSE_WRITE_TIMEOUT_SECONDS = 5.0
+try:
+    GATEWAY_SSE_SENT_ID_LIMIT = max(20, int(os.environ.get("GA_TUI_GATEWAY_SSE_SENT_ID_LIMIT", "2000") or "2000"))
+except ValueError:
+    GATEWAY_SSE_SENT_ID_LIMIT = 2000
 AGENT_BRIDGE_REGISTRY_PATH = os.path.join(AGENT_HARNESS_DIR, "bridge_registry.json")
 LLM_RECENT_MODELS_PATH = os.path.join(AGENT_HARNESS_DIR, "recent_models.json")
 SECRET_VAULT_DIR = os.path.abspath(os.path.expanduser(os.environ.get("GA_TUI_SECRET_VAULT_DIR") or os.path.join(SHUHENG_MEMORY_DIR, "secret_vault")))
@@ -2090,8 +2102,17 @@ def workspace_slug(value: str) -> str:
 def workspace_id_for_root(root: str) -> str:
     normalized = os.path.abspath(os.path.expanduser(root or os.getcwd()))
     slug = workspace_slug(os.path.basename(normalized.rstrip(os.sep)) or "workspace")
-    digest = hashlib.sha1(normalized.encode("utf-8", errors="replace")).hexdigest()[:8]
-    return f"{slug}-{digest}"
+    digest = hashlib.sha256(normalized.encode("utf-8", errors="replace")).hexdigest()[:8]
+    workspace_id = f"{slug}-{digest}"
+    # Existing workspace directories were named with an 8-char sha1 suffix;
+    # keep them discoverable while new workspaces use sha256.
+    legacy_digest = hashlib.sha1(normalized.encode("utf-8", errors="replace")).hexdigest()[:8]
+    legacy_workspace_id = f"{slug}-{legacy_digest}"
+    legacy_path = os.path.join(SHUHENG_WORKSPACES_DIR, legacy_workspace_id)
+    current_path = os.path.join(SHUHENG_WORKSPACES_DIR, workspace_id)
+    if os.path.isdir(legacy_path) and not os.path.isdir(current_path):
+        return legacy_workspace_id
+    return workspace_id
 
 
 def workspace_dir(workspace_id: str) -> str:
@@ -7526,30 +7547,55 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
         self.send_error_json(404, "not found")
 
     def send_sse(self, *, once: bool = False) -> None:
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "close" if once else "keep-alive")
-        self.end_headers()
+        old_timeout: Optional[float] = None
+        try:
+            old_timeout = self.connection.gettimeout()
+            self.connection.settimeout(GATEWAY_SSE_WRITE_TIMEOUT_SECONDS)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close" if once else "keep-alive")
+            self.end_headers()
+        except OSError as exc:
+            log_diagnostic("gateway.sse.open", exc, detail=str(getattr(self, "client_address", "")))
+            return
         sent: set[str] = set()
-        while True:
-            events = gateway_sse_events(limit=20)
-            if not events:
-                events = [{"id": short_uid("event"), "event": "gateway", "data": {"status": "idle", "created_at": now_iso()}}]
-            for event in events:
-                event_id = str(event.get("id") or short_uid("event"))
-                if event_id in sent:
-                    continue
-                sent.add(event_id)
-                data = json.dumps(event.get("data") or {}, ensure_ascii=False, sort_keys=True)
-                frame = f"id: {event_id}\nevent: {event.get('event') or 'message'}\ndata: {data}\n\n"
-                self.wfile.write(frame.encode("utf-8"))
-                self.wfile.flush()
+        sent_order: list[str] = []
+        started_at = time.monotonic()
+        try:
+            while True:
+                if not once and time.monotonic() - started_at >= GATEWAY_SSE_MAX_SECONDS:
+                    return
+                events = gateway_sse_events(limit=20)
+                if not events:
+                    events = [{"id": short_uid("event"), "event": "gateway", "data": {"status": "idle", "created_at": now_iso()}}]
+                for event in events:
+                    event_id = str(event.get("id") or short_uid("event"))
+                    if event_id in sent:
+                        continue
+                    sent.add(event_id)
+                    sent_order.append(event_id)
+                    if len(sent_order) > GATEWAY_SSE_SENT_ID_LIMIT:
+                        old_event_id = sent_order.pop(0)
+                        sent.discard(old_event_id)
+                    data = json.dumps(event.get("data") or {}, ensure_ascii=False, sort_keys=True)
+                    frame = f"id: {event_id}\nevent: {event.get('event') or 'message'}\ndata: {data}\n\n"
+                    try:
+                        self.wfile.write(frame.encode("utf-8"))
+                        self.wfile.flush()
+                    except OSError as exc:
+                        log_diagnostic("gateway.sse.disconnect", exc, detail=str(getattr(self, "client_address", "")))
+                        return
+                    if once:
+                        return
                 if once:
                     return
-            if once:
-                return
-            time.sleep(1)
+                time.sleep(1)
+        finally:
+            try:
+                self.connection.settimeout(old_timeout)
+            except OSError:
+                pass
 
 
 def make_gateway_http_server(host: str = "127.0.0.1", port: int = 8765) -> ThreadingHTTPServer:
@@ -8820,7 +8866,7 @@ def active_plan_continuation_signature(state: State) -> str:
                     task_id,
                     str(row.get("status") or ""),
                     str(child_counts.get(task_id, 0)),
-                    hashlib.sha1(str(row.get("summary") or "").encode("utf-8", errors="ignore")).hexdigest()[:8],
+                    hashlib.sha256(str(row.get("summary") or "").encode("utf-8", errors="ignore")).hexdigest()[:8],
                 ]
             )
         )
@@ -8947,7 +8993,7 @@ STRUCTURED_CONTINUATION_STATES = {
 
 def control_result_continuation_signature(text: str, control_results: list[str]) -> str:
     payload = "\n".join([strip_tui_controls(text), *control_results])
-    digest = hashlib.sha1(payload.encode("utf-8", errors="ignore")).hexdigest()
+    digest = hashlib.sha256(payload.encode("utf-8", errors="ignore")).hexdigest()
     return digest[:16]
 
 
@@ -15290,7 +15336,7 @@ def ai_title_context(messages: list[Message], max_chars: int = 3600) -> str:
 
 
 def session_content_signature(messages: list[Message]) -> str:
-    digest = hashlib.sha1()
+    digest = hashlib.sha256()
     seen = False
     for msg in messages:
         if msg.role not in {"user", "assistant"}:
@@ -15820,7 +15866,7 @@ def session_category_signature(
         str(meta.get("description_signature") or ""),
         session_content_signature(messages or []),
     ])
-    return hashlib.sha1(signature_src.encode("utf-8", errors="ignore")).hexdigest()
+    return hashlib.sha256(signature_src.encode("utf-8", errors="ignore")).hexdigest()
 
 
 def maybe_start_ai_category_job(
@@ -17953,7 +17999,7 @@ def subagent_context_updates_from_messages(messages: list[Message], path: str = 
         update = subagent_result_context_update_from_notice(msg.content, session_key_value=session_key_value)
         if not update:
             continue
-        key = hashlib.sha1(update.encode("utf-8", errors="ignore")).hexdigest()
+        key = hashlib.sha256(update.encode("utf-8", errors="ignore")).hexdigest()
         if key in seen:
             continue
         seen.add(key)
@@ -17993,7 +18039,7 @@ def subagent_result_metadata_summary(notice: dict[str, str], metadata_lines: lis
 
 def subagent_meta_label(notice: dict[str, str]) -> str:
     seed = f"{notice.get('agent_id','')}|{notice.get('task_id','')}|{notice.get('artifact_ref','')}"
-    digest = hashlib.sha1(seed.encode("utf-8", errors="ignore")).hexdigest()[:8]
+    digest = hashlib.sha256(seed.encode("utf-8", errors="ignore")).hexdigest()[:8]
     return f"S{digest}"
 
 

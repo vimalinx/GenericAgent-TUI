@@ -5,8 +5,11 @@ and enforce stable identifier shapes for subagents/workspaces.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 from pathlib import Path
+
+import ga_tui.app as app
 
 from ga_tui.app import (
     clean_subagent_id,
@@ -135,6 +138,28 @@ class TestWorkspaceSlug:
 
     def test_empty_falls_back(self) -> None:
         assert workspace_slug("") == "workspace"
+
+class TestWorkspaceIdForRoot:
+    def test_new_workspace_id_uses_sha256_suffix(self, tmp_path: Path, monkeypatch) -> None:
+        workspaces = tmp_path / "workspaces"
+        monkeypatch.setattr(app, "SHUHENG_WORKSPACES_DIR", str(workspaces))
+        root = tmp_path / "Project Root"
+        root.mkdir()
+        normalized = os.path.abspath(str(root))
+        expected = hashlib.sha256(normalized.encode("utf-8", errors="replace")).hexdigest()[:8]
+        assert app.workspace_id_for_root(str(root)).endswith(f"-{expected}")
+
+    def test_legacy_sha1_workspace_id_remains_discoverable(self, tmp_path: Path, monkeypatch) -> None:
+        workspaces = tmp_path / "workspaces"
+        monkeypatch.setattr(app, "SHUHENG_WORKSPACES_DIR", str(workspaces))
+        root = tmp_path / "Project Root"
+        root.mkdir()
+        normalized = os.path.abspath(str(root))
+        slug = app.workspace_slug(root.name)
+        legacy = hashlib.sha1(normalized.encode("utf-8", errors="replace")).hexdigest()[:8]
+        legacy_id = f"{slug}-{legacy}"
+        (workspaces / legacy_id).mkdir(parents=True)
+        assert app.workspace_id_for_root(str(root)) == legacy_id
 
 
 class TestShortUid:
