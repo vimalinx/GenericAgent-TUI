@@ -1177,6 +1177,8 @@ def assert_ohmypi_runtime_context_pack_is_not_repeated() -> None:
     first = runtime_agent.runtime_requests[-1]
     assert "[GA TUI Context Pack]" in first.prompt, first.prompt
     assert "[GA TUI Context Ref]" not in first.prompt, first.prompt
+    assert "subagent_identity_rule:" in first.prompt, first.prompt
+    assert "copied profile, OMP native task spawn, or IRC demo participant is only a clone" in first.prompt, first.prompt
 
     runtime_state.status = "idle"
     runtime_state.active_task_id = None
@@ -2043,13 +2045,49 @@ def assert_ohmypi_tui_query_host_tool_contract() -> None:
     root = tempfile.mkdtemp(prefix="ga_tui_omp_typed_tools_")
     retarget_harness(root)
     state = a.State(agent=FakeLLMAgent())
+    steward = a.create_subagent(
+        state,
+        "Obsidiam管家",
+        role="memory_curator",
+        persistent=True,
+        profile="整理 Obsidiam 知识库；只提交记忆候选。",
+    )
     all_tools = [item.to_rpc() for item in a.ohmypi_tui_host_tool_definitions()]
     tool_names = {str(item.get("name") or "") for item in all_tools}
     assert {"ga_tui_query", "agent_list", "schedule_list", "memory_context_get", "memory_candidate_submit"} <= tool_names, all_tools
+    query_tool = next(item for item in all_tools if item["name"] == "ga_tui_query")
+    assert "or sends messages to agents" in query_tool["description"], query_tool
+    typed_agent_get_tool = next(item for item in all_tools if item["name"] == "agent_get")
+    assert "identity/interaction rules" in typed_agent_get_tool["description"], typed_agent_get_tool
+    typed_agent_match_tool = next(item for item in all_tools if item["name"] == "agent_match")
+    assert "not clone its persona" in typed_agent_match_tool["description"], typed_agent_match_tool
     typed_handler = a.ohmypi_tui_host_tool_handler(state)
     typed_agents = typed_handler("agent_list", {"limit": 5})
     assert typed_agents["schema_version"] == "ga-tui.query.v1", typed_agents
     assert typed_agents["kind"] == "agent.list", typed_agents
+    typed_agent = next(row for row in typed_agents["agents"] if row["agent_id"] == steward.agent_id)
+    assert typed_agent["runtime_loaded"] is False, typed_agent
+    assert typed_agent["interaction_modes"]["same_agent_task"]["command"] == f"/agent ask {steward.agent_id} <prompt>", typed_agent
+    assert "not this persistent agent" in typed_agent["identity_contract"]["clone_or_spawn_warning"], typed_agent
+    steward_detail = typed_handler("agent_get", {"target": steward.agent_id})
+    assert steward_detail["status"] == "ok", steward_detail
+    assert steward_detail["agent"]["identity_contract"]["canonical_agent_id"] == steward.agent_id, steward_detail
+    assert any(
+        f"source=subagent-chat:{steward.agent_id}" in item
+        for item in steward_detail["agent"]["identity_contract"]["valid_same_agent_paths"]
+    ), steward_detail
+    steward_match = typed_handler(
+        "agent_match",
+        {
+            "objective": "跟 Obsidiam 管家说一句话",
+            "target": steward.agent_id,
+            "reuse_policy": "reuse_only",
+            "lifecycle": "persistent",
+        },
+    )
+    assert steward_match["recommended_action"] == "reuse_existing", steward_match
+    assert steward_match["recommended_agent"]["agent_id"] == steward.agent_id, steward_match
+    assert "clone_or_spawn_warning" in steward_match["recommended_agent"]["identity_contract"], steward_match
     typed_schedule = typed_handler("schedule_list", {})
     assert typed_schedule["status"] == "ok", typed_schedule
     memory_context = typed_handler(
@@ -4463,6 +4501,68 @@ def assert_ohmypi_process_summary_does_not_title_history() -> None:
     assert "Hidden OMP reasoning" not in title_context, title_context
 
 
+def assert_ohmypi_local_category_fallback_for_sidebar() -> None:
+    root = tempfile.mkdtemp(prefix="ga_tui_omp_category_")
+    retarget_harness(root)
+    os.makedirs(a.MODEL_RESPONSES_DIR, exist_ok=True)
+    agent = FakeLLMAgent()
+    setattr(agent, "_ga_tui_runtime_provider_id", "ohmypi")
+    setattr(agent.llmclient.backend, "supports_raw_ask", False)
+
+    def forbidden_raw_ask(_request):
+        raise AssertionError("OMP local category fallback must not call raw_ask")
+        yield ""  # pragma: no cover
+
+    agent.llmclient.backend.raw_ask = forbidden_raw_ask
+    state = a.State(agent=agent)
+    path = os.path.join(a.MODEL_RESPONSES_DIR, "model_responses_category_local.txt")
+    a.set_agent_log_path(agent, path)
+    assistant_text = (
+        "**LLM Running (Turn 1) ...**\n"
+        "<summary>OMP 思考</summary>\n"
+        "<thinking>这里故意写支付、暗网、收款，不能影响左栏分类。</thinking>\n\n"
+        "左栏分类兜底已改成 Shuheng 自己落盘。"
+    )
+    state.messages = [
+        a.Message("user", "左栏会话的自动分类呢？"),
+        a.Message("assistant", assistant_text),
+    ]
+    assert a.append_model_response_transcript_turn(path, state.messages[0].content, assistant_text)
+    assert a.agent_supports_inline_ai_metadata(agent) is False
+    assert a.maybe_start_ai_title_job(state, path, state.messages, agent) is False
+    assert a.maybe_start_ai_category_job(state, path, agent, messages=state.messages) is True
+    assert state.category_jobs == set(), state.category_jobs
+    meta = a.load_session_meta_registry()[os.path.basename(path)]
+    assert meta["category"] == "Shuheng", meta
+    assert meta["category_source"] == "local", meta
+    assert meta.get("category_signature"), meta
+
+    a.set_session_meta_fields(state, path, category="手动类", category_source="manual")
+    assert a.maybe_start_ai_category_job(state, path, agent, messages=state.messages) is False
+    manual_meta = a.load_session_meta_registry()[os.path.basename(path)]
+    assert manual_meta["category"] == "手动类", manual_meta
+    assert manual_meta["category_source"] == "manual", manual_meta
+
+    game_path = os.path.join(a.MODEL_RESPONSES_DIR, "model_responses_category_game.txt")
+    a.set_agent_log_path(agent, game_path)
+    game_state = a.State(agent=agent)
+    game_state.messages = [
+        a.Message("user", "写一个小游戏地图"),
+        a.Message(
+            "assistant",
+            "**LLM Running (Turn 1) ...**\n"
+            "<summary>Shuheng 左栏分类</summary>\n"
+            "<thinking>Hidden Shuheng metadata must stay out of category fallback.</thinking>\n\n"
+            "地图逻辑已完成。",
+        ),
+    ]
+    assert a.append_model_response_transcript_turn(game_path, game_state.messages[0].content, game_state.messages[1].content)
+    assert a.maybe_start_ai_category_job(game_state, game_path, agent, messages=game_state.messages) is True
+    game_meta = a.load_session_meta_registry()[os.path.basename(game_path)]
+    assert game_meta["category"] != "Shuheng", game_meta
+    assert "思考" not in game_meta["category"], game_meta
+
+
 def assert_missing_source_history_rows_restore_from_l4_archive() -> None:
     root = tempfile.mkdtemp(prefix="ga_tui_missing_source_history_")
     retarget_harness(root)
@@ -4964,6 +5064,7 @@ def run_checks() -> None:
     assert_recent_sessions_use_last_message_activity()
     assert_history_curator_skill_uses_progressive_disclosure()
     assert_ohmypi_process_summary_does_not_title_history()
+    assert_ohmypi_local_category_fallback_for_sidebar()
     assert_missing_source_history_rows_restore_from_l4_archive()
     assert_self_intro_does_not_consume_mutual_chat_step()
     assert_control_result_continues_intermediate_workflow_step()

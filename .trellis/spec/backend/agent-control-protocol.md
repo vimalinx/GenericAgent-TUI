@@ -302,7 +302,9 @@ draw_running_indicator_frame(stdscr, state)
 - OMP isolated runtime config must be written under the Shuheng-owned harness runtime directory and must not mutate the user's system OMP config.
 - OMP isolated runtime config defaults `tools.approvalMode` to `yolo`, so OMP runtime tools do not stop for OMP approval prompts.
 - If OMP still emits an RPC extension-UI approval prompt, it may be auto-approved when the active runtime request has `permission_profile:"full"` and the requested tool maps to an allowed capability.
-- OMP RPC backend does not expose `raw_ask`; inline AI metadata jobs such as automatic title, description, and category generation must skip OMP instead of surfacing UI errors.
+- OMP RPC backend does not expose `raw_ask`; inline AI metadata jobs such as automatic title and description generation must skip OMP instead of surfacing UI errors.
+- Sidebar session category is Shuheng-owned index metadata. When `raw_ask` is unavailable, Shuheng must still maintain a bounded local category fallback from visible user/assistant text, cached title/description, and existing category labels without opening an OMP metadata turn.
+- Manual category metadata remains locked: `category_source:"manual"` must not be overwritten by AI or local automatic category refresh.
 
 ### 4. Validation & Error Matrix
 
@@ -314,12 +316,14 @@ draw_running_indicator_frame(stdscr, state)
 - OMP RPC approval select for safe `bash` under full profile -> respond `Approve`.
 - OMP RPC approval select for risky `rm -rf` under full profile -> respond `Approve`.
 - OMP RPC approval select under `standard` profile -> respond `Deny`.
-- OMP active session completes a normal task -> automatic metadata workers are not started through unsupported `raw_ask`, and no `AI title: RuntimeError` appears.
+- OMP active session completes a normal task -> automatic title/description workers are not started through unsupported `raw_ask`, no `AI title: RuntimeError` appears, and sidebar category still lands in `session_meta.json` through the local fallback.
+- OMP process summaries, hidden thinking text, tool calls, and `model_responses*.txt` basenames -> do not influence the local sidebar category.
 
 ### 5. Good/Base/Bad Cases
 
 - Good: Main OMP runtime receives `role:"main_orchestrator"` and `permission_profile:"full"`, shows `write_policy:"single_writer"`, has an empty runtime deny/approval list, can use normal write/search/bash/browser capabilities, and still reports `memory_write:"candidate_only"`.
 - Good: A role-bounded researcher subagent receives `permission_profile:"standard"` with `tools_allowed:["web","read"]` and `write_policy:"none"`.
+- Good: An OMP-backed Shuheng sidebar-history bug session is categorized as `Shuheng` by the local fallback without calling `raw_ask`.
 - Base: Operator sets `GA_TUI_OMP_PERMISSION_PROFILE=read_only`; OMP main runtime starts in compatibility mode and does not advertise bash/write tools.
 - Base: Operator sets `GA_TUI_OMP_APPROVAL_MODE=always-ask`; command/config generation preserves the override.
 - Bad: Main OMP runtime inherits `specialist` role permissions and tells users it only has `read, reason`.
@@ -330,6 +334,7 @@ draw_running_indicator_frame(stdscr, state)
 
 - `scripts/check_policy_gates.py` must assert default full main context with `role:"main_orchestrator"`, main runtime task request role/permissions/prompt/output-contract wiring, read-only env override, standard subagent context, isolated OMP approval mode, runtime provider metadata, and OMP RPC extension approval bridge behavior.
 - `scripts/check_policy_gates.py` must assert OMP inline AI metadata generation is disabled when the backend marks `supports_raw_ask:false`.
+- `scripts/check_policy_gates.py` must assert OMP/raw-ask-disabled sessions still get local sidebar categories, manual categories are not overwritten, and process summaries/hidden thinking do not decide the category.
 - `python3 -m compileall -q src scripts` must pass.
 - `python3 scripts/check_policy_gates.py` must pass.
 
@@ -741,9 +746,10 @@ if text.strip().lower() in {"/llm", "/models", "/model"}:
 - Query tools are installed by wrapping `agentmain.load_tool_schema()` and appending TUI schemas idempotently after every GenericAgent schema reload.
 - Query handlers are installed by patching `agentmain.GenericAgentHandler` with `do_<tool_name>` methods.
 - Runtime state is provided through `agent._ga_tui_state`; if a handler has no bound state, the tool returns an error response instead of guessing.
-- `agent_list` returns bounded agent records: id, name, role, lifecycle, status, busy reason, security context, capabilities, write policy, permissions, queues, active task refs, and profile summary.
-- `agent_get` returns one detailed bounded record with profile summary/full bounded profile, memory summary, output contract, queue previews, and recent assigned tasks.
+- `agent_list` returns bounded agent records: id, name, role, lifecycle, status, busy reason, security context, capabilities, write policy, permissions, queues, active task refs, profile summary, interaction modes, and identity contract.
+- `agent_get` returns one detailed bounded record with profile summary/full bounded profile, memory summary, output contract, queue previews, recent assigned tasks, interaction modes, and identity contract.
 - `agent_match` scores current agents using structured selectors only: explicit target, role, capability, security context, lifecycle, and busy state. It must not score arbitrary natural-language objective/profile similarity.
+- The identity contract must distinguish same-agent routing from persona cloning: a reply only counts as coming from a persistent subagent when it is routed to that existing `agent_id` through Shuheng subagent task/direct-chat controls; OMP native task spawn, IRC demo agents, or copied profile/persona workers must be reported as clones or simulations.
 - `task_list` returns latest ledger rows with terminal rows hidden by default unless `include_completed:true`.
 - `task_get` returns latest row, bounded history, child tasks, recent traces, approval refs, and artifact refs.
 - `approval_list` returns approval metadata and payload keys only; it must not inline raw approval payload bodies.
@@ -759,20 +765,23 @@ if text.strip().lower() in {"/llm", "/models", "/model"}:
 - Repeated `install_tui_query_runtime()` calls -> no duplicate tool schemas and no duplicate handler side effects.
 - GenericAgent model switch or `load_tool_schema()` reload -> query schemas are re-appended exactly once.
 - Secret Vault unlocked -> subagent query refresh uses Secret subagents instead of normal `SUBAGENTS_DIR`.
+- Persistent subagent has `runtime_loaded:false` -> `agent_get` still exposes same-agent task/direct-chat routes, but the model must not claim a separate spawned persona is that persistent agent.
 
 ### 5. Good/Base/Bad Cases
 
 - Good: Before answering "which subagent should handle this?", call `agent_match`, then emit `delegate.create` only if execution is intended.
 - Good: Before saying "that task is blocked", call `task_get` and `approval_list` to inspect ledger and approval gates.
+- Good: To test whether a persistent steward can answer, target its existing `agent_id` with Shuheng subagent task/direct-chat controls and report the returned `assigned_agent`/`subagent-chat:<id>` lane.
 - Base: A capability explanation calls `capability_list` or `agent_list` and answers in prose without a control block.
 - Bad: A query tool creates an agent, starts a task, approves a gate, writes memory, or reads full artifact contents.
 - Bad: The model emits `<ga-control>` while only explaining available subagent capabilities.
+- Bad: The model spawns a new OMP/IRC worker with a copied steward profile and reports "the persistent steward replied" instead of "a clone/persona simulation replied".
 
 ### 6. Tests Required
 
 - `scripts/check_policy_gates.py` must assert all query tool schemas are installed exactly once.
 - Tests must assert handler methods exist and return `StepOutcome` with `next_prompt:"\n"`.
-- Tests must assert `agent_list`, `agent_get`, and `agent_match` expose current subagent records and recommend reuse when a matching idle agent exists.
+- Tests must assert `agent_list`, `agent_get`, and `agent_match` expose current subagent records, interaction modes, identity contracts, clone warnings, and recommend reuse when a matching idle agent exists.
 - Tests must assert `task_list` hides terminal tasks by default and includes them with `include_completed:true`.
 - Tests must assert `task_get` returns latest ledger details and approval references.
 - Tests must assert `approval_list` does not inline raw payload bodies.

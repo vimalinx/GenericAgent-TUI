@@ -6461,6 +6461,7 @@ tools_allowed: {", ".join(permissions.get("tools_allowed", []))}
 tools_forbidden: {", ".join(permissions.get("tools_forbidden", []))}
 output_contract: {", ".join(pack.get("output_contract") or [])}
 stop_condition: {task.get("stop_condition", "")}
+subagent_identity_rule: To claim you talked to a persistent Shuheng subagent, route the message to that existing agent_id through Shuheng subagent task/direct-chat controls. A copied profile, OMP native task spawn, or IRC demo participant is only a clone/persona simulation and must be reported as such.
 
 Boundaries:
 {boundaries or "- (empty)"}
@@ -10632,6 +10633,48 @@ def tui_query_agent_busy_reason(sub: SubAgentRuntime) -> str:
     return "idle"
 
 
+def subagent_identity_contract(sub: SubAgentRuntime) -> dict[str, Any]:
+    return {
+        "canonical_agent_id": sub.agent_id,
+        "canonical_name": sub.name,
+        "same_agent_requires_existing_agent_id": True,
+        "valid_same_agent_paths": [
+            f"agenttask.v2 delegate.create selected_agent={sub.agent_id}",
+            f"/agent ask {sub.agent_id} <prompt>",
+            f"selected-subagent direct chat source=subagent-chat:{sub.agent_id}",
+        ],
+        "clone_or_spawn_warning": (
+            "A newly spawned OMP/task/IRC worker that copies this profile/persona is not this persistent agent. "
+            "Report it as a clone or persona simulation, not as a reply from this agent."
+        ),
+    }
+
+
+def subagent_interaction_modes(sub: SubAgentRuntime) -> dict[str, Any]:
+    return {
+        "read_only_query": {
+            "available": True,
+            "meaning": "Inspect metadata only; no message is sent to the agent.",
+        },
+        "same_agent_task": {
+            "available": True,
+            "command": f"/agent ask {sub.agent_id} <prompt>",
+            "control": f'agenttask.v2 delegate.create selected_agent="{sub.agent_id}"',
+            "identity": "same persistent agent id and memory/context hydration",
+        },
+        "same_agent_direct_chat": {
+            "available": True,
+            "source": f"subagent-chat:{sub.agent_id}",
+            "identity": "same persistent agent id when the selected subagent chat lane is used",
+        },
+        "not_same_agent": [
+            "OMP native task spawn from copied profile/persona",
+            "temporary IRC demo agent with the same display name",
+            "new agent.create without targeting this agent_id",
+        ],
+    }
+
+
 def tui_query_agent_record(sub: SubAgentRuntime, *, detail: bool = False) -> dict[str, Any]:
     permissions = permissions_for_role(sub.role, security_context=sub.security_context)
     record: dict[str, Any] = {
@@ -10654,6 +10697,8 @@ def tui_query_agent_record(sub: SubAgentRuntime, *, detail: bool = False) -> dic
         "active_bus_task_id": sub.active_bus_task_id,
         "runtime_loaded": sub.agent is not None,
         "runtime_running": bool(sub.agent is not None and agent_has_unfinished_task(sub.agent)),
+        "identity_contract": subagent_identity_contract(sub),
+        "interaction_modes": subagent_interaction_modes(sub),
         "owner_session": sub.owner_session,
         "home": sub.home,
         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(sub.updated_at)),
@@ -12252,7 +12297,8 @@ def ohmypi_tui_readonly_host_tool_definitions() -> list[RpcHostToolDefinition]:
             description=(
                 "Read-only Shuheng governance query. Use it to inspect runtime providers, "
                 "capabilities, agents, tasks, approval metadata, and artifact refs. It never approves, "
-                "writes memory, edits artifacts, or mutates ledgers."
+                "writes memory, edits artifacts, mutates ledgers, or sends messages to agents. "
+                "A spawned/copied persona is not a persistent Shuheng agent reply."
             ),
             parameters={
                 "type": "object",
@@ -12288,9 +12334,9 @@ def ohmypi_typed_readonly_host_tool_definitions() -> list[RpcHostToolDefinition]
         },
     }
     descriptions = {
-        "agent_list": "Read bounded Shuheng worker records.",
-        "agent_get": "Read one Shuheng worker record by id or unique name.",
-        "agent_match": "Find suitable Shuheng workers for an objective.",
+        "agent_list": "Read bounded Shuheng worker records; does not send messages or load/chat with agents.",
+        "agent_get": "Read one Shuheng worker record by id or unique name, including identity/interaction rules; does not chat.",
+        "agent_match": "Find suitable Shuheng workers for an objective; reuse means target that agent_id, not clone its persona.",
         "task_list": "Read task ledger rows.",
         "task_get": "Read one task plus related approvals, artifacts, and traces.",
         "approval_list": "Read approval metadata without granting approval.",
@@ -15017,19 +15063,137 @@ def clean_ai_category(category: str) -> str:
     return compact_category(category)
 
 
-def agent_supports_inline_ai_metadata(agent: Any) -> bool:
+LOCAL_SESSION_CATEGORY_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "Shuheng",
+        (
+            "shuheng",
+            "枢衡",
+            "ga-tui",
+            "genericagent-tui",
+            "ohmypi",
+            "oh my pi",
+            "omp",
+            "左栏",
+            "侧栏",
+            "历史会话",
+            "会话分类",
+            "自动分类",
+            "会话标题",
+            "session_meta",
+            "session_names",
+            "model_responses",
+            "过程组",
+            "过程 turn",
+            "raw_ask",
+            "token 记录",
+            "token计数",
+            "/curate-history",
+        ),
+    ),
+    ("智能体", ("智能体", "agent", "subagent", "orchestrator", "多 agent", "子 agent")),
+    ("系统/工具", ("系统", "工具", "命令", "脚本", "终端", "linux", "arch", "hyprland", "cloudflare", "dns", "部署", "服务器", "systemd")),
+    ("代码", ("代码", "bug", "报错", "测试", "实现", "函数", "class", "python", "typescript", "javascript", "repo", "git", "patch")),
+    ("前端", ("前端", "界面", "页面", "ui", "css", "html", "react", "视觉", "动画", "布局")),
+    ("研究", ("调研", "研究", "论文", "竞品", "分析", "报告", "资料", "research")),
+    ("内容", ("文章", "小红书", "公众号", "视频", "脚本", "自媒体", "文案", "标题")),
+    ("学习", ("学习", "作业", "笔记", "英语", "课程", "学生", "题目")),
+    ("商业", ("支付", "收款", "saas", "客户", "商业", "创业", "价格", "订单")),
+    ("图片", ("图片", "图像", "生成图", "照片", "image", "画图", "海报")),
+)
+
+
+def primary_agent_backend(agent: Any) -> Any:
     if agent is None:
-        return False
+        return None
     source_backend = getattr(getattr(agent, "llmclient", None), "backend", None)
     try:
         source_backend = source_backend.primary
     except Exception:
         pass
+    return source_backend
+
+
+def agent_supports_inline_ai_metadata(agent: Any) -> bool:
+    source_backend = primary_agent_backend(agent)
     if source_backend is None:
         return False
     if getattr(source_backend, "supports_raw_ask", True) is False:
         return False
     return callable(getattr(source_backend, "raw_ask", None))
+
+
+def agent_supports_local_session_category(agent: Any) -> bool:
+    source_backend = primary_agent_backend(agent)
+    if source_backend is None:
+        return False
+    return is_ohmypi_runtime_agent(agent) or getattr(source_backend, "supports_raw_ask", True) is False
+
+
+def category_label_from_existing(preferred: str, categories: list[tuple[str, str]]) -> str:
+    preferred_label = compact_category(preferred)
+    preferred_key = category_key(preferred_label)
+    for label, _desc in categories:
+        if category_key(label) == preferred_key:
+            return compact_category(label)
+    return preferred_label
+
+
+def local_category_text(title: str, description: str, messages: Optional[list[Message]] = None) -> str:
+    chunks = [
+        compact_title(title, 120),
+        compact_description(description, 600),
+    ]
+    for msg in messages or []:
+        if msg.role not in {"user", "assistant"}:
+            continue
+        text = compact_description(message_text_for_title_context(msg), 900)
+        if text:
+            chunks.append(text)
+    return "\n".join(chunk for chunk in chunks if chunk).casefold()
+
+
+def known_category_match(text: str, categories: list[tuple[str, str]]) -> str:
+    best_label = ""
+    best_score = 0
+    for label, desc in categories:
+        clean_label = compact_category(label)
+        if not clean_label:
+            continue
+        score = 0
+        label_key = clean_label.casefold()
+        if label_key and label_key in text:
+            score += 20 + min(len(label_key), 8)
+        for part in re.split(r"[/,，、|;；\s]+", clean_label):
+            part_key = part.strip().casefold()
+            if len(part_key) >= 2 and part_key in text:
+                score += 8
+        for part in re.split(r"[,，、。;；\s]+", compact_description(desc, 220)):
+            part_key = part.strip().casefold()
+            if len(part_key) >= 3 and part_key in text:
+                score += 3
+        if score > best_score:
+            best_label = clean_label
+            best_score = score
+    return best_label if best_score >= 10 else ""
+
+
+def generate_local_session_category(
+    title: str,
+    description: str,
+    categories: list[tuple[str, str]],
+    messages: Optional[list[Message]] = None,
+) -> str:
+    text = local_category_text(title, description, messages)
+    if not text:
+        return ""
+    known = known_category_match(text, categories)
+    if known:
+        return known
+    for label, keywords in LOCAL_SESSION_CATEGORY_RULES:
+        if any(keyword.casefold() in text for keyword in keywords):
+            return category_label_from_existing(label, categories)
+    return category_label_from_existing("杂项", categories)
 
 
 def generate_ai_session_title(agent: Any, messages: list[Message]) -> str:
@@ -15334,33 +15498,101 @@ def known_category_options(state: State, exclude: str = "") -> list[tuple[str, s
 
 
 def session_title_for_category(state: State, path: str) -> str:
-    return history_name(state, path) or session_title_for_path(state, path)
+    title = history_name(state, path)
+    if title:
+        return title
+    for item_path, _mtime, preview, _rounds in state.history:
+        if normalized_path(item_path) == normalized_path(path):
+            return compact_title(preview, 80)
+    if normalized_path(path) == normalized_path(current_session_path(state)):
+        current = compact_title(state.current_title, 80)
+        if current not in {"", "main", "运行中会话", "空闲会话"}:
+            return current
+    return ""
 
 
-def maybe_start_ai_category_job(state: State, path: str, agent: Any, force: bool = False) -> bool:
-    if state.temporary_session or agent_log_path_is_devnull(agent):
+def persist_local_session_category(
+    state: State,
+    path: str,
+    category: str,
+    signature: str,
+    *,
+    source: str = "local",
+) -> bool:
+    category = compact_category(category)
+    if not path or not category:
         return False
-    if not agent_supports_inline_ai_metadata(agent):
+    state.session_meta = load_session_meta_registry()
+    entry = dict(state.session_meta.get(session_key(path), {}))
+    if str(entry.get("category_source") or "") == "manual":
+        return False
+    entry["category"] = category
+    entry["category_source"] = source
+    entry["category_signature"] = signature
+    entry["category_updated_at"] = time.time()
+    state.session_meta[session_key(path)] = entry
+    save_session_meta_registry(state.session_meta)
+    set_category_meta_fields(state, category, name=category)
+    load_history(state, force=True)
+    mark_dirty(state)
+    return True
+
+
+def session_category_signature(
+    title: str,
+    description: str,
+    meta: dict[str, Any],
+    messages: Optional[list[Message]] = None,
+) -> str:
+    signature_src = "\n".join([
+        compact_title(title, 120),
+        compact_description(description, 600),
+        str(meta.get("description_signature") or ""),
+        session_content_signature(messages or []),
+    ])
+    return hashlib.sha1(signature_src.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def maybe_start_ai_category_job(
+    state: State,
+    path: str,
+    agent: Any,
+    force: bool = False,
+    messages: Optional[list[Message]] = None,
+) -> bool:
+    if state.temporary_session or agent_log_path_is_devnull(agent):
         return False
     if not path or agent is None:
         return False
     key = session_key(path)
     if not key or key in state.category_jobs:
         return False
+    try:
+        state.session_meta = load_session_meta_registry()
+    except Exception:
+        pass
     meta = session_meta_for(state, path)
     if not force and str(meta.get("category_source") or "") == "manual":
         return False
     title = session_title_for_category(state, path)
     description = compact_description(str(meta.get("description") or state.history_descriptions.get(path) or ""))
-    if not title and not description:
+    message_signature = session_content_signature(messages or [])
+    if not title and not description and not message_signature:
         return False
-    signature_src = f"{title}\n{description}\n{meta.get('description_signature', '')}"
-    signature = hashlib.sha1(signature_src.encode("utf-8", errors="ignore")).hexdigest()
+    signature = session_category_signature(title, description, meta, messages)
     if not force and (state.category_signatures.get(key) == signature or meta.get("category_signature") == signature):
         return False
+    categories = known_category_options(state, exclude=str(meta.get("category") or ""))
+    if not agent_supports_inline_ai_metadata(agent):
+        if not agent_supports_local_session_category(agent):
+            return False
+        category = generate_local_session_category(title, description, categories, messages)
+        if not category:
+            return False
+        state.category_signatures[key] = signature
+        return persist_local_session_category(state, path, category, signature)
     state.category_jobs.add(key)
     state.category_signatures[key] = signature
-    categories = known_category_options(state, exclude=str(meta.get("category") or ""))
     threading.Thread(
         target=ai_category_worker,
         args=(state.ui_queue, path, agent, title, description, categories, signature),
@@ -15394,7 +15626,7 @@ def maybe_autoname_current_session(state: State, force: bool = False) -> bool:
         changed = True
     title_started = maybe_start_ai_title_job(state, path, state.messages, state.agent, force=force)
     description_started = maybe_start_ai_description_job(state, path, state.messages, state.agent, force=force)
-    category_started = maybe_start_ai_category_job(state, path, state.agent, force=force)
+    category_started = maybe_start_ai_category_job(state, path, state.agent, force=force, messages=state.messages)
     return title_started or description_started or category_started or changed
 
 
@@ -15428,7 +15660,7 @@ def maybe_autoname_background_session(state: State, bg: BackgroundSession, force
         changed = True
     title_started = maybe_start_ai_title_job(state, path, bg.messages, bg.agent, force=force)
     description_started = maybe_start_ai_description_job(state, path, bg.messages, bg.agent, force=force)
-    category_started = maybe_start_ai_category_job(state, path, bg.agent, force=force)
+    category_started = maybe_start_ai_category_job(state, path, bg.agent, force=force, messages=bg.messages)
     return title_started or description_started or category_started or changed
 
 
@@ -22803,11 +23035,11 @@ def process_ui_queue(state: State) -> bool:
                                 bg.title = title
                         load_history(state, force=True)
                         if active_key == key and not path_is_active_history_view(state, path):
-                            maybe_start_ai_category_job(state, path, state.agent)
+                            maybe_start_ai_category_job(state, path, state.agent, messages=state.messages)
                         else:
                             for bg in state.background_sessions.values():
                                 if token_session_key(bg.agent) == key:
-                                    maybe_start_ai_category_job(state, path, bg.agent)
+                                    maybe_start_ai_category_job(state, path, bg.agent, messages=bg.messages)
                                     break
                 except Exception as exc:
                     state.last_error = f"AI title save: {type(exc).__name__}: {exc}"
@@ -22842,11 +23074,11 @@ def process_ui_queue(state: State) -> bool:
                         state.dirty = True
                     active_key = token_session_key(state.agent)
                     if active_key == key and not path_is_active_history_view(state, path):
-                        maybe_start_ai_category_job(state, path, state.agent, force=True)
+                        maybe_start_ai_category_job(state, path, state.agent, force=True, messages=state.messages)
                     else:
                         for bg in state.background_sessions.values():
                             if token_session_key(bg.agent) == key:
-                                maybe_start_ai_category_job(state, path, bg.agent, force=True)
+                                maybe_start_ai_category_job(state, path, bg.agent, force=True, messages=bg.messages)
                                 break
                 except Exception as exc:
                     state.last_error = f"AI description save: {type(exc).__name__}: {exc}"
@@ -22919,7 +23151,7 @@ def process_ui_queue(state: State) -> bool:
                 if not path_is_active_history_view(state, path):
                     if maybe_start_ai_description_job(state, path, state.messages, state.agent):
                         state.dirty = True
-                    elif maybe_start_ai_category_job(state, path, state.agent):
+                    elif maybe_start_ai_category_job(state, path, state.agent, messages=state.messages):
                         state.dirty = True
             if load_history(state, force=True):
                 state.dirty = True
