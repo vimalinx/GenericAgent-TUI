@@ -1759,6 +1759,68 @@ def assert_ohmypi_rpc_tool_use_turn_end_waits_for_final_answer() -> None:
     agent.close()
 
 
+def assert_ohmypi_rpc_host_tool_followup_timeout_finishes_stalled_turn() -> None:
+    processes: list[FakeRpcProcess] = []
+
+    def process_factory(*_args, **_kwargs):
+        process = FakeRpcProcess(auto_finish=False)
+        processes.append(process)
+        return process
+
+    def handler(tool_name: str, args: dict[str, object]) -> dict[str, object]:
+        return {
+            "schema_version": "ga-tui.query.v1",
+            "status": "ok",
+            "kind": "test.host_tool",
+            "tool_name": tool_name,
+            "endpoint": str(args.get("endpoint") or ""),
+        }
+
+    tool = omp.RpcHostToolDefinition(
+        name="ga_tui_query",
+        label="GA/TUI Query",
+        description="Read-only test query",
+        parameters={"type": "object", "properties": {"endpoint": {"type": "string"}}},
+    )
+    agent = omp.OhMyPiRpcAgent(
+        command=["/fake/omp", "--mode", "rpc"],
+        cwd=str(ROOT),
+        process_factory=process_factory,
+        host_tool_definitions=[tool],
+        host_tool_handler=handler,
+        startup_timeout=1,
+        terminal_grace_timeout=0.05,
+        host_tool_followup_timeout=0.05,
+    )
+    dq = agent.put_task("host tool stall", source="test")
+    process = wait_for_process(processes)
+    wait_for_rpc_write(process, lambda frame: frame.get("type") == "prompt")
+
+    process.stdout.push({
+        "type": "host_tool_call",
+        "id": "call-stalled",
+        "toolCallId": "tc-stalled",
+        "toolName": "ga_tui_query",
+        "arguments": {"endpoint": "runtime_registry"},
+    })
+    result_frame = wait_for_rpc_write(
+        process,
+        lambda frame: frame.get("type") == "host_tool_result" and frame.get("id") == "call-stalled",
+    )
+    assert result_frame["result"]["content"][0]["type"] == "text", result_frame
+
+    done, streamed = wait_for_queue_done(dq)
+    assert "Shuheng host tool `ga_tui_query` 已完成" in done["done"], done
+    assert "模型没有继续生成最终回复" in done["done"], done
+    assert "runtime_registry" in done["done"], done
+    assert "ga_tui_query" in streamed, streamed
+    assert agent.is_running is False
+    assert agent.task_queue.unfinished_tasks == 0
+    signal = omp.ohmypi_memory_candidate_signal(done["done"], source="test", request_id="host-tool-stall")
+    assert signal is None, signal
+    agent.close()
+
+
 def assert_ohmypi_rpc_process_blocks_fold_like_genericagent() -> None:
     processes: list[FakeRpcProcess] = []
 
@@ -5125,6 +5187,7 @@ def run_checks() -> None:
     assert_ohmypi_rpc_streamed_final_text_dedupes_terminal_message()
     assert_ohmypi_rpc_waits_for_agent_end_before_next_prompt()
     assert_ohmypi_rpc_tool_use_turn_end_waits_for_final_answer()
+    assert_ohmypi_rpc_host_tool_followup_timeout_finishes_stalled_turn()
     assert_ohmypi_rpc_process_blocks_fold_like_genericagent()
     assert_ohmypi_rpc_env_model_switch_and_error_mapping()
     assert_ohmypi_host_tool_bridge()

@@ -180,6 +180,9 @@ class _ActivePrompt:
     pending_terminal_text: str | None = None
     pending_terminal_fallback_text: str = ""
     terminal_grace_started: bool = False
+    host_tool_followup_generation: int = 0
+    host_tool_followup_started_generation: int = 0
+    host_tool_result_fallback_text: str = ""
     token_usage: dict[str, int] = field(default_factory=_empty_token_usage)
     token_usage_signatures: set[str] = field(default_factory=set)
     session_usage_baseline_signatures: set[str] = field(default_factory=set)
@@ -390,6 +393,25 @@ def _host_tool_agent_result(value: Any) -> dict[str, Any]:
     }
 
 
+def _host_tool_fallback_text(tool_name: str, result: Any, *, is_error: bool = False) -> str:
+    tool = _safe_process_tool_name(tool_name)
+    status = "失败" if is_error else "完成"
+    result_text = _bounded_host_tool_text(result, max_chars=1600)
+    return (
+        f"[Oh My Pi] Shuheng host tool `{tool}` 已{status}，但模型没有继续生成最终回复。\n\n"
+        "工具结果摘要：\n"
+        "```json\n"
+        f"{result_text}\n"
+        "```"
+    )
+
+
+def _visible_non_process_text(text: str) -> str:
+    clean = _strip_ohmypi_process_noise_for_memory(text)
+    clean = re.sub(r"^[.\s]+$", "", clean).strip()
+    return clean
+
+
 def _visible_text_from_payload(value: Any) -> str:
     if isinstance(value, str):
         return value
@@ -587,6 +609,7 @@ class OhMyPiRpcAgent:
         startup_timeout: float = 10.0,
         stop_timeout: float = 3.0,
         terminal_grace_timeout: float = 1.0,
+        host_tool_followup_timeout: float = 8.0,
         session_usage_flush_timeout: float = 1.0,
         session_usage_stable_interval: float = 0.08,
     ) -> None:
@@ -606,6 +629,7 @@ class OhMyPiRpcAgent:
         self.startup_timeout = startup_timeout
         self.stop_timeout = stop_timeout
         self.terminal_grace_timeout = terminal_grace_timeout
+        self.host_tool_followup_timeout = max(0.05, float(host_tool_followup_timeout))
         self.session_usage_flush_timeout = max(0.0, float(session_usage_flush_timeout))
         self.session_usage_stable_interval = max(0.0, float(session_usage_stable_interval))
         self.task_queue = _TaskCounter()
@@ -963,11 +987,14 @@ class OhMyPiRpcAgent:
             error_text = self._frame_error_text(frame)
             fallback_text = self._frame_visible_text(frame)
             if frame_type == "turn_end":
+                expects_followup = self._turn_end_expects_followup(frame)
                 self._defer_active_terminal(
                     error_text,
                     fallback_text=fallback_text,
-                    start_grace=not self._turn_end_expects_followup(frame),
+                    start_grace=not expects_followup,
                 )
+                if expects_followup:
+                    self._expect_active_host_tool_followup()
             else:
                 pending_text, pending_fallback = self._active_pending_terminal()
                 self._finish_active(
@@ -1406,6 +1433,60 @@ class OhMyPiRpcAgent:
             active.pending_terminal_fallback_text = ""
             active.terminal_grace_started = False
 
+    def _mark_active_host_tool_result(self, tool_name: str, result: Any, *, is_error: bool = False) -> None:
+        generation = 0
+        with self._active_lock:
+            active = self._active
+            if active is None or active.finished:
+                return
+            active.host_tool_result_fallback_text = _host_tool_fallback_text(tool_name, result, is_error=is_error)
+            active.host_tool_followup_generation += 1
+            generation = active.host_tool_followup_generation
+        self._start_active_host_tool_followup_watchdog(generation)
+
+    def _expect_active_host_tool_followup(self) -> None:
+        generation = 0
+        should_start = False
+        with self._active_lock:
+            active = self._active
+            if active is None or active.finished:
+                return
+            generation = active.host_tool_followup_generation
+            should_start = bool(active.host_tool_result_fallback_text)
+        if should_start:
+            self._start_active_host_tool_followup_watchdog(generation)
+
+    def _start_active_host_tool_followup_watchdog(self, generation: int) -> None:
+        with self._active_lock:
+            active = self._active
+            if active is None or active.finished:
+                return
+            if generation <= 0 or active.host_tool_followup_started_generation == generation:
+                return
+            active.host_tool_followup_started_generation = generation
+        self.thread_factory(
+            target=self._finish_active_after_host_tool_followup_timeout,
+            args=(generation,),
+            daemon=True,
+            name="ohmypi-rpc-host-tool-followup",
+        ).start()
+
+    def _finish_active_after_host_tool_followup_timeout(self, generation: int) -> None:
+        time.sleep(self.host_tool_followup_timeout)
+        fallback_text = ""
+        visible_text = ""
+        with self._active_lock:
+            active = self._active
+            if (
+                active is None
+                or active.finished
+                or active.host_tool_followup_generation != generation
+            ):
+                return
+            fallback_text = active.host_tool_result_fallback_text
+            visible_text = _visible_non_process_text(active.buffer)
+        self._finish_active(None, fallback_text="" if visible_text else fallback_text)
+
     def _defer_active_terminal(self, text: str | None = None, *, fallback_text: str = "", start_grace: bool = True) -> None:
         should_start_grace = False
         with self._active_lock:
@@ -1653,6 +1734,7 @@ class OhMyPiRpcAgent:
                 "error": f"Unknown or unregistered host tool: {tool_name or '<missing>'}",
             }
             self._send_host_tool_result(request_id, result, is_error=True)
+            self._mark_active_host_tool_result(tool_name or "unknown_tool", result, is_error=True)
             self._append_active_tool_result_process(tool_name or "unknown_tool", result, tool_call_id=tool_call_id, is_error=True)
             return
         if self.host_tool_handler is None:
@@ -1663,6 +1745,7 @@ class OhMyPiRpcAgent:
                 "error": "No host tool handler is configured.",
             }
             self._send_host_tool_result(request_id, result, is_error=True)
+            self._mark_active_host_tool_result(tool_name, result, is_error=True)
             self._append_active_tool_result_process(tool_name, result, tool_call_id=tool_call_id, is_error=True)
             return
         try:
@@ -1688,6 +1771,7 @@ class OhMyPiRpcAgent:
                 "error": f"{type(exc).__name__}: {exc}",
             }
             self._send_host_tool_result(request_id, result, is_error=True)
+            self._mark_active_host_tool_result(tool_name, result, is_error=True)
             self._append_active_tool_result_process(tool_name, result, tool_call_id=tool_call_id, is_error=True)
             return
         self._emit_runtime_event(
@@ -1697,6 +1781,7 @@ class OhMyPiRpcAgent:
             payload={"request_id": request_id, "tool_name": tool_name},
         )
         self._send_host_tool_result(request_id, result)
+        self._mark_active_host_tool_result(tool_name, result)
         self._append_active_tool_result_process(tool_name, result, tool_call_id=tool_call_id)
 
     def _handle_host_tool_cancel(self, frame: dict[str, Any]) -> None:
