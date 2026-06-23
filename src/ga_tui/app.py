@@ -13,6 +13,7 @@ import base64
 import concurrent.futures
 import copy
 import curses
+import fcntl
 import glob
 import hashlib
 import itertools
@@ -1658,7 +1659,7 @@ def cached_session_rows(state: State, exclude_pid: Optional[int] = None) -> tupl
         try:
             with open(path, encoding="utf-8", errors="replace") as fh:
                 content = fh.read()
-        except Exception:
+        except OSError:
             continue
         pairs = _pairs(content)
         if not pairs:
@@ -2446,6 +2447,33 @@ def append_text_file(path: str, text: str) -> None:
 def now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime())
 
+_DIAGNOSTICS_ENABLED = (os.environ.get("GA_TUI_DIAGNOSTICS", "") or "").strip().lower() not in {"", "0", "false", "no", "off"}
+_DIAGNOSTIC_LOCK = threading.Lock()
+
+
+def log_diagnostic(scope: str, exc: BaseException, *, detail: str = "") -> None:
+    """Persist a rare exception to the Shuheng log when diagnostics are on.
+
+    This does NOT surface the error to the user; callers that need user-visible
+    feedback must still set state.last_error or return a message tuple. It is a
+    forensic aid so that best-effort paths (which correctly swallow exceptions
+    to keep the TUI responsive) still leave evidence when GA_TUI_DIAGNOSTICS=1.
+    Disabled by default to avoid writing to disk on every run.
+    """
+    if not _DIAGNOSTICS_ENABLED:
+        return
+    try:
+        line = f"{now_iso()} [{scope}] {type(exc).__name__}: {exc}"
+        if detail:
+            line += f" | {detail}"
+        with _DIAGNOSTIC_LOCK:
+            os.makedirs(os.path.dirname(SHUHENG_LOG_PATH) or ".", exist_ok=True)
+            with open(SHUHENG_LOG_PATH, "a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+    except OSError:
+        # Logging must never raise; if the log is unwritable, give up silently.
+        pass
+
 
 def shuheng_memory_file_path(filename: str) -> str:
     return os.path.join(SHUHENG_MEMORY_DIR, filename)
@@ -2584,10 +2612,55 @@ def short_uid(prefix: str) -> str:
     return f"{prefix}_{time.time_ns():x}_{os.getpid():x}"
 
 
+_JSONL_APPEND_LOCKS_GUARD = threading.Lock()
+_JSONL_APPEND_LOCKS: dict[str, threading.Lock] = {}
+
+
+def _jsonl_append_lock(path: str) -> threading.Lock:
+    """Return a process-internal lock keyed by normalized path.
+
+    The TUI spawns worker threads plus a ThreadingHTTPServer gateway, all of
+    which can append to the same JSONL ledger concurrently. Without this lock
+    two threads could interleave their buffered writes and corrupt a line.
+    """
+    key = os.path.normpath(path)
+    lock = _JSONL_APPEND_LOCKS.get(key)
+    if lock is not None:
+        return lock
+    with _JSONL_APPEND_LOCKS_GUARD:
+        lock = _JSONL_APPEND_LOCKS.setdefault(key, threading.Lock())
+    return lock
+
+
 def append_jsonl(path: str, payload: dict[str, Any]) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "a", encoding="utf-8") as fh:
-        fh.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+    """Append one JSONL record under process-internal and cross-process locks.
+
+    A separate in-process lock serializes threads sharing this module; an
+    advisory fcntl.flock on the file serializes separate processes (the gateway
+    daemon is spawned via subprocess.Popen and shares these ledgers). The whole
+    record is built as one string and flushed inside the lock so a partial line
+    is never visible to readers.
+    """
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    line = json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n"
+    with _jsonl_append_lock(path):
+        with open(path, "a", encoding="utf-8") as fh:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            except (OSError, ValueError):
+                # flock is unsupported on this platform or fd type; the
+                # in-process lock still protects co-located writers.
+                pass
+            try:
+                fh.write(line)
+                fh.flush()
+            finally:
+                try:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                except (OSError, ValueError):
+                    pass
 
 
 def write_bytes_atomic(path: str, data: bytes) -> None:
@@ -2664,7 +2737,7 @@ def secret_encrypt_bytes(key: bytes, plaintext: bytes, aad: bytes = b"") -> byte
 def secret_decrypt_bytes(key: bytes, sealed: bytes, aad: bytes = b"") -> bytes:
     if not secret_crypto_available():
         raise SecretVaultError("Secret Vault 强加密不可用。")
-    if len(sealed) <= NACL_XCHACHA_NPUBBYTES + NACL_XCHACHA_ABYTES:
+    if len(sealed) < NACL_XCHACHA_NPUBBYTES + NACL_XCHACHA_ABYTES:
         raise SecretVaultError("Secret Vault 密文过短。")
     nonce = sealed[:NACL_XCHACHA_NPUBBYTES]
     ciphertext = sealed[NACL_XCHACHA_NPUBBYTES:]
@@ -3894,17 +3967,18 @@ def read_jsonl(path: str, limit: int = 0) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     try:
         with open(path, encoding="utf-8", errors="replace") as fh:
-            for line in fh:
+            for lineno, line in enumerate(fh, 1):
                 line = line.strip()
                 if not line:
                     continue
                 try:
                     item = json.loads(line)
-                except Exception:
+                except (json.JSONDecodeError, ValueError) as exc:
+                    log_diagnostic("read_jsonl.parse", exc, detail=f"{path}:{lineno}")
                     continue
                 if isinstance(item, dict):
                     rows.append(item)
-    except Exception:
+    except OSError:
         return []
     if limit and len(rows) > limit:
         return rows[-limit:]
@@ -3922,7 +3996,7 @@ def task_ledger_signature() -> tuple[int, int]:
 def harness_artifact_uri(path: str) -> str:
     try:
         rel = os.path.relpath(path, AGENT_HARNESS_DIR)
-    except Exception:
+    except (ValueError, TypeError):
         rel = os.path.basename(path)
     return "artifact://" + rel.replace(os.sep, "/")
 

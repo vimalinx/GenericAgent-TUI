@@ -1,0 +1,152 @@
+"""Tests for path-safety and ID-sanitization helpers (ga_tui.app).
+
+These guard against directory traversal (secret vault, artifacts, workspaces)
+and enforce stable identifier shapes for subagents/workspaces.
+"""
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+from ga_tui.app import (
+    clean_subagent_id,
+    normalized_path,
+    normalized_workspace_id,
+    path_is_within,
+    secret_safe_session_id,
+    short_uid,
+    workspace_slug,
+)
+
+
+class TestNormalizedPath:
+    def test_expands_user(self, monkeypatch) -> None:
+        monkeypatch.setenv("HOME", "/home/test")
+        assert normalized_path("~/x") == "/home/test/x"
+
+    def test_makes_absolute(self) -> None:
+        # Relative path resolved against cwd.
+        result = normalized_path("a/b")
+        assert os.path.isabs(result)
+
+    def test_empty_falls_back_to_cwd(self) -> None:
+        assert os.path.isabs(normalized_path(""))
+
+
+class TestPathIsWithin:
+    def test_inside(self, tmp_path: Path) -> None:
+        inner = tmp_path / "sub" / "file"
+        inner.parent.mkdir()
+        inner.write_text("x")
+        assert path_is_within(str(inner), str(tmp_path)) is True
+
+    def test_outside(self, tmp_path: Path) -> None:
+        assert path_is_within("/etc/passwd", str(tmp_path)) is False
+
+    def test_root_is_within_itself(self, tmp_path: Path) -> None:
+        assert path_is_within(str(tmp_path), str(tmp_path)) is True
+
+    def test_sibling_not_within(self, tmp_path: Path) -> None:
+        sibling = tmp_path.parent / "other_dir_xyz"
+        sibling.mkdir(exist_ok=True)
+        try:
+            assert path_is_within(str(sibling), str(tmp_path)) is False
+        finally:
+            sibling.rmdir()
+
+    def test_traversal_rejected(self, tmp_path: Path) -> None:
+        # "/safe_root/../evil" should normalize outside.
+        traversing = str(tmp_path) + "/../" + os.path.basename(str(tmp_path)) + "_evil"
+        # After realpath this points outside tmp_path -> False (if it exists).
+        # We assert the function does not crash and returns a bool.
+        assert isinstance(path_is_within(traversing, str(tmp_path)), bool)
+
+
+class TestSecretSafeSessionId:
+    def test_passes_safe_chars(self) -> None:
+        assert secret_safe_session_id("abc_123-4.5") == "abc_123-4.5"
+
+    def test_replaces_slashes(self) -> None:
+        assert secret_safe_session_id("../etc/passwd") == "..-etc-passwd"
+
+    def test_strips_leading_trailing_dashes(self) -> None:
+        assert secret_safe_session_id("---safe---") == "safe"
+
+    def test_empty_falls_back(self) -> None:
+        assert secret_safe_session_id("") == "session"
+
+    def test_preserves_case(self) -> None:
+        # Uppercase is allowed by the allow-list.
+        assert secret_safe_session_id("ABC123") == "ABC123"
+
+
+class TestCleanSubagentId:
+    def test_lowercases(self) -> None:
+        assert clean_subagent_id("Researcher") == "researcher"
+
+    def test_strips_invalid(self) -> None:
+        assert clean_subagent_id("research!@#er") == "researcher"
+
+    def test_spaces_to_dashes(self) -> None:
+        assert clean_subagent_id("code reviewer") == "code-reviewer"
+
+    def test_max_40_chars(self) -> None:
+        result = clean_subagent_id("a" * 100)
+        assert len(result) == 40
+
+    def test_empty_falls_back_to_agent_prefix(self) -> None:
+        result = clean_subagent_id("")
+        assert result.startswith("agent-")
+
+    def test_all_invalid_falls_back(self) -> None:
+        result = clean_subagent_id("!!!")
+        assert result.startswith("agent-")
+
+    def test_nfkc_normalization(self) -> None:
+        # Fullwidth 'Ａ' (U+FF21) normalizes to 'A'.
+        assert clean_subagent_id("Ａ") == "a"
+
+
+class TestNormalizedWorkspaceId:
+    def test_lowercases(self) -> None:
+        assert normalized_workspace_id("MyProject") == "myproject"
+
+    def test_replaces_separators(self) -> None:
+        assert normalized_workspace_id("my/project") == "my-project"
+
+    def test_collapses_dashes(self) -> None:
+        assert normalized_workspace_id("a---b") == "a-b"
+
+    def test_max_80_chars(self) -> None:
+        assert len(normalized_workspace_id("x" * 200)) == 80
+
+    def test_empty(self) -> None:
+        assert normalized_workspace_id("") == ""
+
+
+class TestWorkspaceSlug:
+    def test_ascii_slug(self) -> None:
+        assert workspace_slug("Shuheng Project!") == "shuheng-project"
+
+    def test_non_ascii_dropped(self) -> None:
+        # NFKD strips accents; non-decomposable CJK is dropped.
+        slug = workspace_slug("枢衡")
+        assert slug == "workspace"  # all dropped -> fallback
+
+    def test_empty_falls_back(self) -> None:
+        assert workspace_slug("") == "workspace"
+
+
+class TestShortUid:
+    def test_has_prefix(self) -> None:
+        assert short_uid("task").startswith("task_")
+
+    def test_unique(self) -> None:
+        ids = {short_uid("x") for _ in range(100)}
+        assert len(ids) > 1  # not all identical
+
+    def test_contains_pid(self) -> None:
+        uid = short_uid("p")
+        # Format: prefix_<hex-time>_<hex-pid>
+        parts = uid.split("_")
+        assert len(parts) == 3

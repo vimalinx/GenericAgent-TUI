@@ -305,21 +305,30 @@ def cron_field_matches(expr: str, value: int, minimum: int, maximum: int, *, wee
             step = int(step_text)
         if part in {"", "*"}:
             start, end = minimum, maximum
+            part_was_star = True
         elif "-" in part:
             start_text, end_text = part.split("-", 1)
             if not start_text.isdigit() or not end_text.isdigit():
                 return False
             start, end = int(start_text), int(end_text)
+            part_was_star = False
         elif part.isdigit():
             start = end = int(part)
+            part_was_star = False
         else:
             return False
         if weekday:
+            is_star = part_was_star
             if start == 7:
                 start = 0
             if end == 7:
                 end = 0
-            if start > end:
+            if is_star:
+                # "*" expands to the full weekday range (0-6) before the 7->0
+                # normalization collapses it to {0}. Without this guard a plain
+                # "* * * * *" only matched Sunday (cron_wday 0).
+                values = [0, 1, 2, 3, 4, 5, 6]
+            elif start > end:
                 values = list(range(start, maximum + 1)) + list(range(minimum, end + 1))
             else:
                 values = list(range(start, end + 1))
